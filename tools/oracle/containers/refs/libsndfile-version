@@ -1,0 +1,4 @@
+#!/bin/sh
+# The libsndfile version, not python-soundfile's: the C library is what
+# decides an answer, and the two move independently.
+python3 -c 'import soundfile; print("libsndfile", soundfile.__libsndfile_version__)'

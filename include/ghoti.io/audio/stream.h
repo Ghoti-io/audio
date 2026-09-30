@@ -30,10 +30,9 @@
  * receive audio, and a container parser that assumes it can seek is one that
  * has to be rewritten the first time somebody pipes a file into it.
  *
- * Phase 0 ships the memory stream. The file stream lands with phase 1 rather
- * than being declared here and returning ::GAUD_ERR_UNSUPPORTED, because a
- * declared function that cannot work is worse than an absent one - it
- * compiles, links, and fails at run time in the caller's code.
+ * A stream may also be written to. One type rather than a separate sink,
+ * because a codec that reads a format and a codec that writes it want the
+ * same addressing, and gaud_stream_writable() is how anything asks.
  */
 
 #ifndef GHOTI_IO_GAUD_STREAM_H
@@ -130,6 +129,87 @@ GAUD_API bool gaud_stream_seekable(const GAUD_Stream * stream);
 
 /** @brief Free a stream. Safe on NULL. Does not free borrowed bytes. */
 GAUD_API void gaud_stream_destroy(GAUD_Stream * stream);
+
+/**
+ * @brief A read-only stream over a file.
+ *
+ * @param path The file to open.
+ * @param out_stream Receives the stream. Written only on success.
+ * @return ::GAUD_OK, ::GAUD_ERR_INVALID, ::GAUD_ERR_IO if it will not open,
+ *   or ::GAUD_ERR_OOM.
+ */
+GAUD_API GAUD_Result gaud_stream_create_file(
+    const char * path, GAUD_Stream ** out_stream);
+
+/** @brief gaud_stream_create_file() with an explicit allocator. */
+GAUD_API GAUD_Result gaud_stream_create_file_with_allocator(
+    const GAUD_Allocator * allocator, const char * path,
+    GAUD_Stream ** out_stream);
+
+/**
+ * @brief A stream that presents another stream as though it could not seek.
+ *
+ * This exists so the non-seekable path can be **tested**. "A pipe is an
+ * ordinary way to receive audio" is a claim about code that never runs unless
+ * something makes it run, and a gate that cannot reach a path reports success
+ * for it. Wrapping a memory stream is how a unit test reaches the branch a
+ * container parser takes when it cannot go back.
+ *
+ * Reads forward to @p source. Seeks answer ::GAUD_ERR_UNSUPPORTED, and
+ * gaud_stream_size() does too - a pipe does not know its own length, and a
+ * wrapper that passed the real length through would be testing a stream that
+ * exists nowhere.
+ *
+ * @param source Borrowed. Must outlive the wrapper, and must not be read
+ *   directly while the wrapper is in use.
+ * @param out_stream Receives the wrapper. Written only on success.
+ */
+GAUD_API GAUD_Result gaud_stream_create_unseekable(
+    GAUD_Stream * source, GAUD_Stream ** out_stream);
+
+/**
+ * @brief A growable in-memory stream that can be written to.
+ *
+ * Owns its bytes, unlike gaud_stream_create_memory(), because there is
+ * nothing for it to borrow - it is the destination. Read them back with
+ * gaud_stream_writer_bytes().
+ */
+GAUD_API GAUD_Result gaud_stream_create_memory_writer(
+    const GAUD_Allocator * allocator, GAUD_Stream ** out_stream);
+
+/**
+ * @brief A stream that writes to a file, truncating it.
+ */
+GAUD_API GAUD_Result gaud_stream_create_file_writer(
+    const GAUD_Allocator * allocator, const char * path,
+    GAUD_Stream ** out_stream);
+
+/** @brief Whether this stream accepts gaud_stream_write(). */
+GAUD_API bool gaud_stream_writable(const GAUD_Stream * stream);
+
+/**
+ * @brief Write @p count bytes at the current position.
+ *
+ * Writing over the middle of what has already been written is how a header
+ * whose length field was not known at the time gets patched, so this is not
+ * append-only.
+ *
+ * @return ::GAUD_OK, ::GAUD_ERR_INVALID on a stream that is not writable,
+ *   ::GAUD_ERR_IO, or ::GAUD_ERR_OOM.
+ */
+GAUD_API GAUD_Result gaud_stream_write(
+    GAUD_Stream * stream, const void * bytes, size_t count);
+
+/**
+ * @brief What a memory writer has written so far.
+ *
+ * Borrowed: valid until the next write or until the stream is destroyed.
+ *
+ * @return ::GAUD_OK, or ::GAUD_ERR_UNSUPPORTED on a stream that is not a
+ *   memory writer.
+ */
+GAUD_API GAUD_Result gaud_stream_writer_bytes(
+    const GAUD_Stream * stream, const void ** out_bytes, size_t * out_length);
 
 #ifdef __cplusplus
 }

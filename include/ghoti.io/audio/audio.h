@@ -28,10 +28,22 @@
 #define GHOTI_IO_GAUD_AUDIO_H
 
 #include <ghoti.io/audio/allocator.h>
+#include <ghoti.io/audio/buffer.h>
 #include <ghoti.io/audio/codec.h>
+#include <ghoti.io/audio/codecs.h>
 #include <ghoti.io/audio/core.h>
+#include <ghoti.io/audio/decoder.h>
+#include <ghoti.io/audio/doc.h>
 #include <ghoti.io/audio/macros.h>
+#include <ghoti.io/audio/ops.h>
 #include <ghoti.io/audio/stream.h>
 #include <ghoti.io/audio/version.h>
+
+/*
+ * codec_sdk.h is deliberately absent. It is installed, and a codec includes
+ * it explicitly; nothing a caller reading audio needs is in it, and pulling
+ * it in here would put the document-building entry points in front of every
+ * consumer of this library.
+ */
 
 #endif // GHOTI_IO_GAUD_AUDIO_H

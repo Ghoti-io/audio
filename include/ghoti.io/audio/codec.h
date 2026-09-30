@@ -48,11 +48,20 @@
  *
  * The vtable carries ::GAUD_CODEC_ABI_VERSION and its own `size`, which is
  * what lets this interface grow without silently mis-reading a codec built
- * against an older header. Phase 0 defines the registry, identification and
- * the capability declarations. The decode and encode entry points arrive with
- * phase 1, appended to the end of the struct; a codec compiled against this
- * header will report the smaller `size` and the library will know not to read
- * past it.
+ * against an older header.
+ *
+ * **Phase 1 has now exercised that.** Phase 0 defined identification only;
+ * the decode and encode entry points below were appended to the end of the
+ * struct, and ::GAUD_CODEC_ABI_VERSION **did not move**, because appending
+ * changes the meaning of no existing field. A codec compiled against the
+ * phase 0 header still registers, still probes, and reports the smaller
+ * `size`; the library consults gaud_codec_has() before reading anything past
+ * what that codec declared, so the fields it never wrote are never read. Such
+ * a codec cannot decode, and gaud_doc_load() says ::GAUD_ERR_UNSUPPORTED
+ * rather than calling through a pointer nobody set.
+ *
+ * The version moves when the meaning of an existing field changes, which is a
+ * different event and has not happened.
  *
  * Note also that the versioned symbol namespacing in namespace.h works in
  * this interface's favour. An out-of-tree codec binds to one major version of
@@ -64,9 +73,11 @@
 #define GHOTI_IO_GAUD_CODEC_H
 
 #include <ghoti.io/audio/allocator.h>
+#include <ghoti.io/audio/buffer.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/macros.h>
 #include <ghoti.io/audio/stream.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -152,6 +163,17 @@ typedef struct GAUD_Codec GAUD_Codec;
  * alone, which is the common case; a probe exists for the formats where a
  * signature is not enough to tell two apart.
  *
+ * **Where a codec has a probe, the probe's answer replaces what its
+ * signatures said** - it can lower the confidence as well as raise it. Audio
+ * signatures are widely shared: "RIFF" at offset 0 is a WAV, an AVI and
+ * several other things, and "FORM" is every IFF file there is, so a codec
+ * has to be able to say no about a file that matched its own magic. If the
+ * higher of the two answers won, a probe could never disclaim anything and a
+ * WAV codec would claim every AVI it was shown.
+ *
+ * An error return is different from a low confidence: it means the probe
+ * could not answer, and the signatures' reading stands.
+ *
  * @param codec The codec being asked, so one function can serve several.
  * @param stream Positioned wherever the caller had it.
  * @param out_confidence Receives a ::GAUD_Confidence, or any value 0-100.
@@ -161,6 +183,65 @@ typedef struct GAUD_Codec GAUD_Codec;
  */
 typedef GAUD_Result (*GAUD_Codec_Probe_Fn)(
     const GAUD_Codec * codec, GAUD_Stream * stream, unsigned * out_confidence);
+
+/** @brief Opaque per-document state a codec attaches when it opens one. */
+typedef struct GAUD_Doc GAUD_Doc;
+/** @brief One track of a document. */
+typedef struct GAUD_Track GAUD_Track;
+/** @brief Reads samples from one track. */
+typedef struct GAUD_Decoder GAUD_Decoder;
+/** @brief Writes samples into one stream. */
+typedef struct GAUD_Encoder GAUD_Encoder;
+/** @brief What a file being written should look like. */
+typedef struct GAUD_Encode_Params GAUD_Encode_Params;
+
+/**
+ * @brief Parse a container: read its headers and describe its tracks.
+ *
+ * **Decodes no samples.** A document is cheap and bounded whatever the file's
+ * size, which is what lets a tagger or a library scanner open ten thousand of
+ * them. Samples come later, through ::GAUD_Codec_Decoder_Open_Fn.
+ *
+ * The codec builds the document with gaud_doc_create_internal() and adds
+ * tracks to it; those live in codec_sdk.h, which is installed beside this
+ * header for exactly that reason.
+ *
+ * @param codec The codec being asked.
+ * @param stream Positioned at the start of the container. Borrowed: it must
+ *   outlive the document, because decoding reads from it.
+ * @param limits Never NULL by the time a codec sees it; the library
+ *   substitutes the defaults.
+ * @param diagnostics Where to record what was odd but survivable. May be NULL.
+ * @param out_doc Receives the document. Written only on success.
+ */
+typedef GAUD_Result (*GAUD_Codec_Open_Fn)(const GAUD_Codec * codec,
+    GAUD_Stream * stream, const GAUD_Limits * limits,
+    GAUD_Diagnostics * diagnostics, GAUD_Doc ** out_doc);
+
+/** @brief Release codec-private state hanging off a document. */
+typedef void (*GAUD_Codec_Close_Fn)(const GAUD_Codec * codec, GAUD_Doc * doc);
+
+/**
+ * @brief Begin decoding one track.
+ *
+ * @param codec The codec being asked.
+ * @param track A track of a document this codec opened.
+ * @param out_decoder Receives the decoder. Written only on success.
+ */
+typedef GAUD_Result (*GAUD_Codec_Decoder_Open_Fn)(const GAUD_Codec * codec,
+    GAUD_Track * track, GAUD_Decoder ** out_decoder);
+
+/**
+ * @brief Begin writing a file.
+ *
+ * @param codec The codec being asked.
+ * @param stream A writable stream. Borrowed; must outlive the encoder.
+ * @param params What the file should look like. Never NULL here.
+ * @param out_encoder Receives the encoder. Written only on success.
+ */
+typedef GAUD_Result (*GAUD_Codec_Encoder_Open_Fn)(const GAUD_Codec * codec,
+    GAUD_Stream * stream, const GAUD_Encode_Params * params,
+    GAUD_Encoder ** out_encoder);
 
 /**
  * @brief What a codec tells the registry about itself.
@@ -196,7 +277,34 @@ struct GAUD_Codec {
   size_t magic_count;
   /** Optional; see ::GAUD_Codec_Probe_Fn. */
   GAUD_Codec_Probe_Fn probe;
+
+  /* ------------------------------------------------------------------
+   * Appended in phase 1. Everything above this line was present when a
+   * phase 0 codec was compiled, and `size` is how the library tells the
+   * two apart. Use gaud_codec_has() rather than reading these directly.
+   * ------------------------------------------------------------------ */
+
+  /** Parse a container and build its track list. See ::GAUD_Codec_Open_Fn. */
+  GAUD_Codec_Open_Fn open;
+  /** Release whatever @p open attached to the document. May be NULL. */
+  GAUD_Codec_Close_Fn close;
+  /** Begin decoding one track. See ::GAUD_Codec_Decoder_Open_Fn. */
+  GAUD_Codec_Decoder_Open_Fn decoder_open;
+  /** Begin writing a file. See ::GAUD_Codec_Encoder_Open_Fn. */
+  GAUD_Codec_Encoder_Open_Fn encoder_open;
 };
+
+/**
+ * @brief Whether @p codec declared a struct long enough to contain @p field.
+ *
+ * The forward-compatibility check, spelled once. Use it as
+ * `gaud_codec_has(codec, offsetof(GAUD_Codec, open))` before reading `open`.
+ *
+ * Reading a field a codec never wrote is the failure this whole arrangement
+ * exists to prevent, and the reason it is a function rather than a comment
+ * telling each call site to compare sizes is that a comment is not checked.
+ */
+GAUD_API bool gaud_codec_has(const GAUD_Codec * codec, size_t field_offset);
 
 /** @brief A set of registered codecs. */
 typedef struct GAUD_Registry GAUD_Registry;
@@ -246,6 +354,26 @@ GAUD_API const GAUD_Codec * gaud_registry_by_index(
 /** @brief The codec called @p name, or NULL. NULL registry means the default. */
 GAUD_API const GAUD_Codec * gaud_registry_find(
     const GAUD_Registry * registry, const char * name);
+
+/**
+ * @brief Identify a stream and parse whatever container it holds.
+ *
+ * gaud_probe() first, then the winning codec's ::GAUD_Codec_Open_Fn.
+ *
+ * @param registry NULL for the default.
+ * @param stream Borrowed. **Must outlive the document**, which reads from it
+ *   when its tracks are decoded.
+ * @param limits NULL for gaud_limits_default().
+ * @param diagnostics May be NULL.
+ * @param out_doc Receives the document. Written only on success.
+ * @return ::GAUD_OK; ::GAUD_ERR_FORMAT when nothing recognised the bytes;
+ *   ::GAUD_ERR_UNSUPPORTED when a codec recognised them but cannot open a
+ *   document - which is what a codec registered against the phase 0 header
+ *   gets, and is why it is a distinct code from ::GAUD_ERR_FORMAT.
+ */
+GAUD_API GAUD_Result gaud_doc_load(struct GAUD_Registry * registry,
+    GAUD_Stream * stream, const GAUD_Limits * limits,
+    GAUD_Diagnostics * diagnostics, GAUD_Doc ** out_doc);
 
 /** @brief What gaud_probe() concluded. */
 typedef struct {

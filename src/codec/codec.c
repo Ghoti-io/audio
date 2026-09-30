@@ -31,7 +31,9 @@
  */
 
 #include <ghoti.io/audio/codec.h>
+#include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/cutil/allocator.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -234,20 +236,29 @@ GAUD_Result gaud_probe(GAUD_Registry * registry, GAUD_Stream * stream,
       }
     }
 
-    // The probe runs whatever the signatures said, so that it can both
-    // promote a signature hit to certainty and recognise a format whose
-    // signature is not at a fixed offset.
+    /* The probe runs whatever the signatures said, and **its answer
+     * replaces theirs** rather than being the larger of the two.
+     *
+     * That is not the obvious choice and it is the necessary one. Audio
+     * signatures are widely shared: "RIFF" at offset 0 is a WAV, an AVI and
+     * half a dozen other things, and "FORM" is every IFF file there is. A
+     * codec declaring those magics needs to be able to say *no* about a
+     * file that matched them - and if the magic's answer were kept whenever
+     * it was higher, a probe could raise confidence but never lower it, so
+     * a WAV codec would claim every AVI it was shown.
+     *
+     * A codec with no probe is still matched on its magics alone, which is
+     * the common case. Declaring a probe is how a codec says the signature
+     * is not the whole story. */
     if (codec->probe) {
       unsigned probed = GAUD_CONFIDENCE_NONE;
       if (codec->probe(codec, stream, &probed) == GAUD_OK) {
-        if (probed > 100u) {
-          probed = 100u;
-        }
-        if (probed > confidence) {
-          confidence = probed;
-        }
+        confidence = probed > 100u ? 100u : probed;
       }
-      // A probe is asked to restore the position and may have failed to.
+      /* An error from the probe means "could not answer", not "no", so the
+       * signature's reading stands in that case - which is the arm the
+       * assignment above deliberately does not reach. */
+      /* A probe is asked to restore the position and may have failed to. */
       gaud_stream_seek(stream, (int64_t)origin, GAUD_SEEK_SET);
     }
 
@@ -261,4 +272,65 @@ GAUD_Result gaud_probe(GAUD_Registry * registry, GAUD_Stream * stream,
   }
 
   return GAUD_OK;
+}
+
+bool gaud_codec_has(const GAUD_Codec * codec, size_t field_offset) {
+  if (!codec) {
+    return false;
+  }
+  /* The codec's own `size` is what its compiler saw. A field whose offset is
+   * at or past that was never written by it, and reading one would be
+   * reading past the end of the object - which is the failure the size field
+   * exists to prevent. `>` and not `>=` on the offset alone would admit a
+   * field that merely starts inside the struct and runs off the end, so the
+   * comparison is against the offset, which is where the field begins, and
+   * registration has already refused anything shorter than the fixed part. */
+  return field_offset < codec->size;
+}
+
+GAUD_Result gaud_doc_load(GAUD_Registry * registry, GAUD_Stream * stream,
+    const GAUD_Limits * limits, GAUD_Diagnostics * diagnostics,
+    GAUD_Doc ** out_doc) {
+  if (!stream || !out_doc) {
+    return GAUD_ERR_INVALID;
+  }
+  GAUD_Probe_Result probed;
+  GAUD_Result result = gaud_probe(registry, stream, &probed);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  if (!probed.codec_name) {
+    return GAUD_ERR_FORMAT;
+  }
+  const GAUD_Codec * codec = gaud_registry_find(registry, probed.codec_name);
+  if (!codec) {
+    return GAUD_ERR_INTERNAL; /* Probed a codec the registry then lost. */
+  }
+  /* A codec compiled against the phase 0 header has no `open` field at all.
+   * Distinguished from GAUD_ERR_FORMAT on purpose: the bytes *were*
+   * recognised, and "I know what this is and cannot open it" is a different
+   * thing for a caller to be told than "I do not know what this is". */
+  if (!gaud_codec_has(codec, offsetof(GAUD_Codec, open)) || !codec->open) {
+    return GAUD_ERR_UNSUPPORTED;
+  }
+
+  GAUD_Limits resolved;
+  if (limits) {
+    resolved = *limits;
+  }
+  else {
+    gaud_limits_default(&resolved);
+  }
+
+  /* Rewound before the codec sees it: gaud_probe() restores the position it
+   * was given, but a caller may have handed over a stream that was already
+   * partway through, and every container parser here expects to start at
+   * the beginning of its own container. */
+  if (gaud_stream_seekable(stream)) {
+    result = gaud_stream_seek(stream, 0, GAUD_SEEK_SET);
+    if (result != GAUD_OK) {
+      return result;
+    }
+  }
+  return codec->open(codec, stream, &resolved, diagnostics, out_doc);
 }

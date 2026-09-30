@@ -1,0 +1,4 @@
+#!/bin/sh
+# sox writes its banner to stderr and pads the name with spaces; the pin is
+# the two words that matter.
+sox --version 2>&1 | head -1 | sed 's/.*SoX *v/SoX /'

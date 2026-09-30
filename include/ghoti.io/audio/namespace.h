@@ -77,6 +77,7 @@
 #define gaud_have_image_validation GHOTIIO_AUDIO(gaud_have_image_validation)
 
 // Streams.
+#define gaud_stream_allocator GHOTIIO_AUDIO(gaud_stream_allocator)
 #define gaud_stream_create_memory GHOTIIO_AUDIO(gaud_stream_create_memory)
 #define gaud_stream_create_memory_with_allocator                              \
   GHOTIIO_AUDIO(gaud_stream_create_memory_with_allocator)
@@ -100,6 +101,141 @@
 
 // Version.
 #define gaud_version_string GHOTIIO_AUDIO(gaud_version_string)
+
+// Phase 1 types.
+#define GAUD_Buffer GHOTIIO_AUDIO(GAUD_Buffer)
+#define GAUD_Channel GHOTIIO_AUDIO(GAUD_Channel)
+#define GAUD_Channel_Layout GHOTIIO_AUDIO(GAUD_Channel_Layout)
+#define GAUD_Codec_Close_Fn GHOTIIO_AUDIO(GAUD_Codec_Close_Fn)
+#define GAUD_Codec_Decoder_Open_Fn GHOTIIO_AUDIO(GAUD_Codec_Decoder_Open_Fn)
+#define GAUD_Codec_Encoder_Open_Fn GHOTIIO_AUDIO(GAUD_Codec_Encoder_Open_Fn)
+#define GAUD_Codec_Open_Fn GHOTIIO_AUDIO(GAUD_Codec_Open_Fn)
+#define GAUD_Convert_Options GHOTIIO_AUDIO(GAUD_Convert_Options)
+#define GAUD_Decoder GHOTIIO_AUDIO(GAUD_Decoder)
+#define GAUD_Decoder_Vtable GHOTIIO_AUDIO(GAUD_Decoder_Vtable)
+#define GAUD_Dither GHOTIIO_AUDIO(GAUD_Dither)
+#define GAUD_Doc GHOTIIO_AUDIO(GAUD_Doc)
+#define GAUD_Encode_Params GHOTIIO_AUDIO(GAUD_Encode_Params)
+#define GAUD_Encoder GHOTIIO_AUDIO(GAUD_Encoder)
+#define GAUD_Encoder_Vtable GHOTIIO_AUDIO(GAUD_Encoder_Vtable)
+#define GAUD_Ops_Measure GHOTIIO_AUDIO(GAUD_Ops_Measure)
+#define GAUD_Sample_Format GHOTIIO_AUDIO(GAUD_Sample_Format)
+#define GAUD_Sample_Layout GHOTIIO_AUDIO(GAUD_Sample_Layout)
+#define GAUD_Track GHOTIIO_AUDIO(GAUD_Track)
+#define GAUD_Track_Desc GHOTIIO_AUDIO(GAUD_Track_Desc)
+#define GAUD_Trim GHOTIIO_AUDIO(GAUD_Trim)
+
+// Samples, channel layouts and the buffer.
+#define gaud_buffer_capacity GHOTIIO_AUDIO(gaud_buffer_capacity)
+#define gaud_buffer_channels GHOTIIO_AUDIO(gaud_buffer_channels)
+#define gaud_buffer_create GHOTIIO_AUDIO(gaud_buffer_create)
+#define gaud_buffer_data GHOTIIO_AUDIO(gaud_buffer_data)
+#define gaud_buffer_data_const GHOTIIO_AUDIO(gaud_buffer_data_const)
+#define gaud_buffer_destroy GHOTIIO_AUDIO(gaud_buffer_destroy)
+#define gaud_buffer_bytes_used GHOTIIO_AUDIO(gaud_buffer_bytes_used)
+#define gaud_buffer_format GHOTIIO_AUDIO(gaud_buffer_format)
+#define gaud_frame_size GHOTIIO_AUDIO(gaud_frame_size)
+#define gaud_buffer_frame_size GHOTIIO_AUDIO(gaud_buffer_frame_size)
+#define gaud_buffer_frames GHOTIIO_AUDIO(gaud_buffer_frames)
+#define gaud_buffer_layout GHOTIIO_AUDIO(gaud_buffer_layout)
+#define gaud_buffer_offset GHOTIIO_AUDIO(gaud_buffer_offset)
+#define gaud_buffer_sample_layout GHOTIIO_AUDIO(gaud_buffer_sample_layout)
+#define gaud_buffer_set_frames GHOTIIO_AUDIO(gaud_buffer_set_frames)
+#define gaud_buffer_silence GHOTIIO_AUDIO(gaud_buffer_silence)
+#define gaud_buffer_size_bytes GHOTIIO_AUDIO(gaud_buffer_size_bytes)
+#define gaud_channel_layout_at GHOTIIO_AUDIO(gaud_channel_layout_at)
+#define gaud_channel_layout_default GHOTIIO_AUDIO(gaud_channel_layout_default)
+#define gaud_channel_layout_unspecified \
+  GHOTIIO_AUDIO(gaud_channel_layout_unspecified)
+#define gaud_channel_layout_valid GHOTIIO_AUDIO(gaud_channel_layout_valid)
+#define gaud_channel_string GHOTIIO_AUDIO(gaud_channel_string)
+#define gaud_sample_format_bits GHOTIIO_AUDIO(gaud_sample_format_bits)
+#define gaud_sample_format_is_float GHOTIIO_AUDIO(gaud_sample_format_is_float)
+#define gaud_sample_format_is_pcm GHOTIIO_AUDIO(gaud_sample_format_is_pcm)
+#define gaud_sample_format_string GHOTIIO_AUDIO(gaud_sample_format_string)
+
+// Documents and tracks.
+#define gaud_doc_add_track GHOTIIO_AUDIO(gaud_doc_add_track)
+#define gaud_doc_codec_name GHOTIIO_AUDIO(gaud_doc_codec_name)
+#define gaud_doc_create_internal GHOTIIO_AUDIO(gaud_doc_create_internal)
+#define gaud_doc_destroy GHOTIIO_AUDIO(gaud_doc_destroy)
+#define gaud_doc_load GHOTIIO_AUDIO(gaud_doc_load)
+#define gaud_doc_private GHOTIIO_AUDIO(gaud_doc_private)
+#define gaud_doc_set_private GHOTIIO_AUDIO(gaud_doc_set_private)
+#define gaud_doc_stream GHOTIIO_AUDIO(gaud_doc_stream)
+#define gaud_doc_track GHOTIIO_AUDIO(gaud_doc_track)
+#define gaud_doc_track_count GHOTIIO_AUDIO(gaud_doc_track_count)
+#define gaud_track_channels GHOTIIO_AUDIO(gaud_track_channels)
+#define gaud_track_data_length GHOTIIO_AUDIO(gaud_track_data_length)
+#define gaud_track_data_offset GHOTIIO_AUDIO(gaud_track_data_offset)
+#define gaud_track_doc GHOTIIO_AUDIO(gaud_track_doc)
+#define gaud_track_duration GHOTIIO_AUDIO(gaud_track_duration)
+#define gaud_track_format GHOTIIO_AUDIO(gaud_track_format)
+#define gaud_track_frames GHOTIIO_AUDIO(gaud_track_frames)
+#define gaud_track_index GHOTIIO_AUDIO(gaud_track_index)
+#define gaud_track_layout GHOTIIO_AUDIO(gaud_track_layout)
+#define gaud_track_private GHOTIIO_AUDIO(gaud_track_private)
+#define gaud_track_sample_layout GHOTIIO_AUDIO(gaud_track_sample_layout)
+#define gaud_track_sample_rate GHOTIIO_AUDIO(gaud_track_sample_rate)
+#define gaud_track_trim GHOTIIO_AUDIO(gaud_track_trim)
+
+// Decoding and encoding.
+#define gaud_decoder_allocator GHOTIIO_AUDIO(gaud_decoder_allocator)
+#define gaud_decoder_buffer_create GHOTIIO_AUDIO(gaud_decoder_buffer_create)
+#define gaud_decoder_create GHOTIIO_AUDIO(gaud_decoder_create)
+#define gaud_decoder_create_internal \
+  GHOTIIO_AUDIO(gaud_decoder_create_internal)
+#define gaud_decoder_destroy GHOTIIO_AUDIO(gaud_decoder_destroy)
+#define gaud_decoder_private GHOTIIO_AUDIO(gaud_decoder_private)
+#define gaud_decoder_read GHOTIIO_AUDIO(gaud_decoder_read)
+#define gaud_decoder_seek GHOTIIO_AUDIO(gaud_decoder_seek)
+#define gaud_decoder_set_position GHOTIIO_AUDIO(gaud_decoder_set_position)
+#define gaud_decoder_tell GHOTIIO_AUDIO(gaud_decoder_tell)
+#define gaud_decoder_track GHOTIIO_AUDIO(gaud_decoder_track)
+#define gaud_encode_params_default GHOTIIO_AUDIO(gaud_encode_params_default)
+#define gaud_encoder_add_frames GHOTIIO_AUDIO(gaud_encoder_add_frames)
+#define gaud_encoder_allocator GHOTIIO_AUDIO(gaud_encoder_allocator)
+#define gaud_encoder_create GHOTIIO_AUDIO(gaud_encoder_create)
+#define gaud_encoder_create_internal \
+  GHOTIIO_AUDIO(gaud_encoder_create_internal)
+#define gaud_encoder_destroy GHOTIIO_AUDIO(gaud_encoder_destroy)
+#define gaud_encoder_finish GHOTIIO_AUDIO(gaud_encoder_finish)
+#define gaud_encoder_frames_written GHOTIIO_AUDIO(gaud_encoder_frames_written)
+#define gaud_encoder_params GHOTIIO_AUDIO(gaud_encoder_params)
+#define gaud_encoder_private GHOTIIO_AUDIO(gaud_encoder_private)
+#define gaud_encoder_stream GHOTIIO_AUDIO(gaud_encoder_stream)
+#define gaud_encoder_write GHOTIIO_AUDIO(gaud_encoder_write)
+
+// Operations.
+#define gaud_convert_options_default \
+  GHOTIIO_AUDIO(gaud_convert_options_default)
+#define gaud_ops_convert_format GHOTIIO_AUDIO(gaud_ops_convert_format)
+#define gaud_ops_convert_sample_layout \
+  GHOTIIO_AUDIO(gaud_ops_convert_sample_layout)
+#define gaud_ops_dc_offset GHOTIIO_AUDIO(gaud_ops_dc_offset)
+#define gaud_ops_peak GHOTIIO_AUDIO(gaud_ops_peak)
+#define gaud_ops_rms GHOTIIO_AUDIO(gaud_ops_rms)
+
+// Streams added in phase 1.
+#define gaud_stream_create_file GHOTIIO_AUDIO(gaud_stream_create_file)
+#define gaud_stream_create_file_with_allocator \
+  GHOTIIO_AUDIO(gaud_stream_create_file_with_allocator)
+#define gaud_stream_create_file_writer \
+  GHOTIIO_AUDIO(gaud_stream_create_file_writer)
+#define gaud_stream_create_memory_writer \
+  GHOTIIO_AUDIO(gaud_stream_create_memory_writer)
+#define gaud_stream_create_unseekable \
+  GHOTIIO_AUDIO(gaud_stream_create_unseekable)
+#define gaud_stream_writable GHOTIIO_AUDIO(gaud_stream_writable)
+#define gaud_stream_write GHOTIIO_AUDIO(gaud_stream_write)
+#define gaud_stream_writer_bytes GHOTIIO_AUDIO(gaud_stream_writer_bytes)
+
+// The codec SDK and the built-in codecs.
+#define gaud_aiff_register GHOTIIO_AUDIO(gaud_aiff_register)
+#define gaud_codec_has GHOTIIO_AUDIO(gaud_codec_has)
+#define gaud_register_builtin_codecs \
+  GHOTIIO_AUDIO(gaud_register_builtin_codecs)
+#define gaud_wav_register GHOTIIO_AUDIO(gaud_wav_register)
 
 /// @endcond
 

@@ -2,34 +2,56 @@
 
 Sound in C, as a container of tracks with metadata, read and written.
 
-**This is a scaffold.** Nothing decodes audio yet. What exists is the base
-object, the byte stream, the public codec SDK and the registry over it, with
-the build, the gates and the install path all working end to end. The
-[Status](#status) section says precisely what that means, and
+**Phase 1 of ten.** WAV and AIFF read and write, losslessly, with the base
+object, the pull decoder and the public codec SDK behind them. No lossy codec
+exists yet. [Status](#status) says precisely what that means, and
 `planning/audio.md` in the workspace is the design it is being built to.
 
 ## Formats
 
-None yet. The plan reads containers and codecs as two lists, because they are
-two lists: a `.m4a` is a box tree that may hold AAC, ALAC, Opus or FLAC, and
-Opus is the same bitstream in Ogg, Matroska, MP4 and CAF. What is intended, in
-the order it is intended:
+Containers and codecs are two lists, because they are two lists: a `.m4a` is a
+box tree that may hold AAC, ALAC, Opus or FLAC, and Opus is the same bitstream
+in Ogg, Matroska, MP4 and CAF.
 
-- **WAV** (PCM, `WAVEFORMATEXTENSIBLE`, RF64/BW64) and **AIFF/AIFF-C**.
-- **µ-law, A-law, IMA and MS ADPCM**, inside those.
-- **FLAC** (RFC 9639), native and in Ogg.
-- **MP3**, then **Ogg** with **Vorbis** and **Opus**.
-- **ISO BMFF** with **ALAC**, and **AAC-LC** as a separate library.
-- Matroska, CAF, Wave64, au, DSF/DFF.
+This is what is implemented:
 
-Every format this library reads, it will write.
+- **WAV** - RIFF/WAVE, plus **RF64 and BW64**. Integer PCM at 8, 16, 24 and 32
+  bits, IEEE float at 32 and 64, and `WAVE_FORMAT_EXTENSIBLE` wrapping either,
+  including the channel mask. Read and written.
+- **AIFF and AIFF-C** - signed 8, 16, 24 and 32-bit, and AIFF-C's `NONE`,
+  `twos`, `sowt` (little-endian) and `fl32`/`fl64`. Read and written.
+
+Each has a page saying what it covers and where it differs: \ref format_wav
+"formats/wav.md" and \ref format_aiff "formats/aiff.md".
+
+The two are in phase 1 together deliberately. **WAV is little-endian and AIFF
+is big-endian**, and their 8-bit samples disagree about sign, so each codec
+exercises exactly the paths the other does not - and `make check-golden` runs
+the corpus on big-endian targets, where the two swap round.
+
+What comes next, in order: µ-law, A-law and ADPCM inside these containers;
+FLAC; MP3; Ogg with Vorbis and Opus; ISO BMFF with ALAC, and AAC-LC as a
+separate library. Every format this library reads, it writes.
 
 ## Before you call it
 
 - **Loading a file decodes no samples.** An hour of 96 kHz stereo is about
-  2 GB of PCM, so `gaud_doc_load()` will parse the container, the track list
-  and the metadata and stop. Samples come from a pull decoder, a block at a
-  time.
+  2 GB of PCM, so `gaud_doc_load()` parses the container and the track list
+  and stops. Samples come from a pull decoder, a block at a time, into a
+  buffer you sized. A short read means the end and is not an error.
+- **A seek says where it landed.** For PCM that is always the frame you asked
+  for; it is a parameter rather than a promise because it will not be, for a
+  codec whose frames depend on the ones before them.
+- **Samples are in the host's byte order.** That is why WAV and AIFF produce
+  the same buffer, and it means the raw bytes of a correct decode differ
+  between a little-endian and a big-endian machine. The *values* do not, and
+  `make check-golden` proves it.
+- **Writing needs a seekable sink**, and says so when the encoder is created
+  rather than when it is finished. A RIFF or IFF header states a length that
+  is not known until the data has been written.
+- **`gaud_encoder_finish()` must be called and its result checked.** That is
+  where the header is patched; an encoder merely destroyed leaves a file
+  describing a size it does not have.
 - **Nothing is converted unless you ask.** Sample rate, sample format, channel
   layout and loudness are carried and reported; resampling, requantising,
   remixing and gain are `ops.h`, explicitly. This is `image`'s rule about
@@ -177,30 +199,64 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phase 0 of ten, complete. What works:
+Phase 1 of ten, complete. What works:
 
-- The base object's result codes, diagnostics and limits.
-- A memory stream: read, seek from three origins, tell, size, eof, and a
-  seekable query. The file stream is phase 1.
-- The public codec SDK: the vtable with `abi_version` and `size`, a registry
-  that borrows rather than copies, duplicate-name and ABI refusal, and a probe
-  that identifies by signature or by a codec's own function and leaves the
-  stream where it found it.
-- 51 tests, clean under ASan, UBSan and Valgrind, from an empty build
-  directory, serially and under `-j`. Both `image` arms build and pass.
-- `make install` and a consumer built against nothing but the installed
-  headers.
+- **WAV and AIFF, read and written**, across every PCM width both can carry,
+  including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
+- The base object: `GAUD_Buffer` with interleaved and planar layouts, sample
+  formats including the non-PCM cases DSD and opaque, and an explicit
+  `GAUD_Channel_Layout` that keeps "the file did not say" distinct from mono.
+- The pull decoder, seeking that reports where it landed, and an encoder that
+  patches its own header.
+- `ops.h`: sample-format conversion with selectable dither, layout
+  conversion, and the peak/RMS/DC measurements the decode gate rests on.
+- Streams over memory, over files, growable for writing, and a wrapper that
+  makes one non-seekable so that path can be *tested*.
+- **The codec SDK proved from outside**: `make check-outoftree` installs into
+  a throwaway prefix and builds a codec against nothing but the installed
+  headers. It found two functions that were declared `GAUD_API` and silently
+  not exported, which `check-symbols` structurally could not see - that gap
+  is now a sixth sub-check of `check-symbols`.
 
-What is deliberately absent, and when it arrives:
+How it is judged:
 
-- **Any codec.** Phase 1 brings WAV and AIFF.
-- **`GAUD_Doc`, `GAUD_Track`, `GAUD_Buffer` and the pull decoder.** Phase 1.
-  The codec vtable has identification only; the decode and encode entry points
-  are appended to it then, which is what `abi_version` and `size` exist for.
-- **`make check-fixtures` is not in `TEST_GATES`.** It refuses to run against
-  a tree with no `tests/data`, which is right - a gate measuring an empty set
-  reports success. It goes back in phase 1 with the first fixtures.
-- **No fuzz harnesses.** One per container, added with the container.
+| Gate | What it settles |
+| --- | --- |
+| `make check-corpus` | Four independent references - ffmpeg, sox, libsndfile and Python's `wave` - decode the corpus exactly as this does. PCM is lossless, so this is a byte comparison and not a tolerance |
+| `make check-writer` | Those references read what this library wrote, and the samples survived the round trip. 26 round trips, both containers, both directions |
+| `make check-golden` | The corpus decodes to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs |
+| `make check-outoftree` | A codec in another repository works |
+| `make fuzz` | Per-container harnesses asserting the caller-facing invariants, not merely the absence of a crash |
+
+The corpus is generated **by** the references and never by this library: one
+grown from our own writer would agree with our own reader by construction.
+`make oracle-build` builds the pinned image; `make corpus` regenerates it.
+
+121 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+serially and under `-j`, in both `?image` arms.
+
+What is deliberately absent:
+
+- **Any lossy codec.** Phase 2 brings the compressed formats that live inside
+  these two containers; FLAC is phase 4 and MP3 phase 5.
+- **Metadata.** ID3, `LIST`/`INFO`, `bext` and the rest are phase 3. They are
+  skipped by length today, so they never stop a file loading.
+- **`GAUD_SAMPLE_DSD1` and `GAUD_SAMPLE_OPAQUE` exist and nothing produces
+  them.** They are in the base object because a registered codec cannot add a
+  case to it later; DSD is phase 9 and remux needs the opaque one.
+- **Resampling, remixing and loudness.** `ops.h` converts formats and
+  measures; it does not yet change a rate or a channel count.
+
+## Documentation
+
+| Page | What it settles |
+| --- | --- |
+| \ref format_wav "formats/wav.md" | RIFF/WAVE, RF64 and BW64: what is covered, and the five things a reader gets wrong |
+| \ref format_aiff "formats/aiff.md" | AIFF and AIFF-C, including the 80-bit float its sample rate is stored as |
+| \ref writing_a_codec "writing-a-codec.md" | The compatibility contract for a codec in another repository |
+| \ref development "development.md" | Building, the gates, and why a clean tree is a different test |
+
+`make docs` builds the manual those pages feed.
 
 ## License
 

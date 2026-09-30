@@ -2,6 +2,6 @@ Name: Ghoti.io Audio(BRANCH)
 Description: Sound as a container of tracks - codecs, containers and metadata, read and written
 Version: (VERSION)
 URL: https://github.com/Ghoti-io/audio
-Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)
+Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH) -lm
 CFlags: -I(PC_INCLUDE_DIR)
 Requires: (REQUIRES)

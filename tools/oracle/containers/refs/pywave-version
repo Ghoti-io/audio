@@ -1,0 +1,4 @@
+#!/bin/sh
+# `wave` is a stdlib module with no version of its own, so the interpreter's
+# version is the module's - its behaviour has changed between releases.
+python3 -c 'import sys, wave; print("Python %d.%d.%d wave" % sys.version_info[:3])'

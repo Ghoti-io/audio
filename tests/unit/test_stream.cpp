@@ -27,6 +27,8 @@
 #include <ghoti.io/audio/audio.h>
 #include <gtest/gtest.h>
 #include <string.h>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -206,6 +208,149 @@ TEST(Stream, SizeRejectsNullOutput) {
   GAUD_Stream * stream = OpenSample();
   EXPECT_EQ(gaud_stream_size(stream, nullptr), GAUD_ERR_INVALID);
   gaud_stream_destroy(stream);
+}
+
+TEST(Writer, GrowsAndReadsBackWhatWasWritten) {
+  GAUD_Stream * w = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory_writer(nullptr, &w), GAUD_OK);
+  EXPECT_TRUE(gaud_stream_writable(w));
+  EXPECT_TRUE(gaud_stream_seekable(w));
+
+  // More than the initial allocation, so the grow path runs.
+  std::vector<unsigned char> blob(5000);
+  for (size_t i = 0; i < blob.size(); ++i) {
+    blob[i] = static_cast<unsigned char>(i * 7);
+  }
+  ASSERT_EQ(gaud_stream_write(w, blob.data(), blob.size()), GAUD_OK);
+
+  const void * bytes = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(gaud_stream_writer_bytes(w, &bytes, &length), GAUD_OK);
+  EXPECT_EQ(length, blob.size());
+  EXPECT_EQ(memcmp(bytes, blob.data(), blob.size()), 0);
+  gaud_stream_destroy(w);
+}
+
+TEST(Writer, OverwritingTheMiddleDoesNotTruncate) {
+  // Patching a header whose length was unknown at the time is exactly what
+  // this supports; a write that truncated would destroy the samples.
+  GAUD_Stream * w = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory_writer(nullptr, &w), GAUD_OK);
+  const unsigned char first[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  ASSERT_EQ(gaud_stream_write(w, first, sizeof(first)), GAUD_OK);
+  ASSERT_EQ(gaud_stream_seek(w, 2, GAUD_SEEK_SET), GAUD_OK);
+  const unsigned char patch[] = {0xAA, 0xBB};
+  ASSERT_EQ(gaud_stream_write(w, patch, sizeof(patch)), GAUD_OK);
+
+  const void * bytes = nullptr;
+  size_t length = 0;
+  gaud_stream_writer_bytes(w, &bytes, &length);
+  ASSERT_EQ(length, 8u) << "the tail was lost";
+  const unsigned char expect[] = {1, 2, 0xAA, 0xBB, 5, 6, 7, 8};
+  EXPECT_EQ(memcmp(bytes, expect, sizeof(expect)), 0);
+  gaud_stream_destroy(w);
+}
+
+TEST(Writer, ANonWriterRefusesWritesAndTheQuery) {
+  GAUD_Stream * r = OpenSample();
+  EXPECT_FALSE(gaud_stream_writable(r));
+  const unsigned char byte = 1;
+  EXPECT_EQ(gaud_stream_write(r, &byte, 1), GAUD_ERR_INVALID);
+  const void * bytes = nullptr;
+  size_t length = 0;
+  EXPECT_EQ(gaud_stream_writer_bytes(r, &bytes, &length),
+      GAUD_ERR_UNSUPPORTED);
+  gaud_stream_destroy(r);
+}
+
+TEST(Writer, AZeroLengthWriteIsFine) {
+  GAUD_Stream * w = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory_writer(nullptr, &w), GAUD_OK);
+  EXPECT_EQ(gaud_stream_write(w, nullptr, 0), GAUD_OK);
+  gaud_stream_destroy(w);
+}
+
+TEST(Unseekable, ForwardsReadsAndRefusesEverythingElse) {
+  // The wrapper exists so this path can be REACHED by a test. "A pipe is an
+  // ordinary way to receive audio" describes code that never runs unless
+  // something makes it run, and a gate that cannot reach a branch reports
+  // success for it.
+  GAUD_Stream * source = OpenSample();
+  GAUD_Stream * blind = nullptr;
+  ASSERT_EQ(gaud_stream_create_unseekable(source, &blind), GAUD_OK);
+
+  EXPECT_FALSE(gaud_stream_seekable(blind));
+  EXPECT_FALSE(gaud_stream_writable(blind));
+
+  unsigned char out[4] = {};
+  EXPECT_EQ(gaud_stream_read(blind, out, 4), 4u);
+  EXPECT_EQ(memcmp(out, "RIFF", 4), 0);
+  EXPECT_EQ(gaud_stream_tell(blind), 4u);
+
+  EXPECT_EQ(gaud_stream_seek(blind, 0, GAUD_SEEK_SET), GAUD_ERR_UNSUPPORTED);
+  uint64_t size = 0;
+  EXPECT_EQ(gaud_stream_size(blind, &size), GAUD_ERR_UNSUPPORTED)
+      << "a pipe does not know its own length, and a wrapper that passed "
+         "the real one through would model a stream that exists nowhere";
+
+  gaud_stream_destroy(blind);
+  gaud_stream_destroy(source);
+}
+
+TEST(Unseekable, ReachesTheEndTheSameWayTheSourceDoes) {
+  GAUD_Stream * source = OpenSample();
+  GAUD_Stream * blind = nullptr;
+  ASSERT_EQ(gaud_stream_create_unseekable(source, &blind), GAUD_OK);
+  unsigned char out[64] = {};
+  EXPECT_EQ(gaud_stream_read(blind, out, sizeof(out)), sizeof(kBytes));
+  EXPECT_TRUE(gaud_stream_eof(blind));
+  gaud_stream_destroy(blind);
+  gaud_stream_destroy(source);
+}
+
+TEST(Unseekable, RefusesNullSource) {
+  GAUD_Stream * blind = nullptr;
+  EXPECT_EQ(gaud_stream_create_unseekable(nullptr, &blind), GAUD_ERR_INVALID);
+  GAUD_Stream * source = OpenSample();
+  EXPECT_EQ(gaud_stream_create_unseekable(source, nullptr), GAUD_ERR_INVALID);
+  gaud_stream_destroy(source);
+}
+
+TEST(FileStream, ReadsAFileTheSameWayAMemoryStreamReadsItsBytes) {
+  std::string path = std::string(GAUD_TEST_DATA) + "/wav_s16_stereo_44100.wav";
+  GAUD_Stream * file = nullptr;
+  ASSERT_EQ(gaud_stream_create_file(path.c_str(), &file), GAUD_OK);
+  EXPECT_TRUE(gaud_stream_seekable(file));
+  EXPECT_FALSE(gaud_stream_writable(file));
+
+  uint64_t size = 0;
+  ASSERT_EQ(gaud_stream_size(file, &size), GAUD_OK);
+  EXPECT_GT(size, 12u);
+
+  unsigned char head[12] = {};
+  ASSERT_EQ(gaud_stream_read(file, head, sizeof(head)), sizeof(head));
+  EXPECT_EQ(memcmp(head, "RIFF", 4), 0);
+  EXPECT_EQ(memcmp(head + 8, "WAVE", 4), 0);
+  EXPECT_EQ(gaud_stream_tell(file), 12u);
+
+  ASSERT_EQ(gaud_stream_seek(file, 0, GAUD_SEEK_SET), GAUD_OK);
+  EXPECT_EQ(gaud_stream_tell(file), 0u);
+  EXPECT_FALSE(gaud_stream_eof(file));
+
+  // Out of range is refused identically to the memory stream, rather than
+  // being whatever fseek happens to permit - seeking past the end of a file
+  // is legal in C and makes a hole on the next write.
+  EXPECT_EQ(gaud_stream_seek(file, -1, GAUD_SEEK_SET), GAUD_ERR_INVALID);
+  EXPECT_EQ(gaud_stream_seek(file, 1, GAUD_SEEK_END), GAUD_ERR_INVALID);
+  gaud_stream_destroy(file);
+}
+
+TEST(FileStream, RefusesAFileThatIsNotThere) {
+  GAUD_Stream * file = nullptr;
+  EXPECT_EQ(gaud_stream_create_file("/nonexistent/nothing.wav", &file),
+      GAUD_ERR_IO);
+  EXPECT_EQ(file, nullptr);
+  EXPECT_EQ(gaud_stream_create_file(nullptr, &file), GAUD_ERR_INVALID);
 }
 
 int main(int argc, char ** argv) {

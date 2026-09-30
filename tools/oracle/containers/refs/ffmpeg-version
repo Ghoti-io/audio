@@ -1,0 +1,4 @@
+#!/bin/sh
+# "ffmpeg <version>", so a comparison scores the pin rather than the build
+# banner and copyright line that follow it on the same line.
+ffmpeg -version 2>/dev/null | head -1 | awk '{print $1, $3}'

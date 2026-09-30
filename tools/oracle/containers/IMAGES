@@ -1,0 +1,49 @@
+# The oracle references, pinned.
+#
+# One line per reference, tab-separated: <name> <image> <version> <what it
+# answers>.
+#
+# **Every line names the same image**, which is not tidiness. These are four
+# independent implementations asked the same question about the same file,
+# and the whole value is in where they disagree. In one image per reference,
+# with one base state each, a disagreement would first have to be shown not
+# to be the images' fault. One image makes "the reference set" one fact.
+#
+# The image is built here, so the tag is not a digest of the finished image:
+# two builds of one Containerfile are not two copies of one image. What is
+# pinned instead is everything the build reads - the base by digest, the
+# packages by full apt version, resolved against a dated snapshot of the
+# Debian archive so the pins do not expire - and the run-time version check
+# is the real guarantee. oracle_env.check_pin() therefore runs in *both*
+# modes; there is no stock image named here, so relaxing it in host mode
+# would leave nothing checking anything.
+#
+# Two of them need a word about what the number is:
+#
+#   - For libsndfile it is the **C library's** version and not
+#     python-soundfile's. soundfile is a ctypes wrapper; libsndfile is what
+#     decides an answer, and the two move independently.
+#   - For pywave it is the interpreter version, because `wave` is a stdlib
+#     module with no version of its own and its behaviour has changed
+#     between releases. Note what that same release took away: **Python 3.13
+#     removed `aifc`** under PEP 594, so there is no stdlib AIFF reader any
+#     more. AIFF is scored by ffmpeg, sox and libsndfile; WAV by all four.
+#
+# Raising a pin is deliberate. A new reference version is new answers, and a
+# new answer that disagrees is a finding to triage rather than a regression
+# to fix.
+#
+# Building it:
+#   make oracle-build
+
+ffmpeg	localhost/ghoti-audio-oracle-refs:deb13	ffmpeg 7.1.5	libavformat's RIFF and IFF demuxers; the most widely deployed reader of both formats
+sox	localhost/ghoti-audio-oracle-refs:deb13	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
+libsndfile	localhost/ghoti-audio-oracle-refs:deb13	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
+pywave	localhost/ghoti-audio-oracle-refs:deb13	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
+
+# Not here yet:
+#   afconvert  Apple's own, and the reference that decides what AIFF-C really
+#              means. It is macOS-only, so it cannot live in this image; when
+#              something turns on a disagreement about AIFF-C it will have to
+#              be run by hand and its answer committed.
+#   flac/opusdec  Phase 4 and phase 6 bring the codecs they answer about.
