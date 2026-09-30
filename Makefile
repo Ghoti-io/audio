@@ -1416,8 +1416,12 @@ endef
 # aggregate target below. Two lists is how a harness comes to exist, build, and
 # never be run by `make fuzz` - which adding the writer harness demonstrated, by
 # building and passing while the aggregate still named three.
-# One harness per container, added with the container.
-FUZZ_HARNESSES := wav aiff
+# One harness per container, added with the container - plus `coded`,
+# which is not a container. The two container harnesses reach the block
+# decoders only through a header the fuzzer has to synthesise correctly
+# first, so nearly every input dies at the chunk walk and the nibble loops
+# see almost nothing. `coded` hands the bytes straight to the block layer.
+FUZZ_HARNESSES := wav aiff coded
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))

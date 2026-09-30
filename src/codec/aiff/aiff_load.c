@@ -36,6 +36,7 @@
  */
 
 #include "../shared/bytes.h"
+#include "../shared/coded.h"
 #include "aiff_internal.h"
 #include <ghoti.io/cutil/allocator.h>
 #include <string.h>
@@ -85,6 +86,9 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   bool have_comm = false;
   bool little_endian = false; /* `sowt` and friends. */
   bool is_float = false;
+  GAUD_Sample_Coding coding = GAUD_CODING_PCM;
+  GAUD_Coded_Geometry geometry;
+  memset(&geometry, 0, sizeof(geometry));
   uint64_t data_offset = 0;
   uint64_t data_length = 0;
   bool have_ssnd = false;
@@ -144,10 +148,23 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
         else if (id_is(compression, "fl64") || id_is(compression, "FL64")) {
           is_float = true;
         }
+        /* G.711 has two spellings apiece: Apple's lower case and SGI's
+         * upper. They name the same coding and both appear in the wild,
+         * so both are accepted; the writer emits Apple's, which is what
+         * both writers in the oracle image emit. */
+        else if (id_is(compression, "ulaw") || id_is(compression, "ULAW")) {
+          coding = GAUD_CODING_G711_ULAW;
+        }
+        else if (id_is(compression, "alaw") || id_is(compression, "ALAW")) {
+          coding = GAUD_CODING_G711_ALAW;
+        }
+        else if (id_is(compression, "ima4")) {
+          coding = GAUD_CODING_ADPCM_IMA_QT;
+        }
         else {
-          /* Refused by name rather than decoded as PCM. An IMA or µ-law
-           * AIFF-C read as though it were PCM produces loud noise, which is
-           * a worse answer than saying no. */
+          /* Refused by name rather than decoded as PCM. An AIFF-C in a
+           * compression this does not implement, read as though it were
+           * PCM, produces loud noise - a worse answer than saying no. */
           return GAUD_ERR_UNSUPPORTED;
         }
       }
@@ -215,7 +232,10 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   }
 
   GAUD_Sample_Format format;
-  if (is_float) {
+  if (coding != GAUD_CODING_PCM) {
+    format = gaud_sample_coding_format(coding);
+  }
+  else if (is_float) {
     if (bits == 32) {
       format = GAUD_SAMPLE_F32;
     }
@@ -238,21 +258,59 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     }
   }
 
-  size_t frame_size = gaud_frame_size(format, channels);
-  if (frame_size == 0) {
-    return GAUD_ERR_CORRUPT;
+  size_t frame_size = 0;
+  uint64_t frames = 0;
+  if (coding == GAUD_CODING_PCM) {
+    frame_size = gaud_frame_size(format, channels);
+    if (frame_size == 0) {
+      return GAUD_ERR_CORRUPT;
+    }
+    uint64_t frames_present = data_length / frame_size;
+    /* COMM states the frame count and SSND carries the bytes. Where they
+     * disagree the bytes win, because they are what can actually be read;
+     * the disagreement is worth a diagnostic because it means something
+     * truncated the file. */
+    frames = frames_stated;
+    if (frames_stated != frames_present) {
+      note(diagnostics, 0,
+          "COMM's frame count disagrees with the sound chunk's length; the "
+          "chunk's length is used");
+      frames = frames_present;
+    }
   }
-  uint64_t frames_present = data_length / frame_size;
-  /* COMM states the frame count and SSND carries the bytes. Where they
-   * disagree the bytes win, because they are what can actually be read;
-   * the disagreement is worth a diagnostic because it means something
-   * truncated the file. */
-  uint64_t frames = frames_stated;
-  if (frames_stated != frames_present) {
-    note(diagnostics, 0,
-        "COMM's frame count disagrees with the sound chunk's length; the "
-        "chunk's length is used");
-    frames = frames_present;
+  else {
+    GAUD_Result result
+        = gaud_coded_geometry(coding, channels, 0, 0, &geometry);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    uint64_t whole = data_length / geometry.block_bytes;
+    uint64_t tail = data_length % geometry.block_bytes;
+    frames = whole * geometry.block_frames;
+    if (tail > 0) {
+      frames += gaud_coded_tail_frames(&geometry, (size_t)tail);
+    }
+    /*
+     * COMM is advisory here, and deliberately so.
+     *
+     * For `ima4` the field does not mean what the AIFF-C specification
+     * says it means. The spec describes COMM as stating the uncompressed
+     * data's sample-frame count; ffmpeg 7.1.5 and libsndfile 1.2.2 both
+     * *write* the packet count instead - 32 for a 2048-frame file - and
+     * both *decoders* ignore the field entirely, deriving the length from
+     * SSND. Patching it to 32, 2048, 7 or 100000 changes neither
+     * reference's output. So the bytes are the authority, two independent
+     * implementations agree that they are, and COMM only gets a
+     * diagnostic when it is inconsistent with them under either reading.
+     *
+     * notes/audio/phase2-calibration.md records the measurements.
+     */
+    if (frames_stated != 0 && frames_stated != frames
+        && frames_stated * 64u != frames) {
+      note(diagnostics, 0,
+          "COMM's frame count matches neither the sound chunk's frames nor "
+          "its packet count; the chunk's length is used");
+    }
   }
   if (frames > limits->max_frames) {
     return GAUD_ERR_LIMIT;
@@ -276,16 +334,24 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
    * otherwise, so whether a swap is needed depends on both. */
   bool file_is_little = little_endian;
   bool host_is_little = gaud_host_is_little_endian();
+  uint64_t stored_bytes
+      = coding == GAUD_CODING_PCM ? frames * frame_size : data_length;
   *state = (AIFF_Track_State){
       .data_offset = data_offset,
-      .data_length = frames * frame_size,
+      .data_length = stored_bytes,
       .frame_size = frame_size,
-      .needs_swap = (file_is_little != host_is_little)
+      /* A coded track never swaps: the block layer produces host-order
+       * int16_t rather than bytes copied out of the file. */
+      .needs_swap = coding == GAUD_CODING_PCM
+          && (file_is_little != host_is_little)
           && gaud_sample_format_bits(format) > 8,
+      .coding = coding,
+      .geometry = geometry,
   };
 
   GAUD_Track_Desc desc = {
       .format = format,
+      .coding = coding,
       /* The rate is stored as a float and used as an integer. Rounding
        * rather than truncating: 44100 written by a writer that lost a bit
        * would otherwise read back as 44099. */
@@ -295,7 +361,7 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       .frames = frames,
       .trim = {0, 0, false},
       .data_offset = data_offset,
-      .data_length = frames * frame_size,
+      .data_length = stored_bytes,
       .codec_private = state,
   };
   result = gaud_doc_add_track(doc, &desc, NULL);

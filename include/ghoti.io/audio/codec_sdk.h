@@ -41,6 +41,7 @@
 #include <ghoti.io/audio/allocator.h>
 #include <ghoti.io/audio/buffer.h>
 #include <ghoti.io/audio/codec.h>
+#include <ghoti.io/audio/coding.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/decoder.h>
 #include <ghoti.io/audio/doc.h>
@@ -63,8 +64,16 @@ extern "C" {
  * pretending to be one.
  */
 typedef struct {
-  /** How each sample is stored. Required. */
+  /** What this track's decoder will put in a buffer. Required. */
   GAUD_Sample_Format format;
+  /**
+   * How the container codes them, or ::GAUD_CODING_PCM (zero) when it does
+   * not. A codec that decodes µ-law sets @p format to ::GAUD_SAMPLE_S16 and
+   * this to ::GAUD_CODING_G711_ULAW: the first is what the caller receives,
+   * the second is what the file said, and gaud_track_coding() reports it so
+   * a round trip can put it back.
+   */
+  GAUD_Sample_Coding coding;
   /** Frames per second. Required, and refused if zero. */
   uint32_t sample_rate;
   /** Which speakers. Its `channels` is required and refused if zero. */

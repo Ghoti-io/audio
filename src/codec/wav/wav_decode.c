@@ -31,6 +31,7 @@
  */
 
 #include "../shared/bytes.h"
+#include "../shared/coded.h"
 #include "wav_internal.h"
 #include <ghoti.io/cutil/allocator.h>
 #include <string.h>
@@ -108,9 +109,17 @@ static const GAUD_Decoder_Vtable wav_decoder_vtable = {
 GAUD_Result gaud_wav_decoder_open(const GAUD_Codec * codec,
     GAUD_Track * track, GAUD_Decoder ** out_decoder) {
   (void)codec;
-  if (!gaud_track_private(track)) {
+  WAV_Track_State * state = gaud_track_private(track);
+  if (!state) {
     return GAUD_ERR_INTERNAL;
   }
+  if (state->coding != GAUD_CODING_PCM) {
+    /* Coded tracks go through the shared block decoder, which allocates
+     * per-decoder state because it caches a decoded block. PCM keeps the
+     * phase 1 arrangement of hanging read-only state off the track. */
+    return gaud_coded_decoder_open(track, &state->geometry,
+        state->data_offset, state->data_length, out_decoder);
+  }
   return gaud_decoder_create_internal(
-      track, &wav_decoder_vtable, gaud_track_private(track), out_decoder);
+      track, &wav_decoder_vtable, state, out_decoder);
 }

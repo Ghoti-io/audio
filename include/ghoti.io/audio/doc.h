@@ -33,6 +33,7 @@
 #define GHOTI_IO_GAUD_DOC_H
 
 #include <ghoti.io/audio/buffer.h>
+#include <ghoti.io/audio/coding.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/macros.h>
 #include <ghoti.io/audio/stream.h>
@@ -99,8 +100,22 @@ GAUD_API const char * gaud_doc_codec_name(const GAUD_Doc * doc);
 /** @brief The stream the document was loaded from. */
 GAUD_API GAUD_Stream * gaud_doc_stream(const GAUD_Doc * doc);
 
-/** @brief How each sample of this track is stored. */
+/** @brief What this track's decoder puts in a buffer. */
 GAUD_API GAUD_Sample_Format gaud_track_format(const GAUD_Track * track);
+
+/**
+ * @brief How the container coded this track's samples.
+ *
+ * ::GAUD_CODING_PCM for an uncompressed track, which is what
+ * gaud_track_format() alone already described. For a companded or ADPCM
+ * track this is the only place the file's own coding is reported:
+ * gaud_track_format() says ::GAUD_SAMPLE_S16 for all of them, because that
+ * is what comes out.
+ *
+ * A caller re-encoding a file passes this straight into
+ * ::GAUD_Encode_Params::coding to keep the coding it had.
+ */
+GAUD_API GAUD_Sample_Coding gaud_track_coding(const GAUD_Track * track);
 
 /** @brief Frames per second. */
 GAUD_API uint32_t gaud_track_sample_rate(const GAUD_Track * track);

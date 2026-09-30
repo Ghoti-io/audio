@@ -20,9 +20,15 @@ This is what is implemented:
   including the channel mask. Read and written.
 - **AIFF and AIFF-C** - signed 8, 16, 24 and 32-bit, and AIFF-C's `NONE`,
   `twos`, `sowt` (little-endian) and `fl32`/`fl64`. Read and written.
+- **Coded samples inside both** - G.711 µ-law and A-law, IMA/DVI ADPCM in
+  WAV's block framing and in QuickTime's `ima4` packets, and Microsoft
+  ADPCM. Read and written. They decode to signed 16-bit and are reported
+  separately from the sample format, because what is in the file and what is
+  in the buffer are different questions.
 
 Each has a page saying what it covers and where it differs: \ref format_wav
-"formats/wav.md" and \ref format_aiff "formats/aiff.md".
+"formats/wav.md", \ref format_aiff "formats/aiff.md" and \ref format_coding
+"formats/coding.md".
 
 The two are in phase 1 together deliberately. **WAV is little-endian and AIFF
 is big-endian**, and their 8-bit samples disagree about sign, so each codec
@@ -199,10 +205,14 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phase 1 of ten, complete. What works:
+Phase 2 of ten, complete. What works:
 
 - **WAV and AIFF, read and written**, across every PCM width both can carry,
   including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
+- **G.711 and two ADPCM families inside them**, read and written, with
+  `GAUD_Sample_Coding` reporting what the file used separately from what the
+  buffer holds. Blocks are self-contained, so seeking into a coded track is
+  still exact.
 - The base object: `GAUD_Buffer` with interleaved and planar layouts, sample
   formats including the non-PCM cases DSD and opaque, and an explicit
   `GAUD_Channel_Layout` that keeps "the file did not say" distinct from mono.
@@ -223,22 +233,34 @@ How it is judged:
 | Gate | What it settles |
 | --- | --- |
 | `make check-corpus` | Four independent references - ffmpeg, sox, libsndfile and Python's `wave` - decode the corpus exactly as this does. PCM is lossless, so this is a byte comparison and not a tolerance |
-| `make check-writer` | Those references read what this library wrote, and the samples survived the round trip. 26 round trips, both containers, both directions |
+| `make check-writer` | Those references read what this library wrote, and the samples survived the round trip: 68 lossless round trips across both containers and both directions, plus 95 coded ones scored two ways - every reference must decode the file at all, and the SNR must clear a floor stated per coding |
 | `make check-golden` | The corpus decodes to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs |
 | `make check-outoftree` | A codec in another repository works |
-| `make fuzz` | Per-container harnesses asserting the caller-facing invariants, not merely the absence of a crash |
+| `make fuzz` | Per-container harnesses asserting the caller-facing invariants, not merely the absence of a crash - plus `coded`, which drives the block layer below any container, because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does. It found a real defect in its first minute |
 
 The corpus is generated **by** the references and never by this library: one
 grown from our own writer would agree with our own reader by construction.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-121 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+131 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms.
+
+Two figures the gates print rather than assume: the corpus exercises **all 89
+IMA step-table entries with a nibble magnitude that makes a wrong value
+visible** - counting bare loads said 89 of 89 while a deliberately wrong
+entry still decoded identically, and the honest figure was 54 - and the MS
+ADPCM coefficient table this library writes is byte-identical to ffmpeg's,
+which is the only thing that can check it, since our decoder uses the table
+in the file and our encoder only ever names pair 0.
 
 What is deliberately absent:
 
-- **Any lossy codec.** Phase 2 brings the compressed formats that live inside
-  these two containers; FLAC is phase 4 and MP3 phase 5.
+- **Any perceptual codec.** The four codings above are sample quantisers, not
+  psychoacoustic ones. FLAC is phase 4 and MP3 phase 5.
+- **ADPCM above two channels, on write.** The formats have no defined
+  interleave for it and ffmpeg refuses both directions, so writing one would
+  produce a file the most widely deployed reader cannot open. Reading stays
+  liberal.
 - **Metadata.** ID3, `LIST`/`INFO`, `bext` and the rest are phase 3. They are
   skipped by length today, so they never stop a file loading.
 - **`GAUD_SAMPLE_DSD1` and `GAUD_SAMPLE_OPAQUE` exist and nothing produces
@@ -253,6 +275,7 @@ What is deliberately absent:
 | --- | --- |
 | \ref format_wav "formats/wav.md" | RIFF/WAVE, RF64 and BW64: what is covered, and the five things a reader gets wrong |
 | \ref format_aiff "formats/aiff.md" | AIFF and AIFF-C, including the 80-bit float its sample rate is stored as |
+| \ref format_coding "formats/coding.md" | G.711 and the two ADPCM families: one algorithm in two framings, and where the references disagree |
 | \ref writing_a_codec "writing-a-codec.md" | The compatibility contract for a codec in another repository |
 | \ref development "development.md" | Building, the gates, and why a clean tree is a different test |
 

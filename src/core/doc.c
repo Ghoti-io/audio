@@ -144,6 +144,10 @@ GAUD_Sample_Format gaud_track_format(const GAUD_Track * track) {
   return track ? track->desc.format : GAUD_SAMPLE_FORMAT_COUNT;
 }
 
+GAUD_Sample_Coding gaud_track_coding(const GAUD_Track * track) {
+  return track ? track->desc.coding : GAUD_CODING_PCM;
+}
+
 uint32_t gaud_track_sample_rate(const GAUD_Track * track) {
   return track ? track->desc.sample_rate : 0u;
 }

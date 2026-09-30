@@ -28,16 +28,19 @@
 #ifndef GHOTI_IO_GAUD_SRC_CODEC_AIFF_AIFF_INTERNAL_H
 #define GHOTI_IO_GAUD_SRC_CODEC_AIFF_AIFF_INTERNAL_H
 
+#include "../shared/adpcm.h"
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/macros.h>
 #include <stdint.h>
 
 /** What one track's decoder needs to find its samples again. */
 typedef struct {
-  uint64_t data_offset; ///< Where the sample bytes start.
-  uint64_t data_length; ///< How many of them.
-  size_t frame_size;    ///< Bytes per frame.
-  bool needs_swap;      ///< Whether the file's order is not the host's.
+  uint64_t data_offset;      ///< Where the sample bytes start.
+  uint64_t data_length;      ///< How many of them.
+  size_t frame_size;         ///< Bytes per frame. Zero for a coded track.
+  bool needs_swap;           ///< Whether the file's order is not the host's.
+  GAUD_Sample_Coding coding; ///< ::GAUD_CODING_PCM for an uncoded track.
+  GAUD_Coded_Geometry geometry; ///< Meaningful only when coded.
 } AIFF_Track_State;
 
 /**

@@ -11,6 +11,13 @@ BW64**: the `ds64` chunk is consulted before any size is believed, so a
 `data` length of `0xFFFFFFFF` resolves to the 64-bit value rather than being
 read as four gigabytes.
 
+**Coded samples.** `WAVE_FORMAT_MULAW` (0x0007), `WAVE_FORMAT_ALAW`
+(0x0006), `WAVE_FORMAT_IMA_ADPCM` (0x0011) and `WAVE_FORMAT_ADPCM` (0x0002),
+read and written. All four decode to ::GAUD_SAMPLE_S16 and are reported by
+gaud_track_coding(); see \ref format_coding "the codings page" for what each
+one is. The `fact` chunk is read and written, and is the only record of a
+coded track's true length.
+
 **Write.** The same formats, except signed 8-bit, which the container cannot
 express. `WAVE_FORMAT_EXTENSIBLE` is emitted when and only when it says
 something the plain header cannot - more than two channels, or a channel mask
@@ -35,6 +42,15 @@ answers no otherwise - and because a probe's answer *replaces* what its
 signatures said rather than being the larger of the two, that no is
 effective.
 
+**The `fact` chunk is the only place a coded track's length lives.** An
+ADPCM block is a fixed size and the last one is padded, so the data chunk's
+length rounds up to a whole block. `fact` carries the true frame count and
+this library honours it. **No reference does**: ffmpeg, sox and libsndfile
+all decode the padding, and patching `fact` to any value changes none of
+their output. The disagreement is measured in `make check-corpus`, which
+requires the frames both sides have to be identical and the excess to be
+less than one block.
+
 **A `data` chunk can claim more than the file holds.** A truncated download
 states the length it was going to have. The claim is clamped to what is
 actually present and a diagnostic says so, because a decoder that believed it
@@ -48,8 +64,14 @@ as a sample on the way back in.
 
 - Writing RF64. Past 4 GiB the writer returns ::GAUD_ERR_UNSUPPORTED rather
   than truncating a 32-bit length into a file that opens and is wrong.
-- Any compressed `WAVE_FORMAT_*`: µ-law, A-law, ADPCM, GSM and the rest.
-  Phase 2 brings them. They are refused by format tag, not misread as PCM.
+- GSM 6.10, and every other compressed `WAVE_FORMAT_*` outside the four
+  named above. Refused by format tag, not misread as PCM.
+- ADPCM above two channels. The format has no defined interleave for it and
+  ffmpeg refuses to encode or decode it; writing one would produce a file
+  the most widely deployed reader cannot open, so this writer returns
+  ::GAUD_ERR_UNSUPPORTED. Reading stays liberal.
+- `WAVE_FORMAT_EXTENSIBLE` wrapping a coded tag. The GUID form and the ADPCM
+  extension both want the `cbSize` bytes and no reader expects both.
 - `cue `, `LIST`/`INFO`, `bext` and the other metadata chunks - phase 3. They
   are skipped by length today, so they do not prevent a file from loading.
 

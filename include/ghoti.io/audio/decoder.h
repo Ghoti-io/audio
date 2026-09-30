@@ -52,6 +52,7 @@
 #define GHOTI_IO_GAUD_DECODER_H
 
 #include <ghoti.io/audio/buffer.h>
+#include <ghoti.io/audio/coding.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/doc.h>
 #include <ghoti.io/audio/macros.h>
@@ -145,8 +146,25 @@ GAUD_API GAUD_Track * gaud_decoder_track(const GAUD_Decoder * decoder);
  * in something playable which the caller then edits.
  */
 typedef struct GAUD_Encode_Params {
-  /** How each sample is stored in the file. */
+  /**
+   * What the samples handed to gaud_encoder_write() are.
+   *
+   * When @p coding is not ::GAUD_CODING_PCM this must be the format that
+   * coding decodes to - gaud_sample_coding_format() says which, and it is
+   * ::GAUD_SAMPLE_S16 for every coding that exists today. Anything else is
+   * ::GAUD_ERR_INVALID at gaud_encoder_create(), rather than a silent
+   * conversion the caller did not ask for.
+   */
   GAUD_Sample_Format format;
+  /**
+   * How the file codes them. Zero is ::GAUD_CODING_PCM, so a params struct
+   * filled in before this field existed still means what it meant.
+   *
+   * This is separate from @p format because they answer different
+   * questions: a µ-law file's samples are ::GAUD_SAMPLE_S16 in every buffer
+   * and one companded byte on disk. See coding.h.
+   */
+  GAUD_Sample_Coding coding;
   /** Frames per second. */
   uint32_t sample_rate;
   /** Which speakers, and how many channels. */

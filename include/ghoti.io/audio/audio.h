@@ -31,6 +31,7 @@
 #include <ghoti.io/audio/buffer.h>
 #include <ghoti.io/audio/codec.h>
 #include <ghoti.io/audio/codecs.h>
+#include <ghoti.io/audio/coding.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/decoder.h>
 #include <ghoti.io/audio/doc.h>

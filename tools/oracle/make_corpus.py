@@ -58,6 +58,18 @@ DATA = os.path.join(ROOT, "tests", "data")
 # never exercises the short read at the end.
 CASES = [
     ("wav_u8_mono_22050",     "wav",  "pcm_u8",    1, 22050, 1021),
+    # Phase 2: the coded WAV tags. Mono and stereo for each, because the
+    # ADPCM framings interleave differently and a mono-only corpus meets
+    # neither interleave. MS ADPCM stereo in particular decoded as noise
+    # under a reading that mono could not distinguish.
+    ("wav_ulaw_mono_8000",    "wav",  "pcm_mulaw",     1,  8000, 1021),
+    ("wav_ulaw_stereo_44100", "wav",  "pcm_mulaw",     2, 44100, 2003),
+    ("wav_alaw_mono_8000",    "wav",  "pcm_alaw",      1,  8000, 1021),
+    ("wav_alaw_stereo_44100", "wav",  "pcm_alaw",      2, 44100, 2003),
+    ("wav_imaadpcm_mono_22050",   "wav", "adpcm_ima_wav", 1, 22050, 2003),
+    ("wav_imaadpcm_stereo_44100", "wav", "adpcm_ima_wav", 2, 44100, 3001),
+    ("wav_msadpcm_mono_22050",    "wav", "adpcm_ms",      1, 22050, 2003),
+    ("wav_msadpcm_stereo_44100",  "wav", "adpcm_ms",      2, 44100, 3001),
     ("wav_s16_stereo_44100",  "wav",  "pcm_s16le", 2, 44100, 4409),
     ("wav_s24_stereo_48000",  "wav",  "pcm_s24le", 2, 48000, 2399),
     ("wav_s32_stereo_44100",  "wav",  "pcm_s32le", 2, 44100, 1777),
@@ -75,7 +87,69 @@ CASES = [
 AIFC_CASES = [
     ("aifc_sowt_stereo_44100", "pcm_s16le", 2, 44100, 2003),
     ("aifc_fl32_stereo_48000", "pcm_f32be", 2, 48000, 1499),
+    # Phase 2. `ima4` is the one case where the frame count in the file is
+    # not the frame count asked for: ffmpeg pads to a whole 64-frame
+    # packet, and there is no field in AIFF-C that could say otherwise.
+    ("aifc_ulaw_mono_8000",    "pcm_mulaw",     1,  8000, 1021),
+    ("aifc_alaw_stereo_8000",  "pcm_alaw",      2,  8000, 1021),
+    ("aifc_ima4_mono_22050",   "adpcm_ima_qt",  1, 22050, 1024),
+    ("aifc_ima4_stereo_44100", "adpcm_ima_qt",  2, 44100, 2048),
 ]
+
+# The step table is 89 entries and the signal decides which of them are
+# ever loaded. Measured against the fixtures above, an IMA decode reached
+# 67 of the 89: the eight quietest and the fourteen loudest were never
+# used, so a wrong value in either tail would have passed this corpus in
+# silence. These two fixtures are chosen to reach them - a signal 60 dB
+# down for the bottom of the table, full-scale white noise for the top -
+# and `make check-corpus` prints the coverage so that the number stays
+# visible rather than being rediscovered.
+#
+# This is the corpus-is-a-population problem in its plainest form: the
+# fixtures were all the same kind of signal, so they all walked the same
+# part of the table.
+DYNAMIC_CASES = [
+    # name, codec, channels, rate, frames, aevalsrc expression
+    # Quiet NOISE, not a quiet tone. A low-amplitude sine produces small
+    # and smoothly varying deltas, so the encoder picks nibble magnitude 0
+    # almost every time - and at magnitude 0 the decoder computes only
+    # step>>3, which a wrong table entry barely moves. The step index
+    # passes through the bottom of the table and nothing there is tested.
+    # Noise at the same level forces nonzero magnitudes, which is what
+    # makes those entries observable.
+    #
+    # The amplitudes are a measured cover, not a guess. Each one pins the
+    # step index to a different part of the table, and the four together
+    # with the loud and musical fixtures reach all 89 entries with a
+    # nonzero magnitude. The counts as the corpus grew: the original
+    # musical fixtures 54/89, plus a quiet tone still 54/89 (a tone gives
+    # magnitude 0 almost everywhere), plus quiet noise 73/89, plus these
+    # 89/89. Below about 0.0002 the encoder emits nothing but magnitude 0
+    # again and the bottom three entries go dark, which is why the
+    # quietest here is 0.0003 and not smaller.
+    ("wav_imaadpcm_lsbnoise_8000", "adpcm_ima_wav", 1, 8000, 2001,
+     "0.0003*random(%(c)d)"),
+    ("wav_imaadpcm_quietnoise_8000", "adpcm_ima_wav", 1, 8000, 2001,
+     "0.0015*random(%(c)d)"),
+    ("wav_imaadpcm_lownoise_8000", "adpcm_ima_wav", 1, 8000, 2001,
+     "0.01*random(%(c)d)"),
+    ("wav_imaadpcm_midnoise_8000", "adpcm_ima_wav", 1, 8000, 2001,
+     "0.05*random(%(c)d)"),
+    ("aifc_ima4_quietnoise_8000", "adpcm_ima_qt", 1, 8000, 2048,
+     "0.0015*random(%(c)d)"),
+    ("wav_imaadpcm_loud_8000", "adpcm_ima_wav", 1, 8000, 1501,
+     "0.98*sin(2*PI*1700*t)*sin(2*PI*37*t)+0.02*random(%(c)d)"),
+    ("wav_msadpcm_loud_8000", "adpcm_ms", 1, 8000, 1501,
+     "0.98*sin(2*PI*1700*t)*sin(2*PI*37*t)+0.02*random(%(c)d)"),
+    ("aifc_ima4_loud_8000", "adpcm_ima_qt", 1, 8000, 1536,
+     "0.98*sin(2*PI*1700*t)*sin(2*PI*37*t)+0.02*random(%(c)d)"),
+]
+
+# Every frame count above is deliberately NOT a multiple of the block size
+# a coded fixture ends up with, so that every one of them exercises a
+# short final block. A corpus of round numbers would score a decoder that
+# reads whole blocks only, and the last block is where the arithmetic is
+# hardest.  (memory: corpora flatter and do not cover.)
 
 
 def run(argv, **kwargs):
@@ -86,7 +160,8 @@ def run(argv, **kwargs):
     return finished
 
 
-def ffmpeg_make(path, codec, channels, rate, frames, container):
+def ffmpeg_make(path, codec, channels, rate, frames, container,
+                expr=None):
     """One fixture, from ffmpeg's own signal generator.
 
     The source is a sum of two sines at different frequencies per channel, so
@@ -97,9 +172,13 @@ def ffmpeg_make(path, codec, channels, rate, frames, container):
     duration = frames / float(rate)
     # `aevalsrc` rather than `sine`, because it takes one expression per
     # channel and so can make them differ.
-    exprs = "|".join(
-        "0.6*sin(2*PI*%d*t)+0.25*sin(2*PI*%d*t)" % (220 * (i + 1), 1330 + 97 * i)
-        for i in range(channels))
+    if expr:
+        exprs = "|".join(expr % {"c": i} for i in range(channels))
+    else:
+        exprs = "|".join(
+            "0.6*sin(2*PI*%d*t)+0.25*sin(2*PI*%d*t)"
+            % (220 * (i + 1), 1330 + 97 * i)
+            for i in range(channels))
     argv = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi",
@@ -119,6 +198,43 @@ def ffmpeg_make(path, codec, channels, rate, frames, container):
     run(oracle.command("ffmpeg", argv, scratch=DATA))
 
 
+def cycle_ms_predictors(path):
+    """Rewrite each MS ADPCM block's predictor index to cycle 0..6.
+
+    The index is the first byte of each block, one per channel. Every
+    value 0..6 is legal and selects a different coefficient pair, so this
+    produces a valid file that happens to use the whole table - which no
+    encoder in the oracle image will produce on its own.
+    """
+    import struct as _s
+    data = bytearray(open(path, "rb").read())
+    i, body_at, body_len, block, channels = 12, None, 0, None, None
+    while i + 8 <= len(data):
+        cid = bytes(data[i:i + 4])
+        size = _s.unpack_from("<I", data, i + 4)[0]
+        if cid == b"fmt ":
+            channels = _s.unpack_from("<H", data, i + 10)[0]
+            block = _s.unpack_from("<H", data, i + 20)[0]
+        elif cid == b"data":
+            body_at, body_len = i + 8, size
+        i += 8 + size + (size & 1)
+    if body_at is None or not block or not channels:
+        raise SystemExit("cycle_ms_predictors: %s is not MS ADPCM" % path)
+    blocks = 0
+    for start in range(body_at, body_at + body_len, block):
+        if start + 7 * channels > body_at + body_len:
+            break
+        for c in range(channels):
+            data[start + c] = blocks % 7
+        blocks += 1
+    if blocks < 7:
+        raise SystemExit(
+            "cycle_ms_predictors: %s has %d blocks, too few to reach all "
+            "seven coefficient pairs - the fixture needs more frames"
+            % (path, blocks))
+    open(path, "wb").write(bytes(data))
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
     print(oracle.provenance(["ffmpeg", "sox", "libsndfile", "pywave"]))
@@ -136,6 +252,31 @@ def main():
         ffmpeg_make(path, codec, channels, rate, frames, "aiff")
         made.append(path)
         print("  %-26s %s" % (name, os.path.getsize(path)))
+
+    for name, codec, channels, rate, frames, expr in DYNAMIC_CASES:
+        ext = "aifc" if name.startswith("aifc") else "wav"
+        container = "aiff" if ext == "aifc" else "wav"
+        path = os.path.join(DATA, "%s.%s" % (name, ext))
+        ffmpeg_make(path, codec, channels, rate, frames, container, expr)
+        made.append(path)
+        print("  %-26s %s" % (name, os.path.getsize(path)))
+
+    # MS ADPCM's seven coefficient pairs, all of them.
+    #
+    # ffmpeg's encoder picks pair 0 for every block of every fixture
+    # above, so six of the seven entries in the table this library
+    # carries were exercised by nothing: changing {512,-256} to
+    # {512,-200} decoded identically and `make check-corpus` passed. A
+    # block may legally name any pair, so the fixture is made by
+    # generating an ordinary MS ADPCM file and then rewriting each
+    # block's predictor index to cycle 0..6. The result is a valid file
+    # that ffmpeg and libsndfile both read, and it is the only thing in
+    # the corpus that can see a wrong coefficient.
+    path = os.path.join(DATA, "wav_msadpcm_coefs_8000.wav")
+    ffmpeg_make(path, "adpcm_ms", 1, 8000, 14300, "wav")
+    cycle_ms_predictors(path)
+    made.append(path)
+    print("  %-26s %s" % ("wav_msadpcm_coefs_8000", os.path.getsize(path)))
 
     # A second writer for the same question. sox's RIFF differs from
     # ffmpeg's in what optional chunks it emits, so a reader that only ever

@@ -30,6 +30,7 @@
  */
 
 #include "../shared/bytes.h"
+#include "../shared/coded.h"
 #include "aiff_internal.h"
 #include <ghoti.io/cutil/allocator.h>
 #include <string.h>
@@ -96,11 +97,16 @@ static const GAUD_Decoder_Vtable aiff_decoder_vtable = {
 GAUD_Result gaud_aiff_decoder_open(const GAUD_Codec * codec,
     GAUD_Track * track, GAUD_Decoder ** out_decoder) {
   (void)codec;
-  if (!gaud_track_private(track)) {
+  AIFF_Track_State * state = gaud_track_private(track);
+  if (!state) {
     return GAUD_ERR_INTERNAL;
   }
+  if (state->coding != GAUD_CODING_PCM) {
+    return gaud_coded_decoder_open(track, &state->geometry,
+        state->data_offset, state->data_length, out_decoder);
+  }
   return gaud_decoder_create_internal(
-      track, &aiff_decoder_vtable, gaud_track_private(track), out_decoder);
+      track, &aiff_decoder_vtable, state, out_decoder);
 }
 
 /* ------------------------------------------------------------------ write */
@@ -111,8 +117,10 @@ typedef struct {
   uint64_t comm_frames_offset; ///< Where COMM's frame count is.
   uint64_t ssnd_size_offset; ///< Where SSND's length field is.
   uint64_t data_bytes;       ///< Samples written.
-  size_t frame_size;         ///< Bytes per frame.
+  size_t frame_size;         ///< Bytes per frame. Zero when coded.
   bool needs_swap;           ///< Whether the host's order is not the file's.
+  GAUD_Sample_Coding coding; ///< ::GAUD_CODING_PCM for an uncoded file.
+  GAUD_Coded_Writer coded;   ///< Block buffer; used only when coded.
 } AIFF_Encoder_State;
 
 static GAUD_Result aiff_write(
@@ -122,6 +130,14 @@ static GAUD_Result aiff_write(
   size_t frames = gaud_buffer_frames(buffer);
   if (frames == 0) {
     return GAUD_OK;
+  }
+  if (state->coding != GAUD_CODING_PCM) {
+    GAUD_Result coded = gaud_coded_writer_push(&state->coded, stream,
+        (const int16_t *)gaud_buffer_data_const(buffer), frames);
+    if (coded == GAUD_OK) {
+      gaud_encoder_add_frames(encoder, frames);
+    }
+    return coded;
   }
   size_t bytes = frames * state->frame_size;
   const unsigned char * data = gaud_buffer_data_const(buffer);
@@ -176,6 +192,16 @@ static GAUD_Result aiff_finish(GAUD_Encoder * encoder) {
   AIFF_Encoder_State * state = gaud_encoder_private(encoder);
   GAUD_Stream * stream = gaud_encoder_stream(encoder);
 
+  uint64_t coded_frames = 0;
+  if (state->coding != GAUD_CODING_PCM) {
+    GAUD_Result result = gaud_coded_writer_flush(&state->coded, stream);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    state->data_bytes = state->coded.bytes;
+    coded_frames = state->coded.frames;
+  }
+
   if (state->data_bytes & 1u) {
     const unsigned char pad = 0;
     GAUD_Result result = gaud_stream_write(stream, &pad, 1);
@@ -188,8 +214,29 @@ static GAUD_Result aiff_finish(GAUD_Encoder * encoder) {
     return GAUD_ERR_UNSUPPORTED;
   }
 
-  uint64_t frames = state->frame_size ? state->data_bytes / state->frame_size
-                                      : 0;
+  uint64_t frames;
+  if (state->coding == GAUD_CODING_ADPCM_IMA_QT) {
+    /*
+     * COMM gets the PACKET count, not the frame count.
+     *
+     * AIFF-C's specification says this field is the uncompressed
+     * sample-frame count, which for `ima4` would be 64 times this. Both
+     * writers in the oracle image write the packet count, neither
+     * decoder reads the field at all, and ffmpeg's *reported duration*
+     * is COMM x 64 - so writing the spec-literal value makes `ffprobe`
+     * say the file is 64 times longer than it is. Matching two
+     * independent implementations, and not misreporting the duration to
+     * the most widely deployed reader, beats matching the prose.
+     */
+    frames = state->coded.bytes
+        / (34u * (uint64_t)state->coded.geometry.channels);
+  }
+  else if (state->coding != GAUD_CODING_PCM) {
+    frames = coded_frames;
+  }
+  else {
+    frames = state->frame_size ? state->data_bytes / state->frame_size : 0;
+  }
   GAUD_Result result = patch_u32be(
       encoder, state->comm_frames_offset, (uint32_t)frames);
   if (result != GAUD_OK) {
@@ -205,8 +252,12 @@ static GAUD_Result aiff_finish(GAUD_Encoder * encoder) {
 }
 
 static void aiff_close(GAUD_Encoder * encoder) {
-  gcu_allocator_free(
-      gaud_encoder_allocator(encoder), gaud_encoder_private(encoder));
+  const GAUD_Allocator * allocator = gaud_encoder_allocator(encoder);
+  AIFF_Encoder_State * state = gaud_encoder_private(encoder);
+  if (state) {
+    gaud_coded_writer_free(&state->coded, allocator);
+  }
+  gcu_allocator_free(allocator, state);
 }
 
 static const GAUD_Encoder_Vtable aiff_encoder_vtable = {
@@ -225,27 +276,84 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
   }
 
   /* Float samples need AIFF-C, because plain AIFF has no way to say a
-   * sample is not an integer. Integers are written as plain AIFF, which
-   * more readers accept. */
-  bool is_float = gaud_sample_format_is_float(params->format);
-  switch (params->format) {
-  case GAUD_SAMPLE_S8:
-  case GAUD_SAMPLE_S16:
-  case GAUD_SAMPLE_S24:
-  case GAUD_SAMPLE_S32:
-  case GAUD_SAMPLE_F32:
-  case GAUD_SAMPLE_F64: break;
-  default:
-    /* u8 has no AIFF spelling: this format's 8-bit is signed. Refusing
-     * rather than shifting every sample by 128 unannounced. */
+   * sample is not an integer, and so does every coding. Integers are
+   * written as plain AIFF, which more readers accept. */
+  bool is_float = params->coding == GAUD_CODING_PCM
+      && gaud_sample_format_is_float(params->format);
+  const char * compression = NULL;
+  switch (params->coding) {
+  case GAUD_CODING_PCM:
+    switch (params->format) {
+    case GAUD_SAMPLE_S8:
+    case GAUD_SAMPLE_S16:
+    case GAUD_SAMPLE_S24:
+    case GAUD_SAMPLE_S32:
+    case GAUD_SAMPLE_F32:
+    case GAUD_SAMPLE_F64: break;
+    default:
+      /* u8 has no AIFF spelling: this format's 8-bit is signed. Refusing
+       * rather than shifting every sample by 128 unannounced. */
+      return GAUD_ERR_UNSUPPORTED;
+    }
+    break;
+  /* Apple's lower-case spellings. SGI's `ULAW` and `ALAW` are accepted on
+   * read and not written: one spelling out is one thing to be wrong
+   * about, and this is the one both references emit. */
+  case GAUD_CODING_G711_ULAW: compression = "ulaw"; break;
+  case GAUD_CODING_G711_ALAW: compression = "alaw"; break;
+  case GAUD_CODING_ADPCM_IMA_QT: compression = "ima4"; break;
+  case GAUD_CODING_ADPCM_IMA_WAV:
+    /* WAV's block framing has no AIFF-C compression type. Writing it as
+     * `ima4` would label QuickTime's packets on bytes that are not in
+     * them. GAUD_CODING_ADPCM_IMA_QT is the spelling for this container. */
+    return GAUD_ERR_UNSUPPORTED;
+  case GAUD_CODING_ADPCM_MS:
+    /* Microsoft ADPCM has no AIFF-C compression type at all. ffmpeg
+     * refuses the same combination, producing a zero-byte file. */
+    return GAUD_ERR_UNSUPPORTED;
+  default: return GAUD_ERR_INVALID;
+  }
+  bool coded = params->coding != GAUD_CODING_PCM;
+  bool aifc = is_float || coded;
+  if (coded
+      && !gaud_coded_writable(params->coding, params->layout.channels)) {
+    /* See gaud_coded_writable(). */
     return GAUD_ERR_UNSUPPORTED;
   }
 
-  size_t frame_size = gaud_frame_size(params->format, params->layout.channels);
-  if (frame_size == 0 || params->layout.channels > 0x7FFFu) {
+  if (params->layout.channels == 0 || params->layout.channels > 0x7FFFu) {
     return GAUD_ERR_INVALID;
   }
-  uint16_t bits = (uint16_t)gaud_sample_format_bits(params->format);
+  GAUD_Coded_Geometry geometry;
+  memset(&geometry, 0, sizeof(geometry));
+  size_t frame_size = 0;
+  uint16_t bits;
+  if (coded) {
+    GAUD_Result result = gaud_coded_geometry(
+        params->coding, params->layout.channels, 0, 0, &geometry);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    /*
+     * COMM's sampleSize. The references disagree: ffmpeg writes 4 for
+     * `ima4` (the stored nibble width) and libsndfile writes 16 (the
+     * decoded width). Neither reader appears to use it. AIFF-C's
+     * specification describes COMM as the uncompressed data's
+     * parameters, which makes 16 the spec reading, so that is what goes
+     * out; both values are accepted on read. G.711 is 8 in every
+     * implementation and in the spec, because a companded byte IS the
+     * stored sample.
+     */
+    bits = params->coding == GAUD_CODING_ADPCM_IMA_QT ? 16u : 8u;
+  }
+  else {
+    frame_size
+        = gaud_frame_size(params->format, params->layout.channels);
+    if (frame_size == 0) {
+      return GAUD_ERR_INVALID;
+    }
+    bits = (uint16_t)gaud_sample_format_bits(params->format);
+  }
 
   const GAUD_Allocator * allocator = gaud_stream_allocator(stream);
   AIFF_Encoder_State * state
@@ -277,10 +385,10 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
   uint64_t form_size_offset = n;
   gaud_wr_u32be(header + n, 0);
   n += 4;
-  memcpy(header + n, is_float ? "AIFC" : "AIFF", 4);
+  memcpy(header + n, aifc ? "AIFC" : "AIFF", 4);
   n += 4;
 
-  if (is_float) {
+  if (aifc) {
     /* AIFC requires a format-version chunk, and there is exactly one
      * legal value for it. */
     memcpy(header + n, "FVER", 4);
@@ -295,7 +403,7 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
   n += 4;
   /* AIFF-C's COMM carries the compression type and a Pascal string naming
    * it; the empty string is one zero byte, padded to even. */
-  uint32_t comm_size = is_float ? 18u + 4u + 2u : 18u;
+  uint32_t comm_size = aifc ? 18u + 4u + 2u : 18u;
   gaud_wr_u32be(header + n, comm_size);
   n += 4;
   gaud_wr_u16be(header + n, (uint16_t)params->layout.channels);
@@ -307,8 +415,12 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
   n += 2;
   gaud_aiff_write_extended(header + n, (double)params->sample_rate);
   n += 10;
-  if (is_float) {
-    memcpy(header + n, bits == 32 ? "fl32" : "fl64", 4);
+  if (aifc) {
+    const char * type = compression;
+    if (!type) {
+      type = bits == 32 ? "fl32" : "fl64";
+    }
+    memcpy(header + n, type, 4);
     n += 4;
     header[n++] = 0; /* empty Pascal string */
     header[n++] = 0; /* pad to even */
@@ -336,12 +448,24 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
       .ssnd_size_offset = ssnd_size_offset,
       .data_bytes = 0,
       .frame_size = frame_size,
-      /* AIFF is big-endian, so a little-endian host swaps. */
-      .needs_swap = gaud_host_is_little_endian() && bits > 8,
+      /* AIFF is big-endian, so a little-endian host swaps - but a coded
+       * file never does. `ima4`'s packet header is big-endian and the
+       * block layer writes it that way itself; G.711's samples are one
+       * byte. */
+      .needs_swap = !coded && gaud_host_is_little_endian() && bits > 8,
+      .coding = params->coding,
   };
+  if (coded) {
+    result = gaud_coded_writer_init(&state->coded, &geometry, allocator);
+    if (result != GAUD_OK) {
+      gcu_allocator_free(allocator, state);
+      return result;
+    }
+  }
   result = gaud_encoder_create_internal(
       stream, params, allocator, &aiff_encoder_vtable, state, out_encoder);
   if (result != GAUD_OK) {
+    gaud_coded_writer_free(&state->coded, allocator);
     gcu_allocator_free(allocator, state);
   }
   return result;

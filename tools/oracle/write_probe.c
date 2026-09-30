@@ -43,7 +43,7 @@
 
 int main(int argc, char ** argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: write_probe <in> <out> <codec>\n");
+    fprintf(stderr, "usage: write_probe <in> <out> <codec> [coding]\n");
     return 2;
   }
   gaud_register_builtin_codecs();
@@ -66,6 +66,44 @@ int main(int argc, char ** argv) {
   params.format = gaud_track_format(track);
   params.sample_rate = gaud_track_sample_rate(track);
   params.layout = gaud_track_layout(track);
+
+  /* Named rather than copied from the input, so that the gate can ask for
+   * a coding the source did not have - re-coding a PCM fixture as µ-law is
+   * the case that exercises the encoder, and copying the input's coding
+   * would only ever re-emit what was already there. */
+  if (argc > 4) {
+    static const struct {
+      const char * name;
+      GAUD_Sample_Coding coding;
+    } known[] = {
+        {"pcm", GAUD_CODING_PCM},
+        {"ulaw", GAUD_CODING_G711_ULAW},
+        {"alaw", GAUD_CODING_G711_ALAW},
+        {"ima-wav", GAUD_CODING_ADPCM_IMA_WAV},
+        {"ima-qt", GAUD_CODING_ADPCM_IMA_QT},
+        {"ms-adpcm", GAUD_CODING_ADPCM_MS},
+    };
+    bool found = false;
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i) {
+      if (strcmp(argv[4], known[i].name) == 0) {
+        params.coding = known[i].coding;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      fprintf(stderr, "unknown coding %s\n", argv[4]);
+      return 2;
+    }
+    if (params.coding != GAUD_CODING_PCM) {
+      /* Every coding decodes to S16, and the samples must be in that
+       * format before they reach the encoder. A fixture in any other
+       * format is converted below rather than refused: the gate's job is
+       * to score the writer, and restricting it to the fixtures that
+       * happen to be s16 would shrink the population without saying so. */
+      params.format = gaud_sample_coding_format(params.coding);
+    }
+  }
 
   GAUD_Stream * out = NULL;
   if (gaud_stream_create_file_writer(NULL, argv[2], &out) != GAUD_OK) {
@@ -99,7 +137,19 @@ int main(int argc, char ** argv) {
     if (gaud_buffer_frames(buffer) == 0) {
       break;
     }
-    result = gaud_encoder_write(encoder, buffer);
+    const GAUD_Buffer * to_write = buffer;
+    GAUD_Buffer * converted = NULL;
+    if (gaud_buffer_format(buffer) != params.format) {
+      result = gaud_ops_convert_format(
+          NULL, buffer, params.format, NULL, &converted);
+      if (result != GAUD_OK) {
+        fprintf(stderr, "convert: %s\n", gaud_result_string(result));
+        return 1;
+      }
+      to_write = converted;
+    }
+    result = gaud_encoder_write(encoder, to_write);
+    gaud_buffer_destroy(converted);
     if (result != GAUD_OK) {
       fprintf(stderr, "write: %s\n", gaud_result_string(result));
       return 1;

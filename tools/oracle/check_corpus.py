@@ -95,6 +95,114 @@ EXCLUSIONS = {
         "WAVE_FORMAT_IEEE_FLOAT. It is a reference for integer WAV."),
     ("pywave", "f64"): (
         "As for f32: `wave` has no float support at all."),
+
+    # Phase 2. These are keyed by (reference, container, coding) rather
+    # than by sample format, because the sample format of every coded
+    # fixture is s16 and the thing a reference cannot do is not about the
+    # samples. sox reads mu-law in WAV perfectly well and cannot read the
+    # same coding in AIFF-C, so a per-format key would have excluded it
+    # from both or neither, and either answer is wrong.
+    ("sox", "aiff", "ulaw"): (
+        "sox refuses every AIFF-C compression type: `sox FAIL formats: "
+        "can't open input file ...: Unsupported AIFC compression type "
+        "`ulaw''. Measured on aifc_ulaw_mono_8000. It reads the same "
+        "coding in WAV, where it is still scored."),
+    ("sox", "aiff", "alaw"): (
+        "As for ulaw: `Unsupported AIFC compression type `alaw''."),
+    ("sox", "aiff", "ima-qt"): (
+        "As for ulaw: `Unsupported AIFC compression type `ima4''. sox has "
+        "no reader for QuickTime's IMA packets in any container."),
+
+    ("pywave", "wav", "ulaw"): (
+        "Python's `wave` reads WAVE_FORMAT_PCM only and raises "
+        "wave.Error on every other tag. It is a reference for "
+        "uncompressed integer WAV and for nothing else."),
+    ("pywave", "wav", "alaw"): (
+        "As for ulaw: `wave` refuses WAVE_FORMAT_ALAW."),
+    ("pywave", "wav", "ima-wav"): (
+        "As for ulaw: `wave` refuses WAVE_FORMAT_IMA_ADPCM."),
+    ("pywave", "wav", "ms-adpcm"): (
+        "As for ulaw: `wave` refuses WAVE_FORMAT_ADPCM."),
+
+    # The two IMA exclusions are the only ones here where the reference
+    # can read the file perfectly well and simply decodes it to different
+    # numbers. Both were reproduced exactly before being written down: a
+    # model of ffmpeg's arithmetic matches ffmpeg on every sample of the
+    # corpus, which turns "ffmpeg disagrees" into a statement about which
+    # of two documented algorithms each side implements. We match
+    # libsndfile byte for byte in both cases, on all four fixtures.
+    ("ffmpeg", "wav", "ima-wav"): (
+        "ffmpeg expands an IMA nibble by direct multiplication, "
+        "diff = ((2*delta+1)*step) >> 3; this library and libsndfile use "
+        "the additive form the IMA reference states, "
+        "diff = step>>3 (+step>>2, +step>>1, +step by bit). ffmpeg's own "
+        "source calls the multiplication a substitute for `the series of "
+        "jumps proposed by the reference ADPCM implementation`. Measured "
+        "on wav_imaadpcm_mono_22050: ours vs ffmpeg 1996/2003 samples "
+        "differ, max 40 of 32768 (0.12%); ours vs libsndfile 0/2003. "
+        "Re-decoding the same blocks with the multiplicative form "
+        "reproduces ffmpeg on 2041/2041 samples, which is what "
+        "establishes the mechanism."),
+    # Keyed by FIXTURE, not by coding: sox and libsndfile agree with us on
+    # every MS ADPCM file an encoder actually produces, and disagree only
+    # on the synthetic one that names coefficient pairs no encoder picks.
+    # Excluding them from "ms-adpcm" would throw away four correct
+    # comparisons to accommodate one.
+    ("sox", "wav_msadpcm_coefs_8000.wav"): (
+        "MS ADPCM computes its prediction as "
+        "(sample1*coef1 + sample2*coef2) / 256, and C's division truncates "
+        "toward zero where an arithmetic shift floors. The two differ only "
+        "for a negative numerator with a remainder - and coefficient pairs "
+        "0, 1 and 2 ({256,0} {512,-256} {0,0}) all give exact multiples of "
+        "256, so no file an encoder produces can tell them apart. This "
+        "fixture names pairs 3 to 6 deliberately and does. Measured: "
+        "truncation reproduces ffmpeg on 16288/16288 samples and the shift "
+        "reproduces libsndfile on 16288/16288. This library truncates, "
+        "with ffmpeg; sox and libsndfile shift. Two against two, and "
+        "Microsoft's own description of the format is a division."),
+    ("libsndfile", "wav_msadpcm_coefs_8000.wav"): (
+        "As for sox, which it agrees with exactly: an arithmetic shift "
+        "where this library and ffmpeg truncate toward zero."),
+
+    ("ffmpeg", "aiff", "ima-qt"): (
+        "A different mechanism from the WAV case, and a more consequential "
+        "one: ffmpeg CARRIES the predictor across `ima4` packets instead "
+        "of reloading it from each packet header. Apple's 34-byte packet "
+        "begins with a predictor and step index precisely so that packets "
+        "are independent, and this library reloads both - which is what "
+        "makes gaud_decoder_seek() able to land in the middle of a file "
+        "without decoding what precedes it. Measured on "
+        "aifc_ima4_mono_22050: identical for the first packet and "
+        "divergent from sample 64 onward, 960/1024 samples differing, max "
+        "117 of 32768 (0.36%); ours vs libsndfile 0/1024. Re-decoding "
+        "with the predictor carried across packets reproduces ffmpeg on "
+        "1024/1024 samples."),
+}
+
+# How far a reference is allowed to run past us, and why.
+#
+# A coded WAV's final block is padded to its full length, and `fact`
+# carries the true frame count. This library honours `fact`; **no
+# reference in the image does** - ffmpeg, sox and libsndfile all decode
+# the padding, and patching `fact` to any value changes none of their
+# output (notes/audio/phase2-calibration.md). AIFF-C has no equivalent
+# field at all, so an `ima4` file is always a whole number of 64-frame
+# packets and everyone agrees on the padded length.
+#
+# So the comparison is: the frames we both have must agree EXACTLY, and
+# the excess must be less than one block. Both halves matter. Dropping
+# the first would stop scoring the samples; dropping the second would let
+# a decoder that stopped early pass by calling the missing frames
+# padding.
+# Frames in one block, by (coding, channels-independent formula). Only
+# used to bound the padding, so an upper bound is enough and the exact
+# geometry does not have to be re-derived here.
+MAX_BLOCK_FRAMES = {
+    "ulaw": 1,
+    "alaw": 1,
+    "ima-wav": 4096,
+    "ima-qt": 64,
+    "ms-adpcm": 4096,
 }
 
 
@@ -209,7 +317,132 @@ def scaled_pcm(data, factor):
     return bytes(out)
 
 
-def compare(path, ours, quiet=False, excluded=None, scored=None):
+# The 89-entry IMA step table, mirrored here so that the coverage check
+# below is independent of the C. A copy that drifted would make the check
+# report on the wrong table, so `make check-corpus` compares the two
+# through the fixtures themselves: if this list were wrong, the decoded
+# samples would disagree with the references and the differential above
+# would fail first.
+IMA_STEP_COUNT = 89
+IMA_INDEX_ADJUST = [-1, -1, -1, -1, 2, 4, 6, 8] * 2
+
+
+def ima_observable_indices(path):
+    """Which step-table entries this fixture loads with a nonzero nibble.
+
+    **Loading an entry is not testing it.** At nibble magnitude 0 the
+    decoder computes only `step >> 3`, so most of a wrong step value is
+    invisible; the entry has to be loaded with a magnitude that reads the
+    other shifted terms before a differential can see it. Counting loads
+    rather than observable loads was this corpus's own mistake: it
+    reported 89 of 89 entries reached while a deliberately wrong entry
+    still decoded identically, because every one of its loads was at
+    magnitude 0.
+    """
+    import struct as _s
+    data = open(path, "rb").read()
+    pairs = set()
+    if data[:4] == b"RIFF":
+        i, body, block, channels = 12, None, None, None
+        while i + 8 <= len(data):
+            cid = data[i:i + 4]
+            size = _s.unpack_from("<I", data, i + 4)[0]
+            if cid == b"fmt ":
+                channels = _s.unpack_from("<H", data, i + 10)[0]
+                block = _s.unpack_from("<H", data, i + 20)[0]
+            elif cid == b"data":
+                body = data[i + 8:i + 8 + size]
+            i += 8 + size + (size & 1)
+        if body is None or not block or not channels:
+            return pairs
+        for start in range(0, len(body), block):
+            chunk = body[start:start + block]
+            if len(chunk) < 4 * channels:
+                break
+            index = [min(88, chunk[4 * c + 2]) for c in range(channels)]
+            at = 4 * channels
+            while at + 4 * channels <= len(chunk):
+                for c in range(channels):
+                    for k in range(4):
+                        byte = chunk[at + 4 * c + k]
+                        for nibble in (byte & 0x0F, byte >> 4):
+                            pairs.add((index[c], nibble & 7))
+                            index[c] = max(0, min(88,
+                                index[c] + IMA_INDEX_ADJUST[nibble]))
+                at += 4 * channels
+    else:
+        i, body = 12, None
+        while i + 8 <= len(data):
+            cid = data[i:i + 4]
+            size = _s.unpack_from(">I", data, i + 4)[0]
+            if cid == b"SSND":
+                body = data[i + 16:i + 8 + size]
+            i += 8 + size + (size & 1)
+        if body is None:
+            return pairs
+        for packet in range(0, len(body) // 34 * 34, 34):
+            word = _s.unpack_from(">H", body, packet)[0]
+            index = min(88, word & 0x7F)
+            for n in range(32):
+                byte = body[packet + 2 + n]
+                for nibble in (byte & 0x0F, byte >> 4):
+                    pairs.add((index, nibble & 7))
+                    index = max(0, min(88,
+                        index + IMA_INDEX_ADJUST[nibble]))
+    return set(i for (i, magnitude) in pairs if magnitude != 0)
+
+
+# Fixtures that are quiet ON PURPOSE, with the level each one actually
+# decodes to.
+#
+# The generic floor below ("silent or far down") exists to catch a decoder
+# returning nothing, and it cannot tell that from a fixture written at
+# -60 dBFS to drive the bottom of the IMA step table. Exempting them would
+# lose the check exactly where the samples are smallest and a scaling
+# error is easiest to make, so instead each one states its measured peak
+# and RMS and is held to a BAND around them. That is stricter than the
+# floor, not looser: a decode 6 dB down fails here and would have passed
+# the floor for every loud fixture in the corpus.
+QUIET_FIXTURES = {
+    "aifc_ima4_quietnoise_8000.aifc": (0.00162, 0.000645),
+    "wav_imaadpcm_lownoise_8000.wav": (0.01099, 0.005921),
+    "wav_imaadpcm_lsbnoise_8000.wav": (0.00052, 0.000191),
+    "wav_imaadpcm_midnoise_8000.wav": (0.05371, 0.028858),
+    "wav_imaadpcm_quietnoise_8000.wav": (0.00262, 0.001459),
+}
+# +/- 30%: wide enough that a regenerated fixture does not trip it,
+# narrow enough that the nearest interesting error (6 dB, a factor of two)
+# is outside it in both directions.
+QUIET_BAND = 0.30
+
+
+def classify_excess(coding, excess_frames):
+    """Is a reference reading `excess_frames` more than us allowed?
+
+    Returns a complaint, or None when the difference is padding past the
+    `fact` chunk. Pulled out of compare() so that the self-check can drive
+    it directly: every way of reaching this through a real fixture is
+    caught first by the frame-count check, so a control that goes through
+    compare() proves the frame-count check works and says nothing about
+    this. A branch that can only ACCEPT a difference has to be shown to
+    reject one somehow, and this is the only honest way to show it.
+    """
+    limit = MAX_BLOCK_FRAMES.get(coding, 0)
+    if coding == "pcm":
+        return ("decoded %d frames more than we did, and PCM has no padding "
+                "to explain it" % excess_frames)
+    if excess_frames < 0:
+        return ("decoded %d frames FEWER than we did; we are producing "
+                "frames the file does not hold" % -excess_frames)
+    if excess_frames >= limit:
+        return ("decoded %d frames more than we did, which is a whole block "
+                "or more (%s pads at most %d) - that is a decoder stopping "
+                "early, not padding" % (excess_frames, coding, limit))
+    return None
+
+
+def compare(path, ours, quiet=False, excluded=None, scored=None,
+            pad_notes=None, as_name=None):
     """Score one reading of one fixture. Returns a list of complaints.
 
     `ours` is passed in rather than read here so that the control can hand
@@ -220,9 +453,17 @@ def compare(path, ours, quiet=False, excluded=None, scored=None):
         excluded = set()
     if scored is None:
         scored = []
+    if pad_notes is None:
+        pad_notes = []
     name = os.path.basename(path)
+    # A round trip's output is a temporary file, and the level band that
+    # belongs to the fixture it came from has to follow it there or the
+    # quiet fixtures fail the generic floor every time they are rewritten.
+    level_name = as_name or name
     meta = ours_meta(path)
     fmt = meta["format"]
+    coding = meta.get("coding", "pcm")
+    container = "wav" if name.endswith(".wav") else "aiff"
     channels = int(meta["channels"])
     frames = int(meta["frames"])
     rate = int(meta["rate"])
@@ -249,8 +490,15 @@ def compare(path, ours, quiet=False, excluded=None, scored=None):
     }
     refs = {}
     for ref in wanted:
-        if (ref, fmt) in EXCLUSIONS:
-            excluded.add((ref, fmt))
+        key = None
+        if (ref, name) in EXCLUSIONS:
+            key = (ref, name)
+        elif (ref, container, coding) in EXCLUSIONS:
+            key = (ref, container, coding)
+        elif (ref, fmt) in EXCLUSIONS:
+            key = (ref, fmt)
+        if key:
+            excluded.add(key)
             continue
         refs[ref] = getters[ref]()
     scored.append((name, sorted(refs)))
@@ -268,24 +516,56 @@ def compare(path, ours, quiet=False, excluded=None, scored=None):
             # little-endian; on a big-endian host that is not the host order
             # everything else here is in.
             continue
-        if data != ours:
-            first = next((i for i in range(min(len(data), len(ours)))
-                          if data[i] != ours[i]), min(len(data), len(ours)))
+        common = min(len(data), len(ours))
+        first = next((i for i in range(common) if data[i] != ours[i]), None)
+        if first is not None:
             bad.append("%s: %s disagrees (%d vs %d bytes, first at %d)"
                        % (name, ref, len(data), len(ours), first))
+            continue
+        if len(data) == len(ours):
+            continue
+        # The prefix is identical and the lengths are not. For a coded
+        # WAV that is the padded final block: `fact` told us where the
+        # signal stops and told the reference nothing it acted on. It is
+        # allowed, bounded, and only in that direction - a reference
+        # SHORTER than us means we invented frames.
+        excess_frames = (len(data) - len(ours)) // (channels * width)
+        complaint = classify_excess(coding, excess_frames)
+        if complaint:
+            bad.append("%s: %s %s" % (name, ref, complaint))
+        else:
+            pad_notes.append("%s: %s read %d padding frame%s past the "
+                             "fact chunk's count (identical over the %d "
+                             "frames we share)"
+                             % (name, ref, excess_frames,
+                                "" if excess_frames == 1 else "s",
+                                len(ours) // (channels * width)))
 
     # Absolute level, per channel. A decoder returning silence, or uniformly
     # down, agrees with nothing here even when its difference from a
     # reference looks small - which is the case a threshold scaled to the
     # signal forgives.
     stats = measure(ours, fmt, channels)
+    band = QUIET_FIXTURES.get(level_name)
     for index, (peak, rms, dc) in enumerate(stats):
-        if peak < 0.05:
-            bad.append("%s: channel %d peaks at %.4f - silent or far down"
-                       % (name, index, peak))
-        if rms < 0.01:
-            bad.append("%s: channel %d RMS %.5f - silent or far down"
-                       % (name, index, rms))
+        if band:
+            want_peak, want_rms = band
+            for label, got, want in (("peak", peak, want_peak),
+                                     ("RMS", rms, want_rms)):
+                if not (want * (1.0 - QUIET_BAND) <= got
+                        <= want * (1.0 + QUIET_BAND)):
+                    bad.append("%s: channel %d %s %.6f is outside the "
+                               "%.0f%% band around the %.6f this quiet "
+                               "fixture decodes to"
+                               % (name, index, label, got,
+                                  QUIET_BAND * 100, want))
+        else:
+            if peak < 0.05:
+                bad.append("%s: channel %d peaks at %.4f - silent or far "
+                           "down" % (name, index, peak))
+            if rms < 0.01:
+                bad.append("%s: channel %d RMS %.5f - silent or far down"
+                           % (name, index, rms))
         if abs(dc) > 0.05:
             bad.append("%s: channel %d DC offset %.4f - sign or bias error"
                        % (name, index, dc))
@@ -299,8 +579,10 @@ def compare(path, ours, quiet=False, excluded=None, scored=None):
     return bad
 
 
-def check(path, quiet=False, excluded=None, scored=None):
-    return compare(path, ours_pcm(path), quiet, excluded, scored)
+def check(path, quiet=False, excluded=None, scored=None, pad_notes=None,
+          as_name=None):
+    return compare(path, ours_pcm(path), quiet, excluded, scored, pad_notes,
+                   as_name)
 
 
 def main():
@@ -320,8 +602,10 @@ def main():
     bad = []
     excluded = set()
     scored = []
+    pad_notes = []
     for f in files:
-        bad += check(os.path.join(DATA, f), excluded=excluded, scored=scored)
+        bad += check(os.path.join(DATA, f), excluded=excluded, scored=scored,
+                     pad_notes=pad_notes)
 
     if self_check:
         # The control, and the first draft of it was wrong in a way worth
@@ -357,6 +641,36 @@ def main():
         # level checks are the half that will carry the gate from phase 5,
         # where no reference is exact and the comparison becomes a tolerance.
         # So: require that silence trips a LEVEL complaint specifically.
+        # The padding branch is the one that ACCEPTS a difference, so it
+        # needs a control of its own or it is a hole shaped like a
+        # feature. Two ways to abuse it: stop a whole block early and
+        # call the gap padding, or return more frames than the file
+        # holds. Run against a coded fixture, because padding is only
+        # allowed there.
+        for label, coding, excess, want_reject in [
+            ("padding, one frame", "ms-adpcm", 1, False),
+            ("padding, near a block", "ms-adpcm", 499, False),
+            ("a whole block over", "ms-adpcm", 4096, True),
+            ("reference is shorter", "ms-adpcm", -1, True),
+            ("any excess on PCM", "pcm", 1, True),
+            ("ima-qt, 63 frames", "ima-qt", 63, False),
+            ("ima-qt, 64 frames", "ima-qt", 64, True),
+        ]:
+            got = classify_excess(coding, excess)
+            if want_reject and got is None:
+                bad.append("CONTROL FAILED (%s): the padding allowance "
+                           "accepted %d excess frames of %s, so it is a "
+                           "hole rather than a bounded difference"
+                           % (label, excess, coding))
+            elif not want_reject and got is not None:
+                bad.append("CONTROL FAILED (%s): the padding allowance "
+                           "rejected %d excess frames of %s, which is "
+                           "padding and must be allowed"
+                           % (label, excess, coding))
+            else:
+                print("    %-22s %s"
+                      % (label, "rejected" if want_reject else "allowed"))
+
         silent = compare(victim, bytes(len(truth)), quiet=True)
         level_said = [c for c in silent
                       if "peaks at" in c or "RMS" in c or "DC offset" in c]
@@ -367,6 +681,37 @@ def main():
             print("    %-20s rejected: %s"
                   % ("(level check)", level_said[0].split(": ", 1)[-1][:66]))
 
+    # Step-table coverage, reported every run rather than measured once.
+    # A fixture regenerated with different content, or one removed, can
+    # take entries out of the corpus without changing any verdict - and
+    # the entries it takes out are then validated by nothing.
+    covered = set()
+    for f in files:
+        if "ima" in f:
+            covered |= ima_observable_indices(os.path.join(DATA, f))
+    uncovered = sorted(set(range(IMA_STEP_COUNT)) - covered)
+    print("\nIMA step table: %d of %d entries loaded with a nonzero nibble "
+          "magnitude, which is what makes a wrong value visible."
+          % (len(covered), IMA_STEP_COUNT))
+    if uncovered:
+        bad.append("the IMA step table has %d entries no fixture exercises "
+                   "observably (%s); a wrong value in any of them would "
+                   "decode identically here"
+                   % (len(uncovered),
+                      ", ".join(str(x) for x in uncovered[:12])
+                      + ("..." if len(uncovered) > 12 else "")))
+
+    if pad_notes:
+        # Printed, not silent. This is a real disagreement with every
+        # reference about how long a file is, and it is resolved in our
+        # favour by the file's own `fact` chunk. A reader of this output
+        # has to be able to see that it happened and how often.
+        print("\n%d comparison%s ended in padding past the fact chunk. The "
+              "shared frames were identical in every one:"
+              % (len(pad_notes), "" if len(pad_notes) == 1 else "s"))
+        for line in pad_notes:
+            print("  %s" % line)
+
     # The denominator, stated. A score whose exclusions are invisible is
     # inflated, so both halves are printed whether or not anything failed.
     total = sum(len(refs) for _, refs in scored)
@@ -374,9 +719,9 @@ def main():
                                                                 total))
     if excluded:
         print("\nExcluded, with the reason each was established by:")
-        for ref, fmt in sorted(excluded):
-            print("  %s / %s" % (ref, fmt))
-            for line in _wrap(EXCLUSIONS[(ref, fmt)], 70):
+        for key in sorted(excluded):
+            print("  %s" % " / ".join(key))
+            for line in _wrap(EXCLUSIONS[key], 70):
                 print("      " + line)
 
     if bad:

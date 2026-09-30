@@ -226,6 +226,18 @@ GAUD_Result gaud_encoder_create(const char * codec_name,
   if (params->sample_rate == 0 || !gaud_channel_layout_valid(params->layout)) {
     return GAUD_ERR_INVALID;
   }
+  if (params->coding < 0 || params->coding >= GAUD_CODING_COUNT) {
+    return GAUD_ERR_INVALID;
+  }
+  /* A coded file's samples are whatever that coding decodes to, and the
+   * caller says so rather than having it substituted. Converting here
+   * would mean gaud_encoder_write() silently accepting a format the
+   * encoder was not created with, which is the one thing the buffer check
+   * below exists to prevent. */
+  if (!gaud_sample_coding_is_pcm(params->coding)
+      && params->format != gaud_sample_coding_format(params->coding)) {
+    return GAUD_ERR_INVALID;
+  }
   if (!gaud_stream_writable(stream)) {
     return GAUD_ERR_INVALID;
   }
