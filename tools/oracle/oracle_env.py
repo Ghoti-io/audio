@@ -27,10 +27,11 @@ asked the same question about the same file, and the whole value is in where
 they disagree, which is only a fact about them if their base state is one
 fact.
 
-Two of the names are not programs. `libsndfile` and `pywave` are both
-`python3`, and they are separate entries because they are separate
-implementations: libsndfile is a C library with its own parsers, and `wave` is
-a pure-Python parser in the standard library that shares no code with it. A
+Three of the names are not programs. `libsndfile`, `pywave` and `mutagen` are
+all `python3`, and they are separate entries because they are separate
+implementations: libsndfile is a C library with its own parsers, `wave` is a
+pure-Python parser in the standard library that shares no code with it, and
+mutagen is a pure-Python tag library that reads no samples at all. A
 pin saying "python3 3.13.5" would be one fact where the corpus asks two
 questions.
 
@@ -70,6 +71,7 @@ PROBE = {
     "sox": (["sox-version"], "SoX 14.4.2"),
     "libsndfile": (["libsndfile-version"], "libsndfile 1.2.2"),
     "pywave": (["pywave-version"], "Python 3.13.5 wave"),
+    "mutagen": (["mutagen-version"], "mutagen 1.47.0"),
 }
 
 # The program each reference is invoked as, where it differs from the name.
@@ -79,6 +81,7 @@ PROBE = {
 BINARY = {
     "libsndfile": "python3",
     "pywave": "python3",
+    "mutagen": "python3",
 }
 
 _pins = None

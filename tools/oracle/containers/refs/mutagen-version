@@ -1,0 +1,4 @@
+#!/bin/sh
+# What mutagen says it is. stdout only: an engine banner on stderr must
+# not become part of the version.
+exec python3 -c "import mutagen; print('mutagen', mutagen.version_string)"

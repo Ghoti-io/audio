@@ -36,6 +36,7 @@
 #include <ghoti.io/audio/coding.h>
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/macros.h>
+#include <ghoti.io/audio/meta.h>
 #include <ghoti.io/audio/stream.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -99,6 +100,16 @@ GAUD_API const char * gaud_doc_codec_name(const GAUD_Doc * doc);
 
 /** @brief The stream the document was loaded from. */
 GAUD_API GAUD_Stream * gaud_doc_stream(const GAUD_Doc * doc);
+
+/**
+ * @brief The document's tags, raw blocks and pictures.
+ *
+ * Never NULL for a document this library loaded: a file with no metadata
+ * gets an empty ::GAUD_Meta rather than one, so a caller never has to
+ * distinguish "no tags" from "nothing to ask". Owned by the document and
+ * destroyed with it; gaud_meta_copy() is how to outlive it.
+ */
+GAUD_API GAUD_Meta * gaud_doc_meta(const GAUD_Doc * doc);
 
 /** @brief What this track's decoder puts in a buffer. */
 GAUD_API GAUD_Sample_Format gaud_track_format(const GAUD_Track * track);

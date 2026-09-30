@@ -43,8 +43,28 @@ GAUD_Result gaud_doc_create_internal(const GAUD_Codec * codec,
       .codec = codec,
       .stream = stream,
   };
+  /* Created empty rather than lazily, so gaud_doc_meta() never returns
+   * NULL and no caller has to tell "this file had no tags" from "there is
+   * nothing to ask". A codec that reads no metadata leaves it empty. */
+  GAUD_Result result = gaud_meta_create(allocator, &doc->meta);
+  if (result != GAUD_OK) {
+    gcu_allocator_free(allocator, doc);
+    return result;
+  }
   *out_doc = doc;
   return GAUD_OK;
+}
+
+GAUD_Meta * gaud_doc_meta(const GAUD_Doc * doc) {
+  return doc ? doc->meta : NULL;
+}
+
+void gaud_doc_take_meta(GAUD_Doc * doc, GAUD_Meta * meta) {
+  if (!doc || !meta || doc->meta == meta) {
+    return;
+  }
+  gaud_meta_destroy(doc->meta);
+  doc->meta = meta;
 }
 
 GAUD_Result gaud_doc_add_track(
@@ -108,6 +128,7 @@ void gaud_doc_destroy(GAUD_Doc * doc) {
     gcu_allocator_free(doc->allocator, doc->tracks[i]);
   }
   gcu_allocator_free(doc->allocator, doc->tracks);
+  gaud_meta_destroy(doc->meta);
   gcu_allocator_free(doc->allocator, doc);
 }
 

@@ -1,7 +1,7 @@
 # The oracle references, pinned, in one image.
 #
 # **One image rather than one per reference, because the questions interlock.**
-# These are not tools that each answer about their own format; they are four
+# These are not tools that each answer about their own format; they are five
 # independent implementations asked the *same* question about the same file,
 # and the whole value is in where they disagree. In separate images with
 # separate base states, a disagreement would first have to be shown not to be
@@ -18,6 +18,14 @@
 #             is the scriptable spelling. libsndfile is what most audio
 #             applications that are not ffmpeg actually use, so it is the one
 #             whose acceptance predicts whether a file opens in a DAW.
+# mutagen     A fifth reference, and the only one here that exists *for*
+#             metadata. Pure Python, no shared code with ffmpeg, and the
+#             implementation most taggers are built on - so it is the one
+#             whose reading of an ID3v2 frame is the practical definition.
+#             Added in phase 3 for a reason worth stating: ffmpeg is what
+#             *generates* the tag fixtures, and a reference that both
+#             writes the corpus and marks it cannot see a misunderstanding
+#             it holds in both directions.
 # python3     The standard library's `wave`, a fourth implementation and a
 #             pure-Python one, which shares nothing with the three C parsers
 #             above. **WAV only**: Python 3.13 removed `aifc` under PEP 594,
@@ -67,15 +75,17 @@ RUN apt-get update -qq \
       python3=3.13.5-1 \
       python3-soundfile=0.13.1-2 \
       libsndfile1=1.2.2-2+deb13u1 \
+      python3-mutagen=1.47.0-1 \
     && rm -rf /var/lib/apt/lists/*
 
 # The probes oracle_env.py runs, copied in rather than written with printf
 # inside a RUN: font's first draft did that and its escapes reached the file
 # literally, which puts a quoting layer between a check and the fact it checks.
 COPY ffmpeg-version sox-version libsndfile-version pywave-version \
-      /usr/local/bin/
+      mutagen-version /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/ffmpeg-version /usr/local/bin/sox-version \
-      /usr/local/bin/libsndfile-version /usr/local/bin/pywave-version
+      /usr/local/bin/libsndfile-version /usr/local/bin/pywave-version \
+      /usr/local/bin/mutagen-version
 
 # A locale, pinned, because regex lost 1,855 differential rows to an image
 # that had none. Nothing here reads a name out of a file yet, but sox and
@@ -90,4 +100,4 @@ ENV TZ=UTC SOURCE_DATE_EPOCH=0
 
 ENTRYPOINT []
 CMD ["sh", "-c", "ffmpeg-version; sox-version; libsndfile-version; \
-pywave-version"]
+pywave-version; mutagen-version"]

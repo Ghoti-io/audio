@@ -56,6 +56,7 @@
 #include <ghoti.io/audio/core.h>
 #include <ghoti.io/audio/doc.h>
 #include <ghoti.io/audio/macros.h>
+#include <ghoti.io/audio/meta.h>
 #include <ghoti.io/audio/stream.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -174,6 +175,21 @@ typedef struct GAUD_Encode_Params {
    * NULL is the defaults.
    */
   const GAUD_Limits * limits;
+  /**
+   * Tags, raw blocks and pictures to write, or NULL for a file with none.
+   *
+   * Borrowed: it must outlive gaud_encoder_finish(), which is where most
+   * of it is written. Supplied at creation rather than set later because
+   * some of it goes in front of the samples - BWF's `bext` belongs at the
+   * head of the file - and by the first gaud_encoder_write() that place
+   * has gone.
+   */
+  const GAUD_Meta * meta;
+  /**
+   * What to do with @p meta. ::GAUD_META_PRESERVE_ALL is zero, so a params
+   * struct that names metadata and nothing else writes all of it.
+   */
+  GAUD_Meta_Policy meta_policy;
 } GAUD_Encode_Params;
 
 /** @brief 44.1 kHz stereo signed 16-bit, which every format here can write. */

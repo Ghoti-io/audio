@@ -3,7 +3,7 @@
 # One line per reference, tab-separated: <name> <image> <version> <what it
 # answers>.
 #
-# **Every line names the same image**, which is not tidiness. These are four
+# **Every line names the same image**, which is not tidiness. These are five
 # independent implementations asked the same question about the same file,
 # and the whole value is in where they disagree. In one image per reference,
 # with one base state each, a disagreement would first have to be shown not
@@ -18,11 +18,16 @@
 # modes; there is no stock image named here, so relaxing it in host mode
 # would leave nothing checking anything.
 #
-# Two of them need a word about what the number is:
+# Three of them need a word about what the number is:
 #
 #   - For libsndfile it is the **C library's** version and not
 #     python-soundfile's. soundfile is a ctypes wrapper; libsndfile is what
 #     decides an answer, and the two move independently.
+#   - mutagen was added in phase 3, and the reason is worth keeping: ffmpeg
+#     is what *generates* the tag fixtures, so scoring them with ffmpeg
+#     alone would be asking one implementation whether it agrees with
+#     itself. A misunderstanding held in both its writer and its reader is
+#     invisible to that. mutagen shares no code with it.
 #   - For pywave it is the interpreter version, because `wave` is a stdlib
 #     module with no version of its own and its behaviour has changed
 #     between releases. Note what that same release took away: **Python 3.13
@@ -40,6 +45,7 @@ ffmpeg	localhost/ghoti-audio-oracle-refs:deb13	ffmpeg 7.1.5	libavformat's RIFF a
 sox	localhost/ghoti-audio-oracle-refs:deb13	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
 libsndfile	localhost/ghoti-audio-oracle-refs:deb13	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
 pywave	localhost/ghoti-audio-oracle-refs:deb13	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
+mutagen	localhost/ghoti-audio-oracle-refs:deb13	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
 
 # Not here yet:
 #   afconvert  Apple's own, and the reference that decides what AIFF-C really

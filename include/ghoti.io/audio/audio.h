@@ -36,6 +36,7 @@
 #include <ghoti.io/audio/decoder.h>
 #include <ghoti.io/audio/doc.h>
 #include <ghoti.io/audio/macros.h>
+#include <ghoti.io/audio/meta.h>
 #include <ghoti.io/audio/ops.h>
 #include <ghoti.io/audio/stream.h>
 #include <ghoti.io/audio/version.h>

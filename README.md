@@ -205,7 +205,7 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phase 2 of ten, complete. What works:
+Phase 3 of ten, complete. What works:
 
 - **WAV and AIFF, read and written**, across every PCM width both can carry,
   including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
@@ -213,6 +213,13 @@ Phase 2 of ten, complete. What works:
   `GAUD_Sample_Coding` reporting what the file used separately from what the
   buffer holds. Blocks are self-contained, so seeking into a coded track is
   still exact.
+- **Tags, raw carriage and cover art.** ID3v1 and ID3v2.2/2.3/2.4, RIFF
+  `LIST`/`INFO`, BWF `bext` and AIFF's four text chunks, over a common
+  multi-valued vocabulary with everything unmapped kept under its own
+  spelling. Every string crossing the API is UTF-8, including from a frame
+  that claims UTF-8 and is not. A file this library writes carries its tags
+  in both its container's native scheme and an ID3 chunk, so a reader that
+  knows only one still finds them.
 - The base object: `GAUD_Buffer` with interleaved and planar layouts, sample
   formats including the non-PCM cases DSD and opaque, and an explicit
   `GAUD_Channel_Layout` that keeps "the file did not say" distinct from mono.
@@ -234,16 +241,23 @@ How it is judged:
 | --- | --- |
 | `make check-corpus` | Four independent references - ffmpeg, sox, libsndfile and Python's `wave` - decode the corpus exactly as this does. PCM is lossless, so this is a byte comparison and not a tolerance |
 | `make check-writer` | Those references read what this library wrote, and the samples survived the round trip: 68 lossless round trips across both containers and both directions, plus 95 coded ones scored two ways - every reference must decode the file at all, and the SNR must clear a floor stated per coding |
+| `make check-tags` | Three questions: does the ID3v1 genre table match mutagen's row by row, can ffmpeg and mutagen read the tags this library writes, and can it read theirs. The third is the one a library whose reader and writer share a misunderstanding fails |
 | `make check-golden` | The corpus decodes to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs |
 | `make check-outoftree` | A codec in another repository works |
 | `make fuzz` | Per-container harnesses asserting the caller-facing invariants, not merely the absence of a crash - plus `coded`, which drives the block layer below any container, because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does. It found a real defect in its first minute |
 
 The corpus is generated **by** the references and never by this library: one
 grown from our own writer would agree with our own reader by construction.
+That argument has a second edge, which is why the image gained a fifth
+reference in phase 3 - ffmpeg *writes* the tag fixtures, so scoring them
+with ffmpeg alone would ask one implementation whether it agrees with
+itself. `mutagen` shares no code with it.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-131 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
-serially and under `-j`, in both `?image` arms.
+141 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+serially and under `-j`, in both `?image` arms - and the arms genuinely
+differ from phase 3 on, because cover-art verification is the one thing
+`image` is linked for.
 
 Two figures the gates print rather than assume: the corpus exercises **all 89
 IMA step-table entries with a nibble magnitude that makes a wrong value
@@ -261,8 +275,12 @@ What is deliberately absent:
   interleave for it and ffmpeg refuses both directions, so writing one would
   produce a file the most widely deployed reader cannot open. Reading stays
   liberal.
-- **Metadata.** ID3, `LIST`/`INFO`, `bext` and the rest are phase 3. They are
-  skipped by length today, so they never stop a file loading.
+- **Vorbis comment, MP4 `ilst`, APEv2 and Matroska tags.** Phase 3 covers the
+  schemes the two phase 1 containers carry; the rest arrive with the
+  containers that hold them.
+- **Chapters and cues.** WAV's `cue `/`adtl`, FLAC's CUESHEET and the other
+  two spellings of the same idea. A `LIST` that is not an `INFO` is kept raw
+  today, so nothing is lost while they wait.
 - **`GAUD_SAMPLE_DSD1` and `GAUD_SAMPLE_OPAQUE` exist and nothing produces
   them.** They are in the base object because a registered codec cannot add a
   case to it later; DSD is phase 9 and remux needs the opaque one.
@@ -276,6 +294,7 @@ What is deliberately absent:
 | \ref format_wav "formats/wav.md" | RIFF/WAVE, RF64 and BW64: what is covered, and the five things a reader gets wrong |
 | \ref format_aiff "formats/aiff.md" | AIFF and AIFF-C, including the 80-bit float its sample rate is stored as |
 | \ref format_coding "formats/coding.md" | G.711 and the two ADPCM families: one algorithm in two framings, and where the references disagree |
+| \ref metadata "metadata.md" | Tags, raw carriage and cover art: the schemes, the encodings, and where they disagree |
 | \ref writing_a_codec "writing-a-codec.md" | The compatibility contract for a codec in another repository |
 | \ref development "development.md" | Building, the gates, and why a clean tree is a different test |
 

@@ -35,6 +35,7 @@
  * plain form, because that is the one every reader accepts.
  */
 
+#include "../../meta/scheme.h"
 #include "../shared/bytes.h"
 #include "../shared/coded.h"
 #include "wav_internal.h"
@@ -51,6 +52,9 @@ typedef struct {
   bool needs_swap;           ///< Whether the host's order is not the file's.
   GAUD_Sample_Coding coding; ///< ::GAUD_CODING_PCM for an uncoded file.
   GAUD_Coded_Writer coded;   ///< Block buffer; used only when coded.
+  const GAUD_Meta * meta;    ///< Borrowed from the params; may be NULL.
+  GAUD_Meta_Policy policy;   ///< What to do with it.
+  bool padded;               ///< Whether the data chunk's pad byte is out.
 } WAV_Encoder_State;
 
 static GAUD_Result put(GAUD_Encoder * encoder, const void * bytes,
@@ -134,6 +138,77 @@ static GAUD_Result patch_u32(
   return GAUD_OK;
 }
 
+/**
+ * Write the metadata chunks that follow the samples.
+ *
+ * `LIST`/`INFO` and `id3 `, in that order, which is what ffmpeg and
+ * every tagger emit. Both are written when both have content: they are
+ * different vocabularies and a reader that understands only one should
+ * still find its own.
+ */
+static GAUD_Result write_trailing_metadata(
+    GAUD_Encoder * encoder, WAV_Encoder_State * state) {
+  if (!state->meta || state->policy == GAUD_META_DROP_ALL) {
+    return GAUD_OK;
+  }
+  GAUD_Stream * stream = gaud_encoder_stream(encoder);
+  const GAUD_Allocator * allocator = gaud_encoder_allocator(encoder);
+
+  /* The data chunk is padded to even before anything else is written,
+   * and that pad byte is counted in the RIFF size and not in the data
+   * chunk's own - so it has to go out before the first metadata chunk or
+   * every offset after it is odd. */
+  if (state->data_bytes & 1u) {
+    const unsigned char pad = 0;
+    GAUD_Result result = gaud_stream_write(stream, &pad, 1);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    state->padded = true;
+  }
+
+  if (state->policy != GAUD_META_KEEP_RAW_ONLY) {
+    unsigned char * info = NULL;
+    size_t info_size = 0;
+    GAUD_Result result
+        = gaud_riff_info_build(state->meta, allocator, &info, &info_size);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    if (info_size > 0) {
+      result = gaud_stream_write(stream, info, info_size);
+    }
+    gcu_allocator_free(allocator, info);
+    if (result != GAUD_OK) {
+      return result;
+    }
+  }
+
+  unsigned char * id3 = NULL;
+  size_t id3_size = 0;
+  GAUD_Result result
+      = gaud_id3v2_build(state->meta, state->policy, allocator, &id3,
+          &id3_size);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  if (id3_size > 0) {
+    unsigned char header[8];
+    memcpy(header, "id3 ", 4);
+    gaud_wr_u32le(header + 4, (uint32_t)id3_size);
+    result = gaud_stream_write(stream, header, sizeof(header));
+    if (result == GAUD_OK) {
+      result = gaud_stream_write(stream, id3, id3_size);
+    }
+    if (result == GAUD_OK && (id3_size & 1u)) {
+      const unsigned char pad = 0;
+      result = gaud_stream_write(stream, &pad, 1);
+    }
+  }
+  gcu_allocator_free(allocator, id3);
+  return result;
+}
+
 static GAUD_Result wav_finish(GAUD_Encoder * encoder) {
   WAV_Encoder_State * state = gaud_encoder_private(encoder);
   GAUD_Stream * stream = gaud_encoder_stream(encoder);
@@ -162,13 +237,32 @@ static GAUD_Result wav_finish(GAUD_Encoder * encoder) {
   /* RIFF chunks are padded to an even length. The pad byte is not counted
    * in the chunk's own size and is counted in the RIFF size, which is the
    * detail a writer gets wrong and no reader complains about until one
-   * does. */
-  if (state->data_bytes & 1u) {
+   * does.
+   *
+   * `state->padded` is set when the metadata writer above already did it:
+   * padding twice would put a stray byte between the data chunk and the
+   * first metadata chunk, and every chunk after that would be misread. */
+  if ((state->data_bytes & 1u) && !state->padded) {
     const unsigned char pad = 0;
     GAUD_Result result = gaud_stream_write(stream, &pad, 1);
     if (result != GAUD_OK) {
       return result;
     }
+  }
+
+  /* Metadata goes after the samples.
+   *
+   * RIFF allows it anywhere and readers walk the chunks, so the position
+   * is a choice. After is the right one for everything except `bext`,
+   * which the broadcast specification wants first - and `bext` is
+   * written at the head instead, before any sample, which is why the
+   * encoder is given its metadata at creation rather than at finish.
+   *
+   * Writing the rest here rather than at the head is what lets the
+   * caller keep filling tags while the samples stream past. */
+  GAUD_Result meta_written = write_trailing_metadata(encoder, state);
+  if (meta_written != GAUD_OK) {
+    return meta_written;
   }
 
   uint64_t total = gaud_stream_tell(stream);
@@ -455,6 +549,8 @@ GAUD_Result gaud_wav_encoder_open(const GAUD_Codec * codec,
   state->frame_size = frame_size;
   state->needs_swap = !coded && !gaud_host_is_little_endian() && bits > 8;
   state->coding = params->coding;
+  state->meta = params->meta;
+  state->policy = params->meta_policy;
 
   if (coded) {
     result = gaud_coded_writer_init(&state->coded, &geometry, allocator);

@@ -48,6 +48,7 @@ struct GAUD_Doc {
   size_t track_count;               ///< How many.
   size_t track_capacity;            ///< Room in @p tracks.
   void * codec_private;             ///< The codec's, freed by its close.
+  GAUD_Meta * meta;                 ///< Owned. Never NULL after create.
 };
 
 /** @brief Reads samples from one track. */

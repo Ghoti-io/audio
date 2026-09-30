@@ -691,10 +691,18 @@ $(WRITE_PROBE): $(ORACLE)/write_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
-oracle-probe: ## Build the probes the differentials drive
-oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE)
+TAG_PROBE := $(APP_DIR)/oracle/tag_probe$(EXE_EXTENSION)
 
-oracle-build: ## Build the pinned ffmpeg, sox, libsndfile and python3 image
+$(TAG_PROBE): $(ORACLE)/tag_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET) $(LIBVER_GEN)
+	@printf "\n### Compiling Oracle Probe: tag_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
+oracle-probe: ## Build the probes the differentials drive
+oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE)
+
+oracle-build: ## Build the pinned ffmpeg, sox, libsndfile, python3 and mutagen image
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if none would
@@ -711,6 +719,11 @@ check-corpus: $(DUMP_PROBE)
 		python3 $(ORACLE)/check_corpus.py --self-check
 
 check-writer: ## Fail if a reference cannot read what our writer produced
+check-tags: ## Fail if a reference reads our tags differently than we do
+check-tags: $(TAG_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_TAG_PROBE=$(TAG_PROBE) \
+		python3 $(ORACLE)/check_tags.py
+
 check-writer: $(DUMP_PROBE) $(WRITE_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		GAUD_WRITE_PROBE=$(WRITE_PROBE) python3 $(ORACLE)/check_writer.py
@@ -804,7 +817,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-outoftree check-golden
 .PHONY: check-fixtures corpus check-corpus check-writer
-.PHONY: oracle-build oracle-probe oracle-version
+.PHONY: oracle-build oracle-probe oracle-version check-tags
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1421,7 +1434,7 @@ endef
 # decoders only through a header the fuzzer has to synthesise correctly
 # first, so nearly every input dies at the chunk walk and the nibble loops
 # see almost nothing. `coded` hands the bytes straight to the block layer.
-FUZZ_HARNESSES := wav aiff coded
+FUZZ_HARNESSES := wav aiff coded tags
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))

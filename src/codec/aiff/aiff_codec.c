@@ -29,6 +29,7 @@
  * runs somewhere nobody tests.
  */
 
+#include "../../meta/scheme.h"
 #include "../shared/bytes.h"
 #include "../shared/coded.h"
 #include "aiff_internal.h"
@@ -121,6 +122,9 @@ typedef struct {
   bool needs_swap;           ///< Whether the host's order is not the file's.
   GAUD_Sample_Coding coding; ///< ::GAUD_CODING_PCM for an uncoded file.
   GAUD_Coded_Writer coded;   ///< Block buffer; used only when coded.
+  const GAUD_Meta * meta;    ///< Borrowed from the params; may be NULL.
+  GAUD_Meta_Policy policy;   ///< What to do with it.
+  bool padded;               ///< Whether SSND's pad byte is already out.
 } AIFF_Encoder_State;
 
 static GAUD_Result aiff_write(
@@ -188,6 +192,98 @@ static GAUD_Result patch_u32be(
       : GAUD_ERR_IO;
 }
 
+/**
+ * The metadata chunks that follow SSND.
+ *
+ * AIFF's own text chunks carry four of the twenty tags, so an `ID3 `
+ * chunk goes out as well and carries the rest. Both: a reader that knows
+ * only AIFF's four still finds a title, and one that reads ID3 finds
+ * everything. Writing only the second would make this library's files
+ * look untagged to anything that predates the convention.
+ */
+static GAUD_Result write_trailing_metadata(
+    GAUD_Encoder * encoder, AIFF_Encoder_State * state) {
+  if (!state->meta || state->policy == GAUD_META_DROP_ALL) {
+    return GAUD_OK;
+  }
+  GAUD_Stream * stream = gaud_encoder_stream(encoder);
+  const GAUD_Allocator * allocator = gaud_encoder_allocator(encoder);
+
+  if (state->data_bytes & 1u) {
+    const unsigned char pad = 0;
+    GAUD_Result result = gaud_stream_write(stream, &pad, 1);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    state->padded = true;
+  }
+
+  if (state->policy != GAUD_META_KEEP_RAW_ONLY) {
+    static const struct {
+      const char id[5];
+      GAUD_Tag tag;
+    } text_chunks[] = {
+        {"NAME", GAUD_TAG_TITLE},
+        {"AUTH", GAUD_TAG_ARTIST},
+        {"(c) ", GAUD_TAG_COPYRIGHT},
+        {"ANNO", GAUD_TAG_COMMENT},
+    };
+    for (size_t i = 0; i < sizeof(text_chunks) / sizeof(text_chunks[0]);
+        ++i) {
+      const char * value = gaud_meta_get(state->meta, text_chunks[i].tag, 0);
+      if (!value || value[0] == '\0') {
+        continue;
+      }
+      /* The length is the string's, with no terminator: AIFF text
+       * chunks are counted, not terminated, and a writer that adds a
+       * NUL puts it inside every reader's string. */
+      size_t length = strlen(value);
+      if (length > 0xFFFFFFFFu) {
+        return GAUD_ERR_UNSUPPORTED;
+      }
+      unsigned char header[8];
+      memcpy(header, text_chunks[i].id, 4);
+      gaud_wr_u32be(header + 4, (uint32_t)length);
+      GAUD_Result result = gaud_stream_write(stream, header, sizeof(header));
+      if (result == GAUD_OK) {
+        result = gaud_stream_write(stream, value, length);
+      }
+      if (result == GAUD_OK && (length & 1u)) {
+        const unsigned char pad = 0;
+        result = gaud_stream_write(stream, &pad, 1);
+      }
+      if (result != GAUD_OK) {
+        return result;
+      }
+    }
+  }
+
+  unsigned char * id3 = NULL;
+  size_t id3_size = 0;
+  GAUD_Result result = gaud_id3v2_build(
+      state->meta, state->policy, allocator, &id3, &id3_size);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  if (id3_size > 0) {
+    unsigned char header[8];
+    /* Upper case here and lower case in RIFF, which is what each
+     * format's convention is and what each format's readers look for. */
+    memcpy(header, "ID3 ", 4);
+    gaud_wr_u32be(header + 4, (uint32_t)id3_size);
+    result = gaud_stream_write(stream, header, sizeof(header));
+    if (result == GAUD_OK) {
+      result = gaud_stream_write(stream, id3, id3_size);
+    }
+    if (result == GAUD_OK && (id3_size & 1u)) {
+      const unsigned char pad = 0;
+      result = gaud_stream_write(stream, &pad, 1);
+    }
+  }
+  gcu_allocator_free(allocator, id3);
+  return result;
+}
+
 static GAUD_Result aiff_finish(GAUD_Encoder * encoder) {
   AIFF_Encoder_State * state = gaud_encoder_private(encoder);
   GAUD_Stream * stream = gaud_encoder_stream(encoder);
@@ -202,7 +298,12 @@ static GAUD_Result aiff_finish(GAUD_Encoder * encoder) {
     coded_frames = state->coded.frames;
   }
 
-  if (state->data_bytes & 1u) {
+  GAUD_Result meta_written = write_trailing_metadata(encoder, state);
+  if (meta_written != GAUD_OK) {
+    return meta_written;
+  }
+
+  if ((state->data_bytes & 1u) && !state->padded) {
     const unsigned char pad = 0;
     GAUD_Result result = gaud_stream_write(stream, &pad, 1);
     if (result != GAUD_OK) {
@@ -454,6 +555,8 @@ GAUD_Result gaud_aiff_encoder_open(const GAUD_Codec * codec,
        * byte. */
       .needs_swap = !coded && gaud_host_is_little_endian() && bits > 8,
       .coding = params->coding,
+      .meta = params->meta,
+      .policy = params->meta_policy,
   };
   if (coded) {
     result = gaud_coded_writer_init(&state->coded, &geometry, allocator);

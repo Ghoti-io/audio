@@ -198,6 +198,72 @@ def ffmpeg_make(path, codec, channels, rate, frames, container,
     run(oracle.command("ffmpeg", argv, scratch=DATA))
 
 
+TAGS = [
+    ("title", "A Title"),
+    ("artist", "An Artist"),
+    ("album", "An Album"),
+    ("date", "2026"),
+    ("genre", "Ambient"),
+    ("comment", "caf\u00e9 \u65e5\u672c\u8a9e"),
+]
+
+
+def tagged_make(path, container, codec):
+    """A short tagged file, with an ID3 chunk grafted on.
+
+    ffmpeg writes its own scheme into each container and will not write
+    an ID3 chunk into either, so the ID3 block is taken from an MP3
+    ffmpeg *does* write one into and moved across. That keeps the bytes
+    ffmpeg's own writer produced - a fixture this library authored would
+    agree with this library's reader by construction.
+    """
+    import struct
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi",
+            "-i", "aevalsrc=0.5*sin(2*PI*440*t):s=44100:d=0.05",
+            "-c:a", codec, "-af", "atrim=end_sample=2205"]
+    for key, value in TAGS:
+        argv += ["-metadata", "%s=%s" % (key, value)]
+    # -map_metadata 0 keeps the tags asked for above; the other fixtures
+    # pass -1 to strip everything, which is what makes them byte-stable
+    # across ffmpeg upgrades. A tagged fixture cannot have both.
+    argv += ["-fflags", "+bitexact", "-flags:a", "+bitexact",
+             "-map_metadata", "0", "-f", container, path]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+
+    # The ID3 block, from an MP3 ffmpeg will write one into.
+    source = os.path.join(DATA, ".id3-source.mp3")
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi",
+            "-i", "aevalsrc=0.5*sin(2*PI*440*t):s=44100:d=0.05",
+            "-c:a", "libmp3lame", "-write_id3v2", "1"]
+    for key, value in TAGS:
+        argv += ["-metadata", "%s=%s" % (key, value)]
+    argv += ["-fflags", "+bitexact", "-f", "mp3", source]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+    with open(source, "rb") as handle:
+        mp3 = handle.read()
+    os.remove(source)
+    if mp3[:3] != b"ID3":
+        raise SystemExit("ffmpeg wrote no ID3v2 block to graft")
+    body = (((mp3[6] & 0x7F) << 21) | ((mp3[7] & 0x7F) << 14)
+            | ((mp3[8] & 0x7F) << 7) | (mp3[9] & 0x7F))
+    block = mp3[:10 + body]
+
+    with open(path, "rb") as handle:
+        data = bytearray(handle.read())
+    big = container != "wav"
+    identifier = b"ID3 " if big else b"id3 "
+    order = ">I" if big else "<I"
+    chunk = identifier + struct.pack(order, len(block)) + block
+    if len(block) & 1:
+        chunk += b"\0"
+    data.extend(chunk)
+    struct.pack_into(order, data, 4, len(data) - 8)
+    with open(path, "wb") as handle:
+        handle.write(bytes(data))
+
+
 def cycle_ms_predictors(path):
     """Rewrite each MS ADPCM block's predictor index to cycle 0..6.
 
@@ -258,6 +324,21 @@ def main():
         container = "aiff" if ext == "aifc" else "wav"
         path = os.path.join(DATA, "%s.%s" % (name, ext))
         ffmpeg_make(path, codec, channels, rate, frames, container, expr)
+        made.append(path)
+        print("  %-26s %s" % (name, os.path.getsize(path)))
+
+    # Tagged fixtures, so that every gate that loads the corpus walks
+    # the metadata path as well as the sample path - and so the
+    # container fuzzers have seeds with real chunks in them rather than
+    # only `fmt ` and `data`. ffmpeg writes LIST/INFO into a WAV and
+    # NAME/ANNO into an AIFF; the ID3 chunk is grafted on afterwards,
+    # because ffmpeg will not put one in either container itself and
+    # that is the chunk most of this library's reader is about.
+    for name, container, extension, codec in (
+            ("wav_tagged_s16_44100", "wav", "wav", "pcm_s16le"),
+            ("aiff_tagged_s16_44100", "aiff", "aiff", "pcm_s16be")):
+        path = os.path.join(DATA, "%s.%s" % (name, extension))
+        tagged_make(path, container, codec)
         made.append(path)
         print("  %-26s %s" % (name, os.path.getsize(path)))
 
