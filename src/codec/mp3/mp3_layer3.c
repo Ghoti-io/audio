@@ -817,8 +817,19 @@ static void band_extent(const MP3_Granule * granule, unsigned row,
  * both can be on. Where they meet is the part worth stating: intensity
  * stereo applies from the first band above the *right* channel's
  * non-zero part, the middle/side matrix applies below that, and a band
- * whose intensity position is the illegal one is handled as though
- * intensity stereo were off - which means by the matrix if it is on.
+ * whose intensity position has no weight is handled as though intensity
+ * stereo were off - which means by the matrix if it is on.
+ *
+ * **"No weight" is a range and not a value**, and reading it as a value
+ * was an out-of-bounds read of a global. The intensity position *is* the
+ * right channel's scalefactor, read with whatever field width
+ * `scalefac_compress` selected - up to four bits, so up to 15 - and
+ * 11172-3 gives a weight for 0 to 6 and calls 7 illegal. It says nothing
+ * about 8 to 15 because no encoder writes them, which is not the same as
+ * their being absent from a bitstream: a corrupt or hostile frame can
+ * state any of them, and each one indexed a 7-row table further past its
+ * end. 13818-3's table has 16 rows and calls 15 illegal, so the same
+ * threshold is exactly its bound too.
  */
 static void stereo(MP3_Layer3 * state, const MP3_Header * header,
     const MP3_Granule * granule, const MP3_Layer3_Channel * right, unsigned row,
@@ -826,6 +837,10 @@ static void stereo(MP3_Layer3 * state, const MP3_Header * header,
   int32_t * left = state->xr[0];
   int32_t * side = state->xr[1];
   bool lsf = header->version != MP3_MPEG1;
+  /* The first position with no weight, which is also the number of rows
+   * in the table it would index. See the note above: it is a threshold,
+   * because the field is wider than the range of values the standard
+   * defines a weight for. */
   unsigned illegal = lsf ? 15u : 7u;
 
   const uint16_t * bands;
@@ -855,7 +870,8 @@ static void stereo(MP3_Layer3 * state, const MP3_Header * header,
       int32_t position = is_short ? right->scalefac_short[band][window]
                                   : right->scalefac_long[band];
       bool is_intensity = intensity && from * (is_short ? 3u : 1u) >= bound;
-      if (is_intensity && (uint32_t)position == illegal) {
+      if (is_intensity
+          && (position < 0 || (uint32_t)position >= illegal)) {
         MP3_TRACE(MP3_T_INTENSITY_ILLEGAL);
         is_intensity = false;
       }

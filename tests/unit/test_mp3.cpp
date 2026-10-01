@@ -1539,6 +1539,158 @@ TEST(Mp3Decode, AFrameAtTheTopOfTheGainRangeDecodesWithoutOverflowing) {
 }
 
 /**
+ * A joint-stereo frame whose every intensity position is @p position.
+ *
+ * Built field by field rather than by filling the main data with a byte
+ * pattern, because the test below needs two frames that differ in the
+ * intensity positions and in **nothing else**: a byte pattern that
+ * changed those four-bit fields would change the bits after them too,
+ * and two decodes that differed would prove nothing.
+ *
+ * The shape, and why each part is what it is:
+ *
+ *   - `scalefac_compress` 14 selects four-bit scalefactors for bands 0 to
+ *     10 and two-bit ones for 11 to 20. Four bits is what lets a position
+ *     above 6 exist at all; two bits cannot reach one, so the upper bands
+ *     are legal positions in both frames and contribute the same thing to
+ *     each.
+ *   - **The right channel's `part2_3_length` covers its scalefactors and
+ *     nothing else**, so its spectrum is empty and `nonzero[1]` is zero -
+ *     which puts the intensity bound at the bottom of the spectrum and
+ *     makes every band an intensity band. That is the arrangement a real
+ *     encoder produces at the top of the spectrum and this produces
+ *     everywhere.
+ *   - The left channel's is longer, so its count1 region fills the low
+ *     spectrum with the plus and minus ones that region codes. Without
+ *     that there is nothing for an intensity weight to be applied to and
+ *     every frame decodes to silence.
+ */
+std::vector<unsigned char> IntensityFrame(unsigned position) {
+  /* 11 bands of four bits and 10 of two: 64 bits of scalefactors. */
+  const unsigned scalefactor_bits = 11u * 4u + 10u * 2u;
+  const unsigned count1_bits = 120u;
+
+  Writer side;
+  side.put(0, 9); /* main_data_begin: each frame stands alone */
+  side.put(0, 3); /* private bits */
+  side.put(0, 4); /* scfsi, channel 0: both granules carry their own */
+  side.put(0, 4); /* scfsi, channel 1 */
+  for (unsigned gr = 0; gr < 2u; ++gr) {
+    for (unsigned ch = 0; ch < 2u; ++ch) {
+      side.put(ch == 0 ? scalefactor_bits + count1_bits : scalefactor_bits,
+          12);                         /* part2_3_length */
+      side.put(0, 9);                  /* big_values: none */
+      side.put(180, 8);                /* global_gain */
+      side.put(14, 4);                 /* scalefac_compress */
+      side.put(0, 1);                  /* no window switching */
+      side.put(0, 5);                  /* table_select 0 */
+      side.put(0, 5);
+      side.put(0, 5);
+      side.put(7, 4);                  /* region0_count */
+      side.put(7, 3);                  /* region1_count */
+      side.put(0, 1);                  /* preflag */
+      side.put(0, 1);                  /* scalefac_scale */
+      side.put(0, 1);                  /* count1table_select */
+    }
+  }
+  std::vector<unsigned char> side_bytes = side.bytes();
+  side_bytes.resize(32u, 0u);
+
+  Writer main;
+  for (unsigned gr = 0; gr < 2u; ++gr) {
+    for (unsigned ch = 0; ch < 2u; ++ch) {
+      /* The left channel's own scalefactors are a legal position in both
+       * frames: only the right channel's are read as intensity
+       * positions, and varying the left's would change its
+       * requantisation and confound the comparison. */
+      for (unsigned band = 0; band < 11u; ++band) {
+        main.put(ch == 1u ? position : 4u, 4);
+      }
+      for (unsigned band = 0; band < 10u; ++band) {
+        main.put(1, 2);
+      }
+      if (ch == 0u) {
+        /* Count1 quadruples, table A. A run of ones codes the shortest
+         * codeword repeatedly, which fills the low spectrum. */
+        for (unsigned bit = 0; bit < count1_bits; ++bit) {
+          main.put((bit % 3u) == 0u ? 1u : 0u, 1);
+        }
+      }
+    }
+  }
+
+  /* Joint stereo with both switches on: mode 1, mode extension 3. */
+  std::vector<unsigned char> frame
+      = Frame(Header(V1, L3, false, 9u, 0u, false, 1u, 3u));
+  std::memcpy(frame.data() + 4u, side_bytes.data(), side_bytes.size());
+  const std::vector<unsigned char> & body = main.bytes();
+  size_t at = 4u + side_bytes.size();
+  EXPECT_LE(at + body.size(), frame.size());
+  std::memcpy(frame.data() + at, body.data(),
+      std::min(body.size(), frame.size() - at));
+  return frame;
+}
+
+TEST(Mp3Decode, AnIntensityPositionWithNoWeightIsNotUsedAsAnIndex) {
+  /*
+   * **An out-of-bounds read of a global, found by the Ogg fuzzer.** The
+   * intensity position *is* the right channel's scalefactor, read with
+   * whatever width `scalefac_compress` selected - four bits here, so 0
+   * to 15. ISO/IEC 11172-3 gives a weight for 0 to 6 and calls 7
+   * illegal, and says nothing at all about 8 to 15 because no encoder
+   * writes them. The decoder tested exactly for 7, so a frame stating 12
+   * indexed a seven-row table five rows past its end.
+   *
+   * **The assertion is that 12 and 15 decode identically**, and that is
+   * what makes this a test rather than a crash reproducer. Both are
+   * positions the standard defines no weight for, so a correct decoder
+   * treats both the same way - as though intensity stereo were off for
+   * that band, which here means the middle/side matrix applies instead.
+   * The two frames differ in those four-bit fields and in nothing else.
+   * Before the fix, 15 took the illegal path and 12 read a weight from
+   * whatever follows the table, so the two differed.
+   *
+   * **And the control**: position 5, which is legal and must decode
+   * *differently* from both. Without it the test above would pass on a
+   * decoder that had intensity stereo switched off entirely, which is the
+   * other way to make 12 and 15 agree.
+   *
+   * `make test-asan` is what proves the read is gone; this keeps an
+   * input that reaches it inside `make test`.
+   */
+  std::vector<int16_t> decoded[3];
+  const unsigned positions[3] = {12u, 15u, 5u};
+  for (int which = 0; which < 3; ++which) {
+    std::vector<unsigned char> frame = IntensityFrame(positions[which]);
+    std::vector<unsigned char> stream;
+    for (unsigned i = 0; i < 6u; ++i) {
+      stream.insert(stream.end(), frame.begin(), frame.end());
+    }
+    Loaded loaded;
+    ASSERT_EQ(OpenBytes(loaded, stream), GAUD_OK) << positions[which];
+    decoded[which] = DecodeAll(loaded.track());
+    ASSERT_EQ(decoded[which].size(), 6u * 1152u * 2u) << positions[which];
+    bool any = false;
+    for (int16_t value : decoded[which]) {
+      if (value != 0) {
+        any = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(any) << "position " << positions[which] << " decoded to "
+                     << "silence, so no weight was applied to anything";
+  }
+  EXPECT_EQ(decoded[0], decoded[1])
+      << "positions 12 and 15 decoded differently, and the standard "
+      << "defines a weight for neither: one of them is being used as an "
+      << "index into a table that does not have that row";
+  EXPECT_NE(decoded[0], decoded[2])
+      << "a legal position decoded the same as an illegal one, so "
+      << "intensity stereo is not reached at all and the comparison "
+      << "above is vacuous";
+}
+
+/**
  * A stereo MPEG-1 Layer III side information that decodes.
  *
  * Every field the format requires, with values chosen to be legal rather
