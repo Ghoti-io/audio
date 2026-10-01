@@ -35,6 +35,9 @@
  *   twice gives the same answer, so nothing it does leaves state behind -
  *   which matters because it is the one function here that seeks around
  *   while deciding.
+ * - **A decode never produces more frames than the track claims**, and a
+ *   seek never reports a position past the end. The claim is what a
+ *   caller allocates from and the position is what it seeks against.
  * - **A loaded document's extents are inside the stream.** The audio's
  *   offset and length, the first frame's offset, and the stated trim are
  *   all derived from attacker-controlled numbers, and a caller will seek
@@ -60,7 +63,9 @@ namespace {
 
 /** Registers the codecs once, however many inputs run. */
 struct Registered {
-  Registered() { gaud_register_builtin_codecs(); }
+  Registered() {
+    gaud_register_builtin_codecs();
+  }
 };
 const Registered registered;
 
@@ -199,6 +204,54 @@ void fuzz_file(const uint8_t * data, size_t size) {
     double duration = gaud_track_duration(track);
     if (duration < 0.0 && duration != -1.0) {
       abort();
+    }
+
+    /* And the decoder, which is where the Huffman trees, the
+     * requantisation table and the two filterbanks are. Every one of them
+     * is indexed by numbers out of the file. */
+    GAUD_Decoder * decoder = NULL;
+    if (gaud_decoder_create(track, &decoder) == GAUD_OK) {
+      GAUD_Buffer * buffer = NULL;
+      if (gaud_decoder_buffer_create(decoder, NULL, 503u, &buffer) == GAUD_OK) {
+        uint64_t produced = 0;
+        /* Bounded: a valid file of a million frames would otherwise make
+         * every input a timeout rather than a test. */
+        for (int i = 0; i < 48; ++i) {
+          if (gaud_decoder_read(decoder, buffer) != GAUD_OK) {
+            break;
+          }
+          size_t got = gaud_buffer_frames(buffer);
+          if (got == 0) {
+            break;
+          }
+          if (got > gaud_buffer_capacity(buffer)) {
+            abort();
+          }
+          produced += got;
+          /* The decoder may never produce more than the track claims to
+           * hold: the claim is what a caller allocates from. */
+          if (frames != UINT64_MAX && produced > frames) {
+            abort();
+          }
+        }
+        /* A seek somewhere derived from the input, then a read. A seek
+         * that landed past the end and then read would be the bug, and
+         * so would a seek that reported a position it had not reached. */
+        uint64_t target = ((uint64_t)data[size - 1u] << 9) | data[0];
+        uint64_t landed = UINT64_MAX;
+        if (gaud_decoder_seek(decoder, target, &landed) == GAUD_OK) {
+          if (frames != UINT64_MAX && landed > frames) {
+            abort();
+          }
+          if (gaud_decoder_read(decoder, buffer) == GAUD_OK
+              && frames != UINT64_MAX
+              && landed + gaud_buffer_frames(buffer) > frames) {
+            abort();
+          }
+        }
+        gaud_buffer_destroy(buffer);
+      }
+      gaud_decoder_destroy(decoder);
     }
   }
   gaud_doc_destroy(doc);

@@ -1,16 +1,14 @@
 # MPEG audio {#format_mpeg}
 
 MPEG-1, MPEG-2 and MPEG-2.5 audio, Layers I, II and III - which is to say
-MP3 and the two layers nobody calls by name. **Identified, measured and
-tagged; not decoded.** This page says exactly where that line falls and
-why the measuring half is worth having on its own.
+MP3 and the two layers nobody calls by name. **Read, in all three
+layers.** There is no encoder; phase 8 brings those.
 
 The codec is registered as `mp3`, because that is what the files are
-called. It reads all three layers because they share a frame header, but
-::GAUD_Sample_Coding keeps them apart - `GAUD_CODING_MPEG_LAYER1`,
-`_LAYER2` and `_LAYER3` - since a Layer II frame and a Layer III frame of
-the same length at the same rate have four bytes in common and nothing
-after them.
+called. ::GAUD_Sample_Coding keeps the layers apart -
+`GAUD_CODING_MPEG_LAYER1`, `_LAYER2` and `_LAYER3` - since a Layer II
+frame and a Layer III frame of the same length at the same rate have four
+bytes in common and nothing after them.
 
 ## What is implemented
 
@@ -34,11 +32,40 @@ on top of it.
 through the same readers the WAV and AIFF codecs use for their ID3 chunks.
 An APE trailer is detected, excluded from the audio, and not interpreted.
 
-**No decoder.** The codec declares no `GAUD_CAP_DECODE` and has no decoder
-entry point, so gaud_decoder_create() answers `GAUD_ERR_UNSUPPORTED`.
-That is deliberate rather than unfinished-and-hidden: a decoder that
-returned silence would produce the right number of bytes, crash nothing,
-and sound like a quiet passage.
+**Decoding, in integer arithmetic.** Layer III with every window type,
+both joint stereo modes, the bit reservoir and all 30 usable Huffman
+tables; Layer II with all five allocation tables and its intensity
+stereo; Layer I with every quantiser width. MPEG-1 and MPEG-2's lower
+sampling frequencies. The output is signed 16-bit, and **there is no
+floating point anywhere in the decoder** - which is what makes the next
+paragraph possible.
+
+**The same bytes on every architecture.** `make check-golden`
+cross-compiles this library for s390x and powerpc64, decodes the whole
+corpus under qemu, and compares hashes with this machine. That is a
+promise about this library rather than about a reference, and no
+comparison against a reference could establish it: both references are
+floating point and are entitled to differ from themselves between builds.
+
+## What it is scored against, and how closely
+
+Two reference decoders, and for MPEG audio they really are two
+implementations: ffmpeg's native decoder in libavcodec, and libsndfile's,
+which is minimp3. Neither is the other's front end - unlike FLAC, where
+four of this library's references are libFLAC wearing different hats.
+**sox is not a reference here**: the build in the oracle image has no
+MPEG handler at all, which was measured rather than assumed.
+
+`make check-mpeg` scores every fixture against both, and the agreement is
+**one least significant bit of 16** - the difference is 88 to 106 dB
+below the signal, which is the whole of what an integer decoder and a
+floating-point one can differ by. The gate does not stop at the
+difference, because planning/audio.md section 12 names four failures that
+a difference-only comparison cannot see: the frame count is asserted
+exactly before anything is compared, the absolute level of our own output
+is checked, the DC offset is checked, all of it per channel, and the
+whole gate is run against eight deliberately wrong versions of our own
+answer, every one of which it must reject.
 
 ## The length is a judgement, and it says which one
 
@@ -120,44 +147,72 @@ of all three.
   end there is no audio at all. `GAUD_ERR_CORRUPT`, rather than a document
   whose data offset is outside its own stream.
 
-## How it is scored
-
-**Two independent decoders, not four names for one.** For FLAC this
-library's oracle image holds four references that are two implementations;
-for MPEG audio it holds ffmpeg's native decoder in libavcodec and
-libsndfile's, which is minimp3, and those are genuinely separate. **sox is
-not a reference here at all** - the build in the image has no MP3 handler,
-which is a fact about the package and not about sox, and it was measured
-rather than assumed.
+## Where the references disagree, and with whom
 
 The corpus is written by four encoders: LAME and libshine for Layer III,
-TwoLAME and libavcodec's own for Layer II. That matters more for a
-perceptual codec than it did for FLAC, because an encoder's output is a
-set of *choices* - window switching, stereo mode, how much of the bit
-reservoir to use - and a decoder that has only ever read LAME has met one
-encoder's taste rather than the format.
+TwoLAME and libavcodec's own for Layer II, plus one Layer I file built by
+hand because **nothing in the oracle image writes Layer I at all**. Four
+writers matter more for a perceptual codec than they did for FLAC,
+because an encoder's output is a set of *choices* - window switching,
+stereo mode, how much of the bit reservoir to use - and a decoder that
+has only ever read LAME has met one encoder's taste rather than the
+format.
 
-What is checked today, with no decoder, is the length: every fixture's
-stated frame count minus its stated trim is compared against the number of
-samples ffmpeg and libsndfile actually produce from it. Fifteen of the
-sixteen agree with both.
+Two fixtures turn up a reference disagreement, and both are resolved
+against ffmpeg with a measurement rather than an argument:
 
-**The sixteenth is a disagreement with ffmpeg, and it is resolved against
-it.** The fixture carrying an ID3v1 trailer decodes to 2,351 frames in
-ffmpeg and 2,003 in libsndfile, and 2,003 is the number of samples the
-encoder was given. 2,351 is 3,456 minus 1,105, which is the start trim
-applied and the end trim not. A minimal pair settles it: the same file
-written with `-write_id3v1 0` decodes to 2,003 in ffmpeg too, so the
-128-byte trailer is what defeats its end trim.
+- **An ID3v1 trailer defeats ffmpeg's end-of-stream trim.** The tagged
+  fixture decodes to 2,351 frames in ffmpeg and 2,003 in libsndfile, and
+  2,351 is 3,456 minus the 1,105-frame start trim: the start applied and
+  the end not. The same file written with `-write_id3v1 0` decodes to
+  2,003 in ffmpeg too, and 2,003 is the number of samples the encoder was
+  given.
+- **A channel mode that changes between frames makes ffmpeg drop the
+  first one.** TwoLAME's joint stereo output is joint stereo, then plain
+  stereo, then joint stereo with a different bound - all legal, since the
+  mode is a per-frame field. ffmpeg's demuxer requires it to be stable
+  and skips the leading frame; this library compares the channel *count*
+  and decodes all of them, as libsndfile does. Set ffmpeg's own cold-start
+  aside and its samples agree with ours to half a least significant bit.
+
+## How much of the decoder the corpus reaches
+
+`make mpeg-coverage` is not a gate. It counts which named arms of the
+decoder a corpus actually executes, because a differential that passes
+says nothing about how much of the decoder ran to produce it - which is
+the lesson phase 4 learned when a third of the FLAC decoder turned out
+never to have executed while every reference agreed byte for byte.
+
+As of this writing it reaches 57 of 72 arms. Two of the fifteen it does
+not are unreachable by construction (the standard marks Huffman tables 4
+and 14 unused and this library refuses a frame that selects one); five
+need an encoder nothing in the image has, including intensity stereo,
+which LAME has never implemented; and five are Huffman tables that two
+encoders between them simply never chose. Three fixtures were added
+because this instrument named the arm they reach.
 
 ## Known gaps
 
-- **No decoder.** The rest of phase 5.
+- **MPEG-2.5 Layer III is refused.** Its scalefactor band tables are in
+  no standard: the version is an extension by the format's authors that
+  neither ISO/IEC 11172-3 nor ISO/IEC 13818-3 defines, and this library's
+  tables are generated from those two documents and nothing else. Layers
+  I and II at 8, 11.025 and 12 kHz need no band table and do decode.
+  `gaud_decoder_create()` answers `GAUD_ERR_UNSUPPORTED` for the Layer
+  III case, by name rather than by guessing at the tables.
+- **Mixed blocks have never been exercised.** The code is there; no
+  encoder in existence emits one, and the two standards disagree about
+  where the long part of such a granule ends at the lower sampling
+  frequencies. The reading used is 36 lines, which is what both
+  documents' tables give for every MPEG-1 rate.
 - **No encoder.** Phase 8, with the two-gate harness perceptual output
   needs.
-- **The free format**, as above.
-- **VBRI's seek table is read as a length and not as a table.** Its
-  geometry is stated rather than fixed, unlike Xing's hundred entries, and
-  nothing seeks yet.
+- **The free format**, which states no bitrate, so a frame's length is
+  the distance to the next sync word. Refused by name.
+- **A non-seekable stream.** The length comes from the file's size and
+  from trailers at the end; see above.
+- **VBRI's seek table is read as a length and not as a table.** Seeking
+  counts frames from the start instead, which is exact and costs one
+  four-byte read per frame.
 - **APEv2 is excluded, not read.** It is tier 3 metadata; the diagnostic
   says it was found.

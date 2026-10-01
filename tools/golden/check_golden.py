@@ -66,6 +66,16 @@ WRITE_PROBE = os.path.join(ROOT, "build", "linux", "release", "apps",
 
 # Every one of them big-endian, which is the axis that matters here. A
 # little-endian cross target would be a second copy of this host.
+#
+# **Phase 5 is what this gate was built for.** Until the MPEG decoder
+# there was little in the tree whose output could plausibly differ
+# between architectures: PCM and FLAC are integer by construction. An
+# MPEG decoder is a filterbank, an inverse transform and a requantiser,
+# and planning/audio.md 11.1 promises byte-identical output everywhere -
+# which is a promise about *this library* that no reference comparison
+# can check, because the references are floating point and are allowed
+# to differ from themselves. These hashes are the only thing that checks
+# it.
 TARGETS = {
     "s390x": ("s390x-linux-gnu-gcc", "qemu-s390x", "s390x-linux-gnu",
               "64-bit big-endian"),
@@ -74,10 +84,23 @@ TARGETS = {
 }
 
 
+#: Fixtures this library identifies and does not decode, so there is no
+#: decode to hash. **Named rather than filtered by extension**: an
+#: exclusion that is a missing glob is the most invisible kind there is.
+UNDECODABLE = {
+    # MPEG-2.5 Layer III, whose scalefactor band tables are in no
+    # standard - neither 11172-3 nor 13818-3 defines that version at all,
+    # so tools/tables/gen_mp3_tables.py has nothing to generate them from.
+    "mp3_lame_mono_11025.mp3",
+}
+
+
 def fixtures():
     data = os.path.join(ROOT, "tests", "data")
     return sorted(f for f in os.listdir(data)
-                  if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga")))
+                  if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga",
+                                 ".mp3", ".mp2", ".mp1"))
+                  and f not in UNDECODABLE)
 
 
 # Fixtures that are also ENCODED on the target, and the file hashed.
@@ -150,7 +173,9 @@ SRC="$(find src -name '*.c') %(md5)s %(shim)s"
     -I %(security)s \
     -o %(out)s/write_probe $SRC tools/oracle/write_probe.c -lm
 for f in tests/data/*.wav tests/data/*.aiff tests/data/*.aifc \
-         tests/data/*.flac tests/data/*.oga; do
+         tests/data/*.flac tests/data/*.oga tests/data/*.mp3 \
+         tests/data/*.mp2 tests/data/*.mp1; do
+    case " %(skip)s " in *" $(basename "$f") "*) continue;; esac
     printf 'decode %%s ' "$(basename "$f")"
     %(qemu)s -L /usr/%(triple)s %(out)s/dump_probe "$f" --pcm-le | sha256sum \
         | cut -d' ' -f1
@@ -164,6 +189,7 @@ done
 """ % {"out": out, "root": ROOT, "cc": compiler, "qemu": qemu,
        "triple": triple, "shim": SHIM,
        "encode": " ".join(ENCODE_FIXTURES),
+       "skip": " ".join(sorted(UNDECODABLE)),
        "md5": os.path.join(WORKSPACE, "libs", "security", "src", "md5",
                            "md5.c"),
        "cutil": os.path.join(WORKSPACE, ".local", "include", "ghoti.io",

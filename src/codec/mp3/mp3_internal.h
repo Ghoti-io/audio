@@ -53,6 +53,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* The C++ unit tests link these objects directly, as the other codecs' do,
  * so the declarations need C linkage. */
@@ -195,8 +196,14 @@ uint32_t gaud_mp3_side_info_size(const MP3_Header * header);
  * @brief Whether two headers describe the same stream.
  *
  * Version, layer, sample rate and channel count, and deliberately **not**
- * the bitrate: a variable-rate file changes it every frame, which is the
- * whole point of one. This is the test that turns a candidate sync word
+ * the bitrate or the channel *mode*. A variable-rate file changes the
+ * bitrate every frame, which is the whole point of one - and a real
+ * encoder changes the mode too: the corpus's TwoLAME fixture is joint
+ * stereo in its first frame, plain stereo in its next two and joint
+ * stereo with a different bound in its fourth. Both are two channels,
+ * which is what a decoder has to keep constant. ffmpeg's demuxer
+ * compares the mode and drops that file's first frame as junk; this one
+ * decodes all four. This is the test that turns a candidate sync word
  * into a found frame - a random byte pair matching 11 bits of sync is
  * common, and two of them agreeing about the stream at exactly the
  * distance the first one's length states is not.
@@ -352,6 +359,16 @@ GAUD_Result gaud_mp3_open(const GAUD_Codec * codec, GAUD_Stream * stream,
 void gaud_mp3_close(const GAUD_Codec * codec, GAUD_Doc * doc);
 
 /**
+ * @brief ::GAUD_Codec::decoder_open: a pull decoder over this track.
+ *
+ * @return ::GAUD_ERR_UNSUPPORTED for a Layer I or II track, which this
+ *   library identifies and does not yet decode, and for MPEG-2.5 Layer
+ *   III, whose scalefactor band tables are in no standard.
+ */
+GAUD_Result gaud_mp3_decoder_open(
+    const GAUD_Codec * codec, GAUD_Track * track, GAUD_Decoder ** out);
+
+/**
  * @brief Find the first frame at or after @p start, and parse its header.
  *
  * A candidate sync word is only accepted when the frames that its own
@@ -378,6 +395,312 @@ GAUD_Result gaud_mp3_find_frame(GAUD_Stream * stream, uint64_t start,
  * Zero when there is none. The stream is left where it was found.
  */
 uint64_t gaud_mp3_id3v2_span(GAUD_Stream * stream);
+
+/* ------------------------------------------------- the main data reader */
+
+/**
+ * @brief A most-significant-bit-first reader over bytes already in memory.
+ *
+ * The position is in **bits** and is settable, because Layer III needs it
+ * to be: every granule's main data is `part2_3_length` bits long whether
+ * or not its Huffman data fills that, so the reader is positioned
+ * explicitly at each granule rather than carried along by what was read.
+ *
+ * @p overrun is the only error state, latched on the first read past the
+ * end, exactly as the FLAC reader does it: a granule can be decoded to its
+ * end and asked once.
+ */
+typedef struct {
+  const unsigned char * data; ///< Borrowed.
+  size_t size;                ///< Bytes in @p data.
+  size_t at;                  ///< The next bit to read.
+  bool overrun;               ///< A read asked for more than there was.
+} MP3_Bits;
+
+/** @brief Point a reader at @p size bytes of @p data, at bit zero. */
+void gaud_mp3_bits_init(
+    MP3_Bits * bits, const unsigned char * data, size_t size);
+
+/** @brief Read @p count bits, most significant first. At most 32. */
+uint32_t gaud_mp3_bits_read(MP3_Bits * bits, unsigned count);
+
+/** @brief Read @p count bits as a two's complement signed value. */
+int32_t gaud_mp3_bits_signed(MP3_Bits * bits, unsigned count);
+
+/** @brief Move to bit @p position. Past the end latches the overrun. */
+void gaud_mp3_bits_seek(MP3_Bits * bits, size_t position);
+
+/**
+ * The most bytes a frame's main data can reach back for.
+ *
+ * `main_data_begin` is nine bits in MPEG-1 and eight in the low sampling
+ * frequency versions, so 511 is the largest back-pointer the format can
+ * state. One more than that is kept, which costs nothing and means the
+ * arithmetic never sits exactly on the boundary.
+ */
+#define MP3_RESERVOIR_KEEP 512u
+
+/**
+ * @brief The bit reservoir: the main data of the frames just gone past.
+ *
+ * **The one piece of state that makes an MPEG audio frame not
+ * self-contained.** A Layer III frame's main data starts
+ * `main_data_begin` bytes before its own header, so decoding a frame
+ * needs the bytes of the frames before it. The buffer holds the tail of
+ * those followed by this frame's own, and bit zero of it is bit zero of
+ * this frame's main data - which is what gaud_mp3_reservoir_push()
+ * arranges.
+ */
+typedef struct {
+  /** The carried bytes followed by this frame's own. Large enough for
+   *  the largest back-pointer the format can state plus the largest
+   *  frame it can describe, which is the most that can ever be in it. */
+  unsigned char data[MP3_RESERVOIR_KEEP + MP3_MAX_FRAME_SIZE];
+  size_t length; ///< Bytes held.
+} MP3_Reservoir;
+
+/** @brief Forget everything held, as a seek must. */
+void gaud_mp3_reservoir_reset(MP3_Reservoir * reservoir);
+
+/**
+ * @brief Keep what @p main_data_begin reaches back for and append @p size
+ *   bytes of this frame's main data.
+ *
+ * @return false when the frame reaches back further than there is
+ *   history, which is the first frames of a stream and the first frame
+ *   after a seek. The caller must not decode the granule in that case:
+ *   what is in the buffer is either nothing or another part of the file.
+ */
+bool gaud_mp3_reservoir_push(MP3_Reservoir * reservoir,
+    uint32_t main_data_begin, const unsigned char * data, size_t size);
+
+/** @brief Drop everything a future back-pointer could not reach. */
+void gaud_mp3_reservoir_trim(MP3_Reservoir * reservoir);
+
+/* ---------------------------------------------- the synthesis filterbank */
+
+/**
+ * @brief The state of one channel's polyphase synthesis filterbank.
+ *
+ * 1024 values of history, which is what the format's 512-tap window over
+ * 32 subbands needs, plus where the oldest of them currently is. Every
+ * layer uses this and it is the only state Layers I and II carry at all.
+ */
+typedef struct {
+  int32_t state[1024]; ///< V[] of 11172-3 Figure 3-A.2, Q28.
+  unsigned at;         ///< Where V[0] lives; see mp3_synth.c.
+} MP3_Synth;
+
+/** @brief Zero the filterbank, as the start of a stream or a seek must. */
+void gaud_mp3_synth_reset(MP3_Synth * synth);
+
+/**
+ * @brief Turn 32 subband values into 32 consecutive audio samples.
+ *
+ * @param synth This channel's filterbank; see ::MP3_Synth.
+ * @param subband The 32 values, Q28.
+ * @param out Where the samples go; @p stride apart, so that an
+ *   interleaved buffer can be written directly.
+ * @param stride How far apart consecutive samples are in @p out: the
+ *   channel count, for an interleaved buffer.
+ */
+void gaud_mp3_synth_run(
+    MP3_Synth * synth, const int32_t subband[32], int32_t * out, size_t stride);
+
+/* ---------------------------------------------------------- Layer III */
+
+/** One granule of one channel's side information. */
+typedef struct {
+  uint32_t part2_3_length;    ///< Bits of main data this granule occupies.
+  uint32_t big_values;        ///< Pairs of values coded in the three regions.
+  uint32_t global_gain;       ///< The quantiser step, logarithmically.
+  uint32_t scalefac_compress; ///< Selects the scalefactor field widths.
+  uint8_t block_type;         ///< 0 normal, 1 start, 2 three short, 3 stop.
+  bool window_switching;      ///< Anything other than a normal window.
+  bool mixed_block;           ///< The lowest subbands stay long.
+  bool preflag;               ///< Add ::gaud_mp3_pretab to the scalefactors.
+  bool scalefac_scale;        ///< The scalefactors' step is 2 rather than √2.
+  bool count1table_select;    ///< Which quadruple table the top region uses.
+  uint8_t table_select[3];    ///< A Huffman table per region.
+  uint8_t subblock_gain[3];   ///< A further gain per short window.
+  uint8_t region0_count;      ///< One less than the bands in region 0.
+  uint8_t region1_count;      ///< One less than the bands in region 1.
+} MP3_Granule;
+
+/** A frame's side information: the part before the main data. */
+typedef struct {
+  uint32_t main_data_begin; ///< Bytes back the main data starts.
+  uint8_t scfsi[2];         ///< Scalefactor reuse, four bands per channel.
+  /** [granule][channel]; MPEG-2 and 2.5 have one granule. */
+  MP3_Granule granule[2][2];
+} MP3_Side_Info;
+
+/** What one channel of a Layer III stream carries between granules. */
+typedef struct {
+  MP3_Synth synth;         ///< The polyphase filterbank's history.
+  int32_t overlap[32][18]; ///< The hybrid filterbank's, Q28.
+  /** The long scalefactors, kept across granules because scfsi lets the
+   *  second granule reuse the first's rather than transmitting them. */
+  int32_t scalefac_long[23];
+  /** The short ones, [band][window]. Never reused across granules: scfsi
+   *  is zero for a frame in which either granule is short. */
+  int32_t scalefac_short[13][3];
+} MP3_Layer3_Channel;
+
+/** Everything a Layer III decoder holds. */
+typedef struct {
+  MP3_Reservoir reservoir;       ///< The bit reservoir.
+  MP3_Layer3_Channel channel[2]; ///< Per-channel history.
+  MP3_Side_Info side;            ///< The frame being decoded.
+  int32_t xr[2][576];            ///< The requantised spectrum, Q28.
+  int32_t scratch[576];          ///< Reordering and the hybrid's output.
+  unsigned nonzero[2];           ///< Values decoded, for the stereo bound.
+  /**
+   * Granules that could not be decoded because the reservoir did not
+   * reach back far enough, which is the first frames of a stream and the
+   * first frame after a seek. They are emitted as silence - which every
+   * decoder does and which the references do - and counted, because
+   * "silence this library could not avoid" and "silence the file
+   * contains" must not look the same from outside.
+   */
+  uint32_t ungrounded;
+  /** Samples that saturated rather than wrapped. A file that does this is
+   *  either very loud or wrong, and the count is how a caller can tell
+   *  this decoder is clipping rather than the recording. */
+  uint32_t saturated;
+} MP3_Layer3;
+
+/** @brief Forget every carried value: a seek, or the start of a stream. */
+void gaud_mp3_layer3_reset(MP3_Layer3 * state);
+
+/**
+ * @brief Decode one Layer III frame into @p pcm.
+ *
+ * @param state The decoder's carried state; see ::MP3_Layer3.
+ * @param header That frame's parsed header.
+ * @param frame The whole frame, from its sync word.
+ * @param size How many bytes that is; at least the header, the CRC and
+ *   the side information.
+ * @param pcm Receives `header->samples` frames of interleaved Q28
+ *   samples, channels interleaved, so `samples * channels` values.
+ * @return ::GAUD_ERR_CORRUPT for side information the format forbids.
+ *   A granule whose main data is missing is silence and not an error;
+ *   see ::MP3_Layer3::ungrounded.
+ */
+GAUD_Result gaud_mp3_layer3_frame(MP3_Layer3 * state, const MP3_Header * header,
+    const unsigned char * frame, size_t size, int32_t * pcm);
+
+/**
+ * @brief Which row of the scalefactor band tables this stream uses.
+ *
+ * Rows 0 to 2 are MPEG-1 and rows 3 to 5 are MPEG-2, by the header's rate
+ * index. @return false for MPEG-2.5, whose band tables are in no
+ * standard; see the refusal in gaud_mp3_decoder_open().
+ */
+bool gaud_mp3_band_row(const MP3_Header * header, unsigned * out_row);
+
+/* ------------------------------------------------------ Layers I and II */
+
+/**
+ * @brief Everything a Layer I or II decoder holds.
+ *
+ * Which is nothing but the filterbank. These layers have no bit
+ * reservoir, no overlapping transform and no scalefactor reuse across
+ * frames: every frame is self-contained, which is why a Layer II stream
+ * survives being cut with a text editor and a Layer III one does not.
+ */
+typedef struct {
+  MP3_Synth synth[2]; ///< One polyphase filterbank per channel.
+} MP3_Layer12;
+
+/** @brief Zero the filterbanks: a seek, or the start of a stream. */
+void gaud_mp3_layer12_reset(MP3_Layer12 * state);
+
+/**
+ * @brief Decode one Layer I or Layer II frame into @p pcm.
+ *
+ * @param state The filterbanks; see ::MP3_Layer12.
+ * @param header That frame's parsed header.
+ * @param frame The whole frame, from its sync word.
+ * @param size How many bytes that is.
+ * @param pcm Receives `header->samples` frames of interleaved Q28
+ *   samples - 384 for Layer I, 1,152 for Layer II.
+ * @return ::GAUD_ERR_CORRUPT for an allocation the format forbids, or a
+ *   frame whose samples run past its own length.
+ */
+GAUD_Result gaud_mp3_layer12_frame(MP3_Layer12 * state,
+    const MP3_Header * header, const unsigned char * frame, size_t size,
+    int32_t * pcm);
+
+/* ------------------------------------------------- the coverage counters */
+
+/**
+ * Which arms of this decoder a corpus reaches.
+ *
+ * planning/audio.md 11.14 asked for this in phase 5 from the first day,
+ * and the reason is phase 4's most uncomfortable measurement: FLAC's
+ * decode agreed byte for byte with every reference on every fixture
+ * while a third of the decoder had never executed. A codec's branches
+ * are selected by choices the *encoder* made, so a corpus is a sample of
+ * encoders' habits rather than of the format - and MPEG audio has far
+ * more of that shape than FLAC: 32 Huffman tables, four window types,
+ * two joint stereo modes, a bit reservoir, and two layers below the one
+ * everybody means.
+ *
+ * Compiled to nothing without `GAUD_MP3_TRACE`, which only
+ * `make mpeg-coverage` defines. It is **not a gate**: a zero in the
+ * report is a question about the corpus, and some of the rows can be
+ * reached by no encoder that exists.
+ */
+#ifdef GAUD_MP3_TRACE
+/** The arms counted. Keep in step with the names in mp3_layer3.c. */
+enum {
+  MP3_T_V1,
+  MP3_T_V2,
+  MP3_T_V25,
+  MP3_T_L1,
+  MP3_T_L2,
+  MP3_T_L3,
+  MP3_T_CRC,
+  MP3_T_PADDED,
+  MP3_T_RESYNC,
+  MP3_T_BLOCK_LONG,
+  MP3_T_BLOCK_START,
+  MP3_T_BLOCK_SHORT,
+  MP3_T_BLOCK_STOP,
+  MP3_T_MIXED,
+  MP3_T_SUBBLOCK_GAIN,
+  MP3_T_PREFLAG,
+  MP3_T_SCALEFAC_SCALE,
+  MP3_T_SCFSI,
+  MP3_T_MS_STEREO,
+  MP3_T_INTENSITY,
+  MP3_T_INTENSITY_ILLEGAL,
+  MP3_T_LINBITS,
+  MP3_T_COUNT1_A,
+  MP3_T_COUNT1_B,
+  MP3_T_RESERVOIR,
+  MP3_T_UNGROUNDED,
+  MP3_T_SATURATED,
+  MP3_T_L2_GROUPED,
+  MP3_T_L2_UNGROUPED,
+  MP3_T_L2_INTENSITY,
+  MP3_T_L2_SCFSI_0,
+  MP3_T_L2_SCFSI_1,
+  MP3_T_L2_SCFSI_2,
+  MP3_T_L2_SCFSI_3,
+  MP3_T_L1_ALLOCATED,
+  MP3_T_ALLOC_TABLE, /* five, one per Layer II allocation table */
+  MP3_T_HUFF = MP3_T_ALLOC_TABLE + 5, /* thirty-two, one per table */
+  MP3_T_COUNT = MP3_T_HUFF + 32
+};
+extern unsigned long gaud_mp3_trace_counts[MP3_T_COUNT];
+/** @brief Count one visit to arm @p which. */
+#define MP3_TRACE(which) (gaud_mp3_trace_counts[which]++)
+#else
+/** @brief Nothing, in an ordinary build. */
+#define MP3_TRACE(which) ((void)0)
+#endif
 
 #ifdef __cplusplus
 }

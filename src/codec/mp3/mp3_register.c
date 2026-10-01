@@ -99,25 +99,29 @@ static GAUD_Result mp3_probe(const GAUD_Codec * codec, GAUD_Stream * stream,
 /**
  * The codec itself.
  *
- * `GAUD_CAP_DECODE` is **not** declared and `decoder_open` is NULL: this
- * phase reads what the stream says about itself and does not yet decode a
- * sample. The capability bits are what a caller tests, so declaring one
- * that is not there would be a lie a program could act on; a track asked
- * for a decoder answers ::GAUD_ERR_UNSUPPORTED through the ordinary path.
+ * `GAUD_CAP_DECODE` is declared for Layer III, which is what the name
+ * `mp3` means to everyone. Layers I and II are identified and not yet
+ * decoded, and so is MPEG-2.5 Layer III, whose scalefactor band tables
+ * are in no standard; those tracks answer ::GAUD_ERR_UNSUPPORTED when
+ * asked for a decoder, which is the per-track answer a capability bit
+ * cannot give.
+ *
+ * No encoder: phase 8 brings the perceptual ones, with the two-gate
+ * harness their output needs.
  */
 static const GAUD_Codec mp3_codec = {
     .abi_version = GAUD_CODEC_ABI_VERSION,
     .size = sizeof(GAUD_Codec),
     .name = "mp3",
     .ctx = NULL,
-    .capabilities = GAUD_CAP_METADATA_READ,
+    .capabilities = GAUD_CAP_DECODE | GAUD_CAP_METADATA_READ,
     .encoder_tier = GAUD_ENCODER_NONE,
     .magics = NULL,
     .magic_count = 0,
     .probe = mp3_probe,
     .open = gaud_mp3_open,
     .close = gaud_mp3_close,
-    .decoder_open = NULL,
+    .decoder_open = gaud_mp3_decoder_open,
     .encoder_open = NULL,
 };
 

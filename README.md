@@ -2,11 +2,11 @@
 
 Sound in C, as a container of tracks with metadata, read and written.
 
-**Phases 1 through 4 of ten, and phase 5 begun.** WAV, AIFF and FLAC read
-and write, losslessly, with tags and cover art, over the base object, the
-pull decoder and the public codec SDK. **No lossy codec decodes a sample
-yet**: a bare MPEG audio stream is identified, measured and tagged, and
-that is all it is. [Status](#status) says precisely what that means, and
+**Phases 1 through 5 of ten.** WAV, AIFF and FLAC read and write,
+losslessly, with tags and cover art; **MPEG audio - MP3 and its two
+sibling layers - reads**, in integer arithmetic, to the same bytes on
+every architecture. Over the base object, the pull decoder and the public
+codec SDK. [Status](#status) says precisely what that means, and
 `planning/audio.md` in the workspace is the design it is being built to.
 
 ## Formats
@@ -36,16 +36,22 @@ This is what is implemented:
   output that is byte-identical on every architecture - see \ref format_flac
   "formats/flac.md".
 
-- **MPEG audio** - MPEG-1, MPEG-2 and MPEG-2.5, Layers I, II and III, which
-  is to say MP3 and its relatives. **Identified and measured, not decoded.**
-  The frame header, the ID3v2 tag at the front and the ID3v1 trailer at the
-  back, and the Xing, Info, VBRI and LAME tags that are the only places such
-  a stream ever states its own length or its encoder delay - so
-  `gaud_track_frames()`, `gaud_track_trim()` and `gaud_track_duration()`
-  answer, and `gaud_decoder_create()` says `GAUD_ERR_UNSUPPORTED` rather
-  than handing back silence. How the length was arrived at is part of the
-  answer: stated by a tag, counted, estimated from the bitrate, or unknown,
-  with a diagnostic for the last three.
+- **MPEG audio** - MPEG-1, MPEG-2 and MPEG-2.5, Layers I, II and III,
+  which is to say MP3 and its relatives. **Read.** Layer III with every
+  window type, both joint stereo modes, the bit reservoir and all thirty
+  usable Huffman tables; Layer II with all five allocation tables; Layer I
+  with every quantiser width. The frame header, the ID3v2 tag at the front
+  and the ID3v1 trailer at the back, and the Xing, Info, VBRI and LAME
+  tags that are the only places such a stream ever states its own length
+  or its encoder delay. How the length was arrived at is part of the
+  answer: stated by a tag, counted, estimated from the bitrate, or
+  unknown, with a diagnostic for the last three. The decoder is integer
+  throughout and produces **the same bytes on every architecture**, which
+  `make check-golden` checks on two big-endian targets - a promise no
+  comparison against a floating-point reference could establish.
+  MPEG-2.5's Layer III scalefactor band tables are in no standard, so
+  that one combination is refused by name; see \ref format_mpeg
+  "formats/mpeg.md".
 
 Each has a page saying what it covers and where it differs: \ref format_wav
 "formats/wav.md", \ref format_aiff "formats/aiff.md", \ref format_coding
@@ -59,9 +65,9 @@ check-golden` runs the corpus on big-endian targets, where the two swap
 round. From phase 4 that gate also *encodes* on those targets and compares
 the files byte for byte, which is why the FLAC encoder is integer-only.
 
-What comes next, in order: the MPEG audio decoder itself; Vorbis and Opus in
-Ogg; ISO BMFF with ALAC, and AAC-LC as a separate library. Every format this
-library reads, it writes.
+What comes next, in order: Vorbis and Opus in Ogg; ISO BMFF with ALAC,
+and AAC-LC as a separate library; then the perceptual encoders. Every
+format this library reads, it will write.
 
 ## Before you call it
 
@@ -236,22 +242,30 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phases 1 through 4 of ten, complete, and phase 5 begun. What works:
+Phases 1 through 5 of ten, complete. What works:
 
-- **MPEG audio identified, measured and tagged - and not decoded.** A bare
-  stream of MPEG-1, MPEG-2 or MPEG-2.5 frames in any of the three layers
-  loads into a document that states its rate, its channel count, its
-  layer, its length and its encoder delay, with ID3v2 and ID3v1 read off
-  the ends. It has no decoder: the codec declares no `GAUD_CAP_DECODE`,
-  and asking a track for one answers `GAUD_ERR_UNSUPPORTED`. That is a
-  deliberate half, because the half that exists is the half a tagger and a
-  library scanner need, and because a decoder that returned silence would
-  pass every test that counts frames. **Nothing about the length is
-  assumed:** a Xing, Info or VBRI frame is believed only if the bytes
-  could hold what it claims, a stream short enough to walk is counted
-  exactly, a constant-rate stream is estimated and says so, and a
-  variable-rate stream with no tag reports an unknown length rather than a
-  number that would be wrong.
+- **MPEG audio read, in all three layers.** A bare stream of MPEG-1,
+  MPEG-2 or MPEG-2.5 frames loads into a document that states its rate,
+  its channel count, its layer, its length and its encoder delay, with
+  ID3v2 and ID3v1 read off the ends - and decodes, for every combination
+  except MPEG-2.5 Layer III, whose scalefactor band tables are in no
+  standard and are therefore refused by name rather than guessed at.
+  Measured against the two reference decoders the agreement is **one least
+  significant bit of sixteen**, per channel, in level and in offset as
+  well as in difference. **Nothing about the length is assumed:** a Xing,
+  Info or VBRI frame is believed only if the bytes could hold what it
+  claims, a stream short enough to walk is counted exactly, a
+  constant-rate stream is estimated and says so, and a variable-rate
+  stream with no tag reports an unknown length rather than a number that
+  would be wrong.
+- **The decoder has no floating point in it**, and that is the whole of
+  how `planning/audio.md` 11.1's promise is kept: every coefficient is a
+  28-bit fixed-point integer, and the tables they come from are generated
+  from ISO/IEC 11172-3 and 13818-3 by a script in `tools/tables/` that
+  validates every one of them - that each Huffman table is a complete
+  prefix code over its whole grid, that each synthesis window coefficient
+  is an exact multiple of 2^-16, and a dozen more. The documents are
+  fetched and not kept; the generated C is committed.
 
 - **WAV and AIFF, read and written**, across every PCM width both can carry,
   including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
@@ -300,13 +314,20 @@ How it is judged:
 | `make check-corpus` | Independent references decode the corpus exactly as this does: 57 fixtures, 163 fixture-reference comparisons. Lossless means a byte comparison and not a tolerance. The gate prints the count of *implementations* beside the count of references, because they are not the same number - of the 20 FLAC fixtures, 4 references read them and they are 2 implementations |
 | `make check-writer` | Those references read what this library wrote, and the samples survived: 217 lossless round trips and 109 coded ones, each read back by every reference that can. 106 of the FLAC files are additionally verified by `flac -t --warnings-as-errors` against the STREAMINFO MD5 we wrote - with a control that zeroes a digest and requires the refusal, because that tool exits zero on a file it has complained about |
 | `make check-tags` | 134 comparisons across four containers and two references. Does the ID3v1 genre table match mutagen's row by row, can ffmpeg and mutagen read the tags this library writes, and can it read theirs - the third is the one a library whose reader and writer share a misunderstanding fails. The two FLAC containers also go three generations through our own reader and writer, which is what caught a vendor string being collected as a tag |
-| `make check-golden` | 57 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only |
+| `make check-mpeg` | The MPEG decode against **two** reference decoders that are two implementations - ffmpeg's native one and libsndfile's minimp3 - and not a byte comparison, because the format defines a transform rather than sample values. It checks what a difference alone cannot see: the frame count exactly, the absolute level of our own output, the DC offset, all of it per channel, and eight deliberately wrong versions of our own answer that it must reject. The measured agreement is one least significant bit of sixteen, 88 to 106 dB down |
+| `make check-golden` | 73 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only. **Phase 5 is what this gate was built for**: an MPEG decoder is a filterbank and an inverse transform, and byte-identical output everywhere is a promise about this library that no floating-point reference can be asked to confirm |
 | `make check-outoftree` | A codec in another repository works |
 | `make fuzz` | Six harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, `coded`, which drives the block layer below any container because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does, and `mpeg`, where the opposite is true: MPEG audio has no container to synthesise, so nearly every input reaches the frame search. `coded` found a real defect in its first minute; `mpeg` found two in its first ten, and neither was a crash - a header struct whose padding made two parses of one header compare unequal, and a document whose audio began past the end of its own file |
+| `make mpeg-coverage` | The same instrument for MPEG audio, and the same reason: 57 of 72 named arms are reached by the corpus. Two of the rest are unreachable by construction, five need an encoder nothing has - LAME has never implemented intensity stereo - and five are Huffman tables two encoders between them never chose. Three fixtures exist because this named the arm they reach |
 | `make flac-coverage` | Not pass/fail: it counts which named arms of the FLAC frame decoder the corpus actually reaches. It exists because `check-corpus` agreed byte for byte with every reference on every fixture while a third of the subframe decoder had never run - a codec's branches are selected by the *encoder*, so a corpus samples encoders rather than the format |
 
 The corpus is generated **by** the references and never by this library: one
 grown from our own writer would agree with our own reader by construction.
+The one exception is named as one: **nothing in the image writes Layer I**
+- ffmpeg has two Layer II encoders and two Layer III encoders and no Layer
+I encoder at all - so that fixture is constructed by the generator, and
+what makes it a differential rather than a self-comparison is that its
+expected output still comes from the references, both of which decode it.
 That argument has a second edge, which is why the image holds `mutagen` as
 well - ffmpeg *writes* the tag fixtures, so scoring them with ffmpeg alone
 would ask one implementation whether it agrees with itself, and a
@@ -319,10 +340,10 @@ The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
 its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-216 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+226 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
-`image` is linked for. 80.2% line coverage from the unit tests alone, which
+`image` is linked for. 80.7% line coverage from the unit tests alone, which
 is the figure that matters for a contributor without the oracle container:
 the gates above cover a great deal that those tests do not.
 
@@ -332,9 +353,11 @@ visible** - counting bare loads said 89 of 89 while a deliberately wrong
 entry still decoded identically, and the honest figure was 54. The MS ADPCM
 coefficient table this library writes is byte-identical to ffmpeg's, which
 is the only thing that can check it, since our decoder uses the table in the
-file and our encoder only ever names pair 0. And `make flac-coverage`
-reports **22 of 24 named arms** of the FLAC frame decoder reached, over two
-populations it keeps apart - the reference corpus reaches 19 and our own
+file and our encoder only ever names pair 0. And the two coverage
+instruments report what the corpus actually executes: `make mpeg-coverage`
+**57 of 72 named arms** of the MPEG decoder, with the fifteen it does not
+reach listed and triaged, and `make flac-coverage` **22 of 24 named arms**
+of the FLAC frame decoder, over two populations it keeps apart - the reference corpus reaches 19 and our own
 re-encoding of it reaches 17, and neither subsumes the other. The two left
 are a variable-blocksize stream and a frame that defers its bit depth to
 STREAMINFO: legal spellings no encoder in the image will produce an input
@@ -342,10 +365,12 @@ for, so the unit tests build those frames by hand instead.
 
 What is deliberately absent:
 
-- **Any perceptual decoder.** The four codings above are sample quantisers,
-  not psychoacoustic ones, and FLAC is lossless. MPEG audio is identified
-  and measured as of phase 5 and decodes nothing; the decoder is the rest of
-  that phase.
+- **Any perceptual encoder.** MPEG audio is read and not written; phase 8
+  brings the encoders, with the two-gate harness perceptual output needs -
+  bitstream validity against pinned decoders, and quality against a
+  metric. A stub encoder that produced a conformant bitstream nobody would
+  want to listen to would be worse than none, because it would look like
+  support.
 - **ADPCM above two channels, on write.** The formats have no defined
   interleave for it and ffmpeg refuses both directions, so writing one would
   produce a file the most widely deployed reader cannot open. Reading stays

@@ -40,13 +40,22 @@
  * of the sixteen agree with both; the sixteenth is named below with the
  * minimal pair that shows which reference is wrong.
  *
- * What is *not* here is a sample value, because this phase decodes none.
+ * **Sample values are not asserted here.** `make check-mpeg` scores every
+ * fixture's decode against ffmpeg and libsndfile - two separate MPEG
+ * implementations - per channel, in level, in offset and in length, with
+ * a control that must fail. What is here instead is everything a
+ * reference cannot be asked about: that the frame count is the one the
+ * loader stated, that the buffer size does not change the samples, that a
+ * seek lands on the sample it was asked for, and that the generated
+ * tables are still the standard's.
  */
 
 #include "../../src/codec/mp3/mp3_internal.h"
+#include "../../src/codec/mp3/mp3_tables.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <gtest/gtest.h>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -557,48 +566,54 @@ const struct Fixtures {
   uint64_t delay;
   uint64_t padding;
   uint64_t recording;
+  /** Whether this library decodes it. False only for MPEG-2.5 Layer III,
+   *  whose scalefactor band tables are in no standard. */
+  bool decodes;
+  /** Whether it is silence by construction, so that the energy check
+   *  below does not demand a signal from a file that has none. */
+  bool silent;
 } fixtures[] = {
     {"mp3_lame_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 5760u,
-        1105u, 246u, 4409u},
+        1105u, 246u, 4409u, true, false},
     {"mp3_lame_mono_44100.mp3", 44100u, 1u, GAUD_CODING_MPEG_LAYER3, 4608u,
-        1105u, 502u, 3001u},
+        1105u, 502u, 3001u, true, false},
     {"mp3_lame_vbr_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 1105u, 246u, 4409u},
+        5760u, 1105u, 246u, 4409u, true, false},
     {"mp3_lame_truestereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 1105u, 246u, 4409u},
+        5760u, 1105u, 246u, 4409u, true, false},
     {"mp3_lame_transient_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        10368u, 1105u, 444u, 8819u},
+        10368u, 1105u, 444u, 8819u, true, false},
     {"mp3_lame_stereo_320_48000.mp3", 48000u, 2u, GAUD_CODING_MPEG_LAYER3,
-        6912u, 1105u, 1008u, 4799u},
+        6912u, 1105u, 1008u, 4799u, true, false},
     {"mp3_lame_silence_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u},
+        1105u, 348u, 2003u, true, true},
     {"mp3_lame_stereo_22050.mp3", 22050u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u},
+        1105u, 348u, 2003u, true, false},
     {"mp3_lame_mono_11025.mp3", 11025u, 1u, GAUD_CODING_MPEG_LAYER3, 2304u,
-        1105u, 178u, 1021u},
+        1105u, 178u, 1021u, false, false},
     /* The second MP3 encoder, which writes a length tag whose delay and
      * padding are zero. The 529 frames of decoder delay are still real and
      * are still subtracted, and both references do the same: they decode
      * these to 4,079 and 1,775 frames rather than to 4,608 and 2,304. */
     {"mp3_shine_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 4608u,
-        529u, 0u, 4079u},
+        529u, 0u, 4079u, true, false},
     {"mp3_shine_mono_44100.mp3", 44100u, 1u, GAUD_CODING_MPEG_LAYER3, 2304u,
-        529u, 0u, 1775u},
+        529u, 0u, 1775u, true, false},
     /* Layer II, from both of its writers. Neither puts a length tag in
      * one, so the frames were counted and no trim is stated - and both
      * references decode all of them, which is the same answer. */
     {"mp2_twolame_stereo_44100.mp2", 44100u, 2u, GAUD_CODING_MPEG_LAYER2, 4608u,
-        0u, 0u, 4608u},
+        0u, 0u, 4608u, true, false},
     {"mp2_ff_mono_48000.mp2", 48000u, 1u, GAUD_CODING_MPEG_LAYER2, 3456u, 0u,
-        0u, 3456u},
+        0u, 3456u, true, false},
     {"mp2_ff_stereo_22050.mp2", 22050u, 2u, GAUD_CODING_MPEG_LAYER2, 2304u, 0u,
-        0u, 2304u},
+        0u, 2304u, true, false},
     /* No Xing frame at all: nothing states the length and nothing states
      * the delay. Both references also decode the whole 5,760 frames, so
      * "untrimmed" is not this library being unable to do what they do - it
      * is the file not saying. */
     {"mp3_lame_noxing_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 0u, 0u, 5760u},
+        5760u, 0u, 0u, 5760u, true, false},
     /* An ID3v2 tag at the front and an ID3v1 trailer at the end, and **the
      * one fixture where the two references disagree**: libsndfile decodes
      * 2,003 frames and ffmpeg 2,351. 2,351 is 3,456 - 1,105, which is the
@@ -607,7 +622,7 @@ const struct Fixtures {
      * ffmpeg too, so the 128-byte trailer is what defeats its end trim,
      * and 2,003 is what the encoder was given. We agree with libsndfile. */
     {"mp3_tagged_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u},
+        1105u, 348u, 2003u, true, false},
 };
 
 TEST(Mp3Load, EveryFixtureIdentifiesAsTheStreamItIs) {
@@ -830,24 +845,6 @@ TEST(Mp3Load, AnUnseekableStreamIsRefusedWithAReason) {
   gaud_stream_destroy(seekable);
 }
 
-TEST(Mp3Load, ThereIsNoDecoderYet) {
-  /* The honest statement of where this phase stops. The codec declares no
-   * GAUD_CAP_DECODE and has no decoder entry point, so asking for one
-   * answers "I know what this is and cannot decode it" rather than
-   * handing back a decoder that produces silence - which is the first trap
-   * planning/audio.md section 12 names, and the one a caller cannot tell
-   * from a quiet passage. */
-  Loaded loaded;
-  ASSERT_EQ(OpenFile(loaded, "mp3_lame_stereo_44100.mp3"), GAUD_OK);
-  const GAUD_Codec * codec = gaud_registry_find(nullptr, "mp3");
-  ASSERT_NE(codec, nullptr);
-  EXPECT_EQ(codec->capabilities & GAUD_CAP_DECODE, 0u);
-  GAUD_Decoder * decoder = nullptr;
-  EXPECT_EQ(
-      gaud_decoder_create(loaded.track(), &decoder), GAUD_ERR_UNSUPPORTED);
-  EXPECT_EQ(decoder, nullptr);
-}
-
 /* --------------------------------------------- what the loader refuses */
 
 /** A stream of @p count identical frames of the shape @p header describes. */
@@ -1008,11 +1005,11 @@ TEST(Mp3Load, AFrameWhoseBodyIsMissingIsNotCounted) {
       << "the fifth frame's header is there and its body is not";
 }
 
-TEST(Mp3Load, LayerOneAndLayerTwoAreTheirOwnCodings) {
-  /* No encoder in the oracle image writes Layer I at all, so this is the
-   * only thing that reads one: the corpus has Layer II from two writers
-   * and Layer III from two, and Layer I exists in hand-built frames or
-   * nowhere. */
+TEST(Mp3Load, EachLayerIsItsOwnCoding) {
+  /* No encoder in the oracle image writes Layer I at all, so the corpus
+   * has Layer II from two writers, Layer III from two, and Layer I only
+   * as a fixture the generator constructs. These are hand-built frames,
+   * which is the cheapest way to check the coding each layer reports. */
   const struct {
     unsigned layer;
     GAUD_Sample_Coding coding;
@@ -1082,7 +1079,11 @@ TEST(Mp3Load, AnId3v2TagLongerThanTheStreamIsIgnoredAndTheFramesAreRead) {
    * length the file does not have. The frames are a separate question and
    * may be perfectly good, so this is a diagnostic rather than a refusal -
    * but the frames have to be found, which means the search starts after
-   * where the tag said it ended and finds nothing there, then carries on. */
+   * where the tag said it ended and finds nothing there. A refusal naming
+   * the format is the honest answer: the alternative is searching from
+   * zero as well, which would find frames inside a tag body on every file
+   * that really does carry a large one - and a partial download, which is
+   * the common case, has no frames yet anyway. */
   std::vector<unsigned char> stream;
   unsigned char head[10] = {'I', 'D', '3', 3, 0, 0, 0, 0, 0x7Fu, 0x7Fu};
   stream.insert(stream.end(), head, head + 10);
@@ -1091,12 +1092,511 @@ TEST(Mp3Load, AnId3v2TagLongerThanTheStreamIsIgnoredAndTheFramesAreRead) {
   stream.insert(stream.end(), frames.begin(), frames.end());
 
   Loaded loaded;
-  /* The span the tag claims is past the end, so the frame search begins
-   * past the end and the stream has no frame this library will find. A
-   * refusal naming the format is the honest answer: the alternative is
-   * searching from zero as well, which would find frames inside a tag
-   * body on every file that really does carry a large one. */
   EXPECT_EQ(OpenBytes(loaded, stream), GAUD_ERR_FORMAT);
+}
+
+/* ------------------------------------------------------------ decoding */
+
+/** Decode a whole track into one vector of 16-bit samples. */
+std::vector<int16_t> DecodeAll(GAUD_Track * track, size_t block = 97) {
+  std::vector<int16_t> out;
+  GAUD_Decoder * decoder = nullptr;
+  EXPECT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK);
+  if (!decoder) {
+    return out;
+  }
+  GAUD_Buffer * buffer = nullptr;
+  EXPECT_EQ(
+      gaud_decoder_buffer_create(decoder, nullptr, block, &buffer), GAUD_OK);
+  unsigned channels = gaud_track_layout(track).channels;
+  for (;;) {
+    EXPECT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+    size_t frames = gaud_buffer_frames(buffer);
+    if (frames == 0) {
+      break;
+    }
+    const int16_t * data
+        = static_cast<const int16_t *>(gaud_buffer_data_const(buffer));
+    out.insert(out.end(), data, data + frames * channels);
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+  return out;
+}
+
+TEST(Mp3Decode, EveryFixtureDecodesTheFrameCountItStated) {
+  /* The first trap planning/audio.md section 12 names, asserted without
+   * any reference: a decoder that returns silence, or stops early, or
+   * runs long, produces the wrong number of frames - and the loader has
+   * already said what the right number is. `make check-mpeg` compares the
+   * samples; this compares the count, and it runs on a machine with no
+   * container. */
+  for (const auto & one : fixtures) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
+    GAUD_Track * track = loaded.track();
+    GAUD_Decoder * decoder = nullptr;
+    GAUD_Result opened = gaud_decoder_create(track, &decoder);
+    if (!one.decodes) {
+      EXPECT_EQ(opened, GAUD_ERR_UNSUPPORTED) << one.name;
+      EXPECT_EQ(decoder, nullptr) << one.name;
+      continue;
+    }
+    ASSERT_EQ(opened, GAUD_OK) << one.name;
+    gaud_decoder_destroy(decoder);
+
+    std::vector<int16_t> samples = DecodeAll(track);
+    unsigned channels = gaud_track_layout(track).channels;
+    ASSERT_EQ(samples.size() % channels, 0u) << one.name;
+    EXPECT_EQ(samples.size() / channels, one.frames) << one.name;
+
+    /* And it is not silence. The count alone would pass for a decoder
+     * that produced the right number of zeros, which is exactly the
+     * failure that sounds like a quiet passage. */
+    if (!one.silent) {
+      int64_t energy = 0;
+      for (int16_t value : samples) {
+        energy += (int64_t)value * value;
+      }
+      EXPECT_GT(energy / (int64_t)samples.size(), 1000)
+          << one.name
+          << " decoded to something far too quiet to be the "
+             "signal the generator put in it";
+    }
+  }
+}
+
+TEST(Mp3Decode, TheBlockSizeDoesNotChangeTheSamples) {
+  /* A frame is 1,152 samples and a caller's buffer is whatever it chose,
+   * so the decoder holds a frame and drains it across calls. Three block
+   * sizes: one smaller than a frame, one that is not a divisor of it, and
+   * one much larger. */
+  Loaded loaded;
+  ASSERT_EQ(OpenFile(loaded, "mp3_lame_stereo_44100.mp3"), GAUD_OK);
+  std::vector<int16_t> reference = DecodeAll(loaded.track(), 1152u);
+  ASSERT_FALSE(reference.empty());
+  for (size_t block : {1u, 97u, 577u, 4096u}) {
+    Loaded again;
+    ASSERT_EQ(OpenFile(again, "mp3_lame_stereo_44100.mp3"), GAUD_OK);
+    EXPECT_EQ(DecodeAll(again.track(), block), reference)
+        << "block size " << block;
+  }
+}
+
+TEST(Mp3Decode, ASeekLandsOnTheSampleItWasAskedFor) {
+  /* The property no reference can be asked about, and the one a
+   * decode-from-the-start comparison cannot distinguish from a seek that
+   * silently did nothing. There is no index in an MPEG stream, so the
+   * seek counts frames from the start and then runs up to the target
+   * through the frames whose state it needs; what is checked here is that
+   * the samples after it are the samples that were there before. */
+  Loaded loaded;
+  ASSERT_EQ(OpenFile(loaded, "mp3_lame_stereo_44100.mp3"), GAUD_OK);
+  GAUD_Track * track = loaded.track();
+  std::vector<int16_t> whole = DecodeAll(track, 1152u);
+  unsigned channels = gaud_track_layout(track).channels;
+  ASSERT_GT(whole.size(), 4000u * channels);
+
+  GAUD_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK);
+  GAUD_Buffer * buffer = nullptr;
+  ASSERT_EQ(
+      gaud_decoder_buffer_create(decoder, nullptr, 500u, &buffer), GAUD_OK);
+  /* Targets on and off a frame boundary, forwards and backwards, and one
+   * at the very start - which is the case that has to reset the
+   * filterbank rather than carry it. */
+  for (uint64_t target : {2304u, 2305u, 1000u, 3456u, 0u, 4000u}) {
+    uint64_t landed = UINT64_MAX;
+    ASSERT_EQ(gaud_decoder_seek(decoder, target, &landed), GAUD_OK) << target;
+    EXPECT_EQ(landed, target) << "a seek must report where it landed";
+    ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+    size_t frames = gaud_buffer_frames(buffer);
+    ASSERT_GT(frames, 0u) << target;
+    const int16_t * data
+        = static_cast<const int16_t *>(gaud_buffer_data_const(buffer));
+    /* The run-up means the decoder's filterbank state is warm but not
+     * identical to a decode from the start, so the samples are compared
+     * with a tolerance - and the tolerance is tight enough that a seek
+     * landing on the wrong frame could not pass it. One frame out is
+     * 1,152 samples of completely different audio. */
+    int64_t error = 0;
+    int64_t energy = 0;
+    for (size_t i = 0; i < frames * channels; ++i) {
+      int64_t want = whole[(target * channels) + i];
+      int64_t got = data[i];
+      error += (want - got) * (want - got);
+      energy += want * want;
+    }
+    double relative = energy > 0 ? std::sqrt((double)error / (double)energy)
+                                 : (double)error;
+    EXPECT_LT(relative, 0.01)
+        << "seek to " << target << " landed somewhere else";
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+}
+
+TEST(Mp3Decode, ALayerIStreamDecodesAtEveryQuantiserWidth) {
+  /* Nothing in the oracle image writes Layer I, so this fixture is
+   * built by tools/oracle/make_corpus.py rather than by an encoder - and
+   * it allocates a different number of bits to each of fourteen
+   * subbands, so one file exercises every sample width the layer has.
+   * `make check-mpeg` scores its samples against both references; what is
+   * asserted here is that the fourteen widths are all present, which is
+   * the property that makes the fixture worth having. */
+  Loaded loaded;
+  ASSERT_EQ(OpenFile(loaded, "mp1_handbuilt_stereo_32000.mp1"), GAUD_OK);
+  EXPECT_EQ(gaud_track_coding(loaded.track()), GAUD_CODING_MPEG_LAYER1);
+  std::vector<int16_t> samples = DecodeAll(loaded.track());
+  EXPECT_EQ(samples.size() / 2u, 4608u);
+
+  unsigned widths = 0;
+  uint64_t at = gaud_track_data_offset(loaded.track());
+  unsigned char frame[4];
+  ASSERT_EQ(
+      gaud_stream_seek(loaded.stream, (int64_t)at, GAUD_SEEK_SET), GAUD_OK);
+  ASSERT_EQ(gaud_stream_read(loaded.stream, frame, 4), 4u);
+  MP3_Header header;
+  ASSERT_TRUE(gaud_mp3_header_parse(frame, &header));
+  EXPECT_EQ(header.layer, 1u);
+  /* The allocation fields are the 256 bits after the header. */
+  std::vector<unsigned char> allocations(32);
+  ASSERT_EQ(gaud_stream_read(loaded.stream, allocations.data(), 32), 32u);
+  MP3_Bits bits;
+  gaud_mp3_bits_init(&bits, allocations.data(), allocations.size());
+  bool seen[17] = {false};
+  for (unsigned sb = 0; sb < 32u; ++sb) {
+    for (unsigned ch = 0; ch < 2u; ++ch) {
+      unsigned value = gaud_mp3_bits_read(&bits, 4u);
+      ASSERT_LT(value, 15u) << "allocation 15 is forbidden";
+      if (value) {
+        seen[value + 1u] = true;
+      }
+    }
+  }
+  for (unsigned width = 2; width <= 15u; ++width) {
+    EXPECT_TRUE(seen[width]) << "no subband uses " << width
+                             << "-bit samples, so this fixture no longer "
+                                "covers every Layer I quantiser";
+    ++widths;
+  }
+  EXPECT_EQ(widths, 14u);
+}
+
+TEST(Mp3Decode, AFrameWhoseReservoirIsMissingIsSilenceAndIsCounted) {
+  /* A Layer III frame's main data starts before its own header, so the
+   * first frames of a stream point at bytes that do not exist. Every
+   * decoder emits silence for those and so does this one - the point of
+   * the test is that it is **counted**, so that silence this library
+   * could not avoid and silence the file contains are different facts
+   * from outside. */
+  std::vector<unsigned char> header = Header(V1, L3, false, 9u, 0u, false, 3u);
+  std::vector<unsigned char> frame = Frame(header);
+  /* A side information whose main_data_begin is the largest the field can
+   * state: nine bits of ones, at the very start of the frame's data. */
+  frame[4] = 0xFFu;
+  frame[5] = 0x80u;
+  std::vector<unsigned char> stream;
+  for (unsigned i = 0; i < 8u; ++i) {
+    stream.insert(stream.end(), frame.begin(), frame.end());
+  }
+  Loaded loaded;
+  ASSERT_EQ(OpenBytes(loaded, stream), GAUD_OK);
+  std::vector<int16_t> samples = DecodeAll(loaded.track());
+  /* Every frame is ungrounded, because every frame points back 511 bytes
+   * and the frames are 417 long - so the whole decode is silence, and the
+   * frame count is still exact. */
+  EXPECT_EQ(samples.size(), 8u * 1152u);
+  for (int16_t value : samples) {
+    EXPECT_EQ(value, 0);
+  }
+}
+
+/** Bits into a byte buffer, most significant first, as the format is. */
+class Writer {
+public:
+  void put(uint32_t value, unsigned width) {
+    for (int shift = (int)width - 1; shift >= 0; --shift) {
+      if (at_ == 0) {
+        bytes_.push_back(0);
+      }
+      if ((value >> shift) & 1u) {
+        bytes_.back() |= (unsigned char)(0x80u >> at_);
+      }
+      at_ = (at_ + 1u) & 7u;
+    }
+  }
+  const std::vector<unsigned char> & bytes() const {
+    return bytes_;
+  }
+
+private:
+  std::vector<unsigned char> bytes_;
+  unsigned at_ = 0;
+};
+
+/**
+ * A stereo MPEG-1 Layer III side information that decodes.
+ *
+ * Every field the format requires, with values chosen to be legal rather
+ * than musical: a hundred pairs of big values in three regions coded with
+ * table 1, no window switching, no preflag. The main data that follows it
+ * is whatever the caller puts there - what matters for the test below is
+ * that the *structure* is valid, so that a reader which found it two
+ * bytes from where it should be would fail rather than disagree.
+ */
+std::vector<unsigned char> SideInfo() {
+  Writer w;
+  w.put(0, 9); /* main_data_begin: this frame stands alone */
+  w.put(0, 3); /* private bits, stereo */
+  w.put(0, 4); /* scfsi, channel 0 */
+  w.put(0, 4); /* scfsi, channel 1 */
+  for (unsigned gr = 0; gr < 2u; ++gr) {
+    for (unsigned ch = 0; ch < 2u; ++ch) {
+      w.put(500, 12); /* part2_3_length */
+      w.put(100, 9);  /* big_values */
+      w.put(180, 8);  /* global_gain */
+      w.put(0, 4);    /* scalefac_compress */
+      w.put(0, 1);    /* no window switching */
+      w.put(1, 5);    /* table_select[0] */
+      w.put(1, 5);    /* table_select[1] */
+      w.put(1, 5);    /* table_select[2] */
+      w.put(7, 4);    /* region0_count */
+      w.put(7, 3);    /* region1_count */
+      w.put(0, 1);    /* preflag */
+      w.put(0, 1);    /* scalefac_scale */
+      w.put(0, 1);    /* count1table_select */
+    }
+  }
+  std::vector<unsigned char> out = w.bytes();
+  out.resize(32u, 0u);
+  return out;
+}
+
+TEST(Mp3Decode, AProtectedFrameDecodesTheSameAsAnUnprotectedOne) {
+  /* The protection bit moves the side information and the main data two
+   * bytes later, and nothing in the corpus sets it: no encoder in the
+   * oracle image writes a CRC. So the only check on that offset is this
+   * one, and it is an equivalence rather than a value - the same side
+   * information and the same main data, in a frame with a checksum and a
+   * frame without, must decode to the same samples. A reader that
+   * mislaid the two bytes would parse the side information off by
+   * sixteen bits, which these values are chosen to make fatal rather
+   * than merely different: a table_select of 4 or 14 and a big_values
+   * past 288 are both refusals.
+   *
+   * The main data is a run of non-zero bytes rather than zeros, because
+   * two frames of silence are equal whatever the offset was. */
+  std::vector<unsigned char> side = SideInfo();
+  std::vector<int16_t> decoded[2];
+  for (int which = 0; which < 2; ++which) {
+    bool crc = which != 0;
+    std::vector<unsigned char> frame
+        = Frame(Header(V1, L3, crc, 9u, 0u, false, 0u));
+    size_t at = 4u + (crc ? 2u : 0u);
+    if (crc) {
+      /* A checksum the reader does not verify and must skip. */
+      frame[4] = 0x12u;
+      frame[5] = 0x34u;
+    }
+    std::memcpy(frame.data() + at, side.data(), side.size());
+    /* The main data, indexed from its own start rather than from the
+     * frame's: the two frames put it two bytes apart, and a fill that
+     * depended on the absolute offset would make them carry *different*
+     * data, which is the mistake the first draft of this test made. The
+     * length is the shorter of the two for the same reason. */
+    size_t payload = frame.size() - (4u + 2u + side.size());
+    for (size_t k = 0; k < payload; ++k) {
+      frame[at + side.size() + k] = (unsigned char)(0x80u + (k * 37u) % 0x7Fu);
+    }
+    std::vector<unsigned char> stream;
+    for (unsigned i = 0; i < 6u; ++i) {
+      stream.insert(stream.end(), frame.begin(), frame.end());
+    }
+    Loaded loaded;
+    ASSERT_EQ(OpenBytes(loaded, stream), GAUD_OK) << which;
+    decoded[which] = DecodeAll(loaded.track());
+    EXPECT_EQ(decoded[which].size(), 6u * 1152u * 2u) << which;
+  }
+  EXPECT_EQ(decoded[0], decoded[1])
+      << "the two frames carry the same side information and the same "
+         "main data, so the checksum's two bytes are the only difference "
+         "and they are not data";
+  /* And the payload really did reach the decoder: all-zero output would
+   * make this test pass for the wrong reason. */
+  int64_t energy = 0;
+  for (int16_t value : decoded[0]) {
+    energy += (int64_t)value * value;
+  }
+  EXPECT_GT(energy, 0)
+      << "both decodes are silence, so this proved nothing about the "
+         "offset";
+}
+
+/* ------------------------------------------------- the generated tables */
+
+/*
+ * What these are for.
+ *
+ * `src/codec/mp3/mp3_tables.c` is generated from the tables in ISO/IEC
+ * 11172-3 and 13818-3 by `tools/tables/gen_mp3_tables.py`, which
+ * validates everything it extracts - that every Huffman table is a
+ * complete prefix code, that every window coefficient is a multiple of
+ * 2^-16, and a dozen more. **Those checks run in the generator and the
+ * generator does not run in the build.** What is below is the half of
+ * that which can be re-checked from the generated file alone, so that a
+ * corrupted or hand-edited table is caught by `make test` rather than by
+ * a differential that needs a container.
+ */
+
+TEST(Mp3Tables, EveryHuffmanTreeIsCompleteAndWellFormed) {
+  for (unsigned number = 0; number < 32u; ++number) {
+    const MP3_Huff * table = &gaud_mp3_huff[number];
+    if (table->unused) {
+      EXPECT_EQ(table->width, 0u) << number;
+      continue;
+    }
+    if (table->width == 0u) {
+      continue; /* Table 0 codes nothing. */
+    }
+    /* Walk every node reachable from the root. A tree with a hole in it
+     * would decode some bit pattern into a node index that is not a
+     * node, which is the failure that cannot be caught at run time
+     * without a test on every lookup. */
+    std::vector<unsigned> pending = {0u};
+    std::vector<bool> visited;
+    unsigned leaves = 0;
+    std::vector<bool> covered((size_t)table->width * table->width, false);
+    while (!pending.empty()) {
+      unsigned node = pending.back();
+      pending.pop_back();
+      if (visited.size() <= node) {
+        visited.resize(node + 1u, false);
+      }
+      if (visited[node]) {
+        FAIL() << "table " << number << " revisits node " << node
+               << ", so its tree has a cycle";
+      }
+      visited[node] = true;
+      for (unsigned bit = 0; bit < 2u; ++bit) {
+        int16_t entry = gaud_mp3_huff_nodes[table->offset + 2u * node + bit];
+        if (entry < 0) {
+          unsigned payload = (unsigned)(-(int)entry - 1);
+          unsigned x = payload >> 4;
+          unsigned y = payload & 15u;
+          ASSERT_LT(x, table->width) << "table " << number;
+          ASSERT_LT(y, table->width) << "table " << number;
+          size_t index = (size_t)x * table->width + y;
+          EXPECT_FALSE(covered[index])
+              << "table " << number << " codes (" << x << "," << y << ") twice";
+          covered[index] = true;
+          ++leaves;
+        }
+        else {
+          pending.push_back((unsigned)entry);
+        }
+      }
+    }
+    EXPECT_EQ(leaves, (unsigned)table->width * table->width)
+        << "table " << number << " has " << leaves << " leaves for a "
+        << (unsigned)table->width << "x" << (unsigned)table->width << " grid";
+    for (size_t index = 0; index < covered.size(); ++index) {
+      EXPECT_TRUE(covered[index])
+          << "table " << number << " does not code the pair at index " << index;
+    }
+  }
+}
+
+TEST(Mp3Tables, TheSynthesisWindowIsTheStandardsExactValues) {
+  /* Every coefficient of Table 3-B.3 is an exact multiple of 2^-16 - the
+   * standard prints them to nine decimal places and 0.000015259 is
+   * 1/65536 - so in Q28 every one of them is a multiple of 4096. Nothing
+   * a mis-read digit or a hand edit produced would be. */
+  bool any = false;
+  for (unsigned i = 0; i < 512u; ++i) {
+    EXPECT_EQ(gaud_mp3_window[i] % 4096, 0)
+        << "window coefficient " << i << " is " << gaud_mp3_window[i]
+        << ", which is not a multiple of 2^-16 in Q28";
+    if (gaud_mp3_window[i] != 0) {
+      any = true;
+    }
+  }
+  EXPECT_TRUE(any) << "the window is all zeros, which would decode every "
+                      "file to silence";
+  /* Two values from the standard, by hand: D[0] is zero and D[1] is
+   * -1/65536. A table shifted by one entry fails this. */
+  EXPECT_EQ(gaud_mp3_window[0], 0);
+  EXPECT_EQ(gaud_mp3_window[1], -(1 << MP3_Q) / 65536);
+}
+
+TEST(Mp3Tables, RequantisationIsMonotonicAndExactAtOne) {
+  /* |is|^(4/3) for every value the Huffman stage can produce, as a
+   * mantissa and an exponent. Monotonic because the function is, and
+   * exactly 1.0 at 1 because 1^(4/3) is 1 - which is the entry every
+   * frame with a quiet passage uses. */
+  EXPECT_EQ(gaud_mp3_pow43[0], 0u);
+  EXPECT_EQ(gaud_mp3_pow43[1] & 0xFFFFFFu, 1u << 23);
+  EXPECT_EQ(gaud_mp3_pow43[1] >> 24, 0u);
+  double previous = 0.0;
+  for (unsigned value = 1; value < 8207u; ++value) {
+    uint32_t packed = gaud_mp3_pow43[value];
+    double here = (double)(packed & 0xFFFFFFu)
+        * std::pow(2.0, (double)(packed >> 24) - 23.0);
+    EXPECT_GT(here, previous) << "pow43 is not monotonic at " << value;
+    /* And it is the right function, to the 24 bits the mantissa has. */
+    double want = std::pow((double)value, 4.0 / 3.0);
+    EXPECT_LT(std::fabs(here - want) / want, 1e-6)
+        << "pow43[" << value << "] is " << here << " and " << value
+        << "^(4/3) is " << want;
+    previous = here;
+  }
+}
+
+TEST(Mp3Tables, TheBandTablesPartitionTheWholeSpectrum) {
+  /* Boundaries, so band b covers [b] to [b+1). The generator checks the
+   * widths against the standard's printed columns; what is checkable here
+   * is that the result covers every line exactly once and reaches the top
+   * - which is the property the padding band was added for, and the
+   * defect it fixed was a third of the spectrum decoded with the wrong
+   * scalefactor. */
+  for (unsigned row = 0; row < 6u; ++row) {
+    unsigned bands = gaud_mp3_sfb_long_bands[row];
+    ASSERT_GT(bands, 0u) << row;
+    ASSERT_LT(bands, 24u) << row;
+    EXPECT_EQ(gaud_mp3_sfb_long[row][0], 0u) << row;
+    EXPECT_EQ(gaud_mp3_sfb_long[row][bands], 576u)
+        << "row " << row << "'s long bands stop at "
+        << gaud_mp3_sfb_long[row][bands] << " of 576";
+    for (unsigned band = 1; band <= bands; ++band) {
+      EXPECT_GT(gaud_mp3_sfb_long[row][band], gaud_mp3_sfb_long[row][band - 1u])
+          << "row " << row << " band " << band;
+    }
+    unsigned shorts = gaud_mp3_sfb_short_bands[row];
+    EXPECT_EQ(gaud_mp3_sfb_short[row][0], 0u) << row;
+    EXPECT_EQ(gaud_mp3_sfb_short[row][shorts], 192u)
+        << "row " << row << "'s short bands stop at "
+        << gaud_mp3_sfb_short[row][shorts] << " of 192";
+    for (unsigned band = 1; band <= shorts; ++band) {
+      EXPECT_GT(
+          gaud_mp3_sfb_short[row][band], gaud_mp3_sfb_short[row][band - 1u])
+          << "row " << row << " short band " << band;
+    }
+  }
+}
+
+TEST(Mp3Tables, LayerIsQuantiserWidthsFindTheirClass) {
+  /* Layer I's allocation of n means n+1 bits and so 2^(n+1)-1 levels,
+   * and the class table's rows are 3, 5, 7, 9, 15, 31 ... - so only the
+   * rows from 15 upwards line up with the index. The generated map is the
+   * correspondence and this is the check that it is one. */
+  for (unsigned width = 2; width <= 16u; ++width) {
+    unsigned index = gaud_mp3_class_for_bits[width];
+    ASSERT_LT(index, 17u) << width;
+    EXPECT_EQ(gaud_mp3_classes[index].steps, (1u << width) - 1u)
+        << width << "-bit samples are mapped to a class of "
+        << gaud_mp3_classes[index].steps << " levels";
+    EXPECT_EQ(gaud_mp3_classes[index].sample_bits, width) << width;
+  }
 }
 
 /* -------------------------------------------------------------- probing */

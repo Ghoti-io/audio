@@ -595,6 +595,26 @@ MP2_CASES = [
     ("mp2_ff_mono_48000", "mp2", 1, 48000, 2399, "tone", ["-b:a", "128k"]),
     ("mp2_ff_stereo_22050", "mp2", 2, 22050, 2003, "noise",
      ["-b:a", "96k"]),
+    # The three below were added after `make mpeg-coverage` named arms
+    # nothing reached, which is the instrument doing its job:
+    #
+    #   32 kbit/s per channel selects Layer II allocation table 3-B.2c at
+    #   44.1 kHz and 3-B.2d at 32 kHz, and the corpus above reached
+    #   neither - every fixture in it is at a rate the two high tables
+    #   cover. Those two tables are 8 and 12 subbands where the others
+    #   are 27 and 30, so a decoder that read the wrong one would read
+    #   samples for subbands the frame does not carry.
+    #
+    #   And joint stereo, which TwoLAME will produce on request and which
+    #   neither it nor anything else in the image chooses on its own. For
+    #   Layers I and II joint stereo *is* intensity stereo, so this is the
+    #   only fixture that reaches it at all.
+    ("mp2_ff_lowrate_44100", "mp2", 2, 44100, 4409, "tone",
+     ["-b:a", "64k"]),
+    ("mp2_ff_lowrate_32000", "mp2", 2, 32000, 3199, "tone",
+     ["-b:a", "64k"]),
+    ("mp2_twolame_joint_44100", "libtwolame", 2, 44100, 4409, "tone",
+     ["-b:a", "192k", "-mode", "1"]),
 ]
 
 
@@ -649,6 +669,114 @@ def mp3_tagged_make(path, channels, rate, frames):
              "-map_metadata", "0", "-f", "mp3", path]
     run(oracle.command("ffmpeg", argv, scratch=DATA))
     os.remove(raw)
+
+
+
+class BitWriter:
+    """Bits, most significant first, which is how MPEG audio is written."""
+
+    def __init__(self):
+        self.bytes = bytearray()
+        self.bit = 0
+
+    def put(self, value, width):
+        for shift in range(width - 1, -1, -1):
+            if self.bit == 0:
+                self.bytes.append(0)
+            if (value >> shift) & 1:
+                self.bytes[-1] |= 0x80 >> self.bit
+            self.bit = (self.bit + 1) & 7
+
+    def pad(self, size):
+        while len(self.bytes) < size:
+            self.bytes.append(0)
+        self.bit = 0
+
+
+def layer1_make(path):
+    """A Layer I fixture, built here rather than by an encoder.
+
+    **Nothing in the oracle image writes Layer I.** ffmpeg has encoders for
+    Layer II (two of them) and Layer III (two), and none for Layer I; nor
+    does sox, nor libsndfile. So the only way for Layer I to be covered by
+    anything at all is to construct the bitstream, and the only way for
+    that to be a *differential* rather than a self-comparison is for the
+    expected output to come from the references: ffmpeg and libsndfile both
+    decode Layer I, and `make check-mpeg` scores this file against them
+    exactly as it scores the encoded ones.
+
+    The construction is deliberately not what an encoder would write. Each
+    subband gets a different allocation, so the file exercises every
+    quantiser width from 2 bits to 15 rather than the two or three a real
+    encoder would settle on, and the sample values come from a linear
+    congruential sequence so that every width's codes are spread over
+    their range. A fixture that looked like music would cover less.
+
+    MPEG-1, 32 kHz, 448 kbit/s, stereo: that rate and bitrate make the
+    frame exactly 168 four-byte slots with no padding, so nothing here
+    depends on the padding arithmetic being right - the header tests cover
+    that separately.
+    """
+    rate_index = 2        # 32 kHz
+    bitrate_index = 14    # 448 kbit/s, the highest Layer I has
+    bitrate = 448000
+    rate = 32000
+    frames = 12
+    slots = 12 * bitrate // rate
+    size = slots * 4
+    out = bytearray()
+    state = 0x13579BDF
+    for frame in range(frames):
+        w = BitWriter()
+        w.put(0x7FF, 11)          # sync
+        w.put(3, 2)               # MPEG-1
+        w.put(3, 2)               # Layer I
+        w.put(1, 1)               # no CRC
+        w.put(bitrate_index, 4)
+        w.put(rate_index, 2)
+        w.put(0, 1)               # no padding
+        w.put(0, 1)               # private
+        w.put(0, 2)               # stereo
+        w.put(0, 2)               # mode extension
+        w.put(0, 1)               # copyright
+        w.put(1, 1)               # original
+        w.put(0, 2)               # no emphasis
+        # An allocation per subband per channel. Subband i takes
+        # (i % 14) + 1, so the widths 2 to 15 all appear; the top four
+        # subbands are left unallocated, which is what every real file
+        # does and is the arm where a decoder must write silence rather
+        # than read bits.
+        # Subbands 0 to 13 take allocations 1 to 14, which is sample
+        # widths 2 to 15 - every width the layer has, once per channel.
+        # The rest are unallocated, which is what a real file does with
+        # its top subbands and is the arm where a decoder must write
+        # silence rather than read bits.
+        #
+        # The count is bounded by the frame: 448 kbit/s at 32 kHz is 672
+        # bytes, and 28 allocated subbands at these widths need 3,024
+        # bits of the 5,088 that are left after the header and the
+        # allocation fields. Allocating all 32 at these widths would not
+        # fit, which is why a real encoder never does.
+        allocation = []
+        for sb in range(32):
+            for ch in range(2):
+                value = sb + 1 if sb < 14 else 0
+                allocation.append(value)
+                w.put(value, 4)
+        for index, value in enumerate(allocation):
+            if value:
+                w.put((index * 7 + frame * 3) % 63, 6)
+        for _ in range(12):
+            for index, value in enumerate(allocation):
+                if not value:
+                    continue
+                width = value + 1
+                state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+                w.put((state >> 11) & ((1 << width) - 1), width)
+        w.pad(size)
+        out += w.bytes[:size]
+    with open(path, "wb") as handle:
+        handle.write(bytes(out))
 
 
 def main():
@@ -749,6 +877,12 @@ def main():
         mpeg_make(path, codec, channels, rate, frames, signal, flags)
         made.append(path)
         print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    path = os.path.join(DATA, "mp1_handbuilt_stereo_32000.mp1")
+    layer1_make(path)
+    made.append(path)
+    print("  %-30s %s" % ("mp1_handbuilt_stereo_32000",
+                          os.path.getsize(path)))
 
     path = os.path.join(DATA, "mp3_tagged_stereo_44100.mp3")
     mp3_tagged_make(path, 2, 44100, 2003)

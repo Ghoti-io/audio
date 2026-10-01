@@ -758,6 +758,11 @@ check-corpus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_corpus.py --self-check
 
+check-mpeg: ## Fail if a reference decodes MPEG audio differently than we do
+check-mpeg: $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
+		python3 $(ORACLE)/check_mpeg.py
+
 check-writer: ## Fail if a reference cannot read what our writer produced
 check-tags: ## Fail if a reference reads our tags differently than we do
 check-tags: $(TAG_PROBE)
@@ -842,6 +847,18 @@ check-golden: $(DUMP_PROBE)
 ####################################################################
 # Fixture hygiene
 ####################################################################
+
+mpeg-coverage: ## Which arms of the MPEG audio decoder the corpus reaches
+# As flac-coverage, and for the reason planning/audio.md 11.14 gives: a
+# differential says our decode matches the references and says nothing
+# about how much of the decoder ran. Not in TEST_GATES and not pass/fail.
+mpeg-coverage:
+	@rm -rf build/mpeg-coverage && mkdir -p build/mpeg-coverage
+	@$(CC) $(CFLAGS) -DGAUD_MP3_TRACE=1 $(INCLUDE) \
+		-o build/mpeg-coverage/probe \
+		$(SOURCES) $(ORACLE)/dump_probe.c \
+		-Wl,-rpath,$(LIB_INSTALL_PATH)/$(SUITE) $(DEP_LIBS) -lm
+	@python3 tools/mpeg_coverage.py build/mpeg-coverage/probe
 
 flac-coverage: ## Which arms of the FLAC frame decoder the corpus reaches
 # Not in TEST_GATES, and not a pass/fail: it is a measurement, and what to
