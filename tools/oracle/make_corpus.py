@@ -416,6 +416,17 @@ SIGNALS = {
     "tiny": "0.004*(2*random(%(c)d)-1)",
     "sideright": "0.5*sin(2*PI*220*t)+0.02*(2*random(1)-1)"
                  "|0.5*sin(2*PI*220*t)",
+    # Noise under a steep rising envelope eight times a second. Phase 5
+    # needs it and nothing before phase 5 did: a perceptual encoder chooses
+    # its window length from the signal, and every fixture above is
+    # stationary, so LAME codes all of them in long blocks only. The three
+    # short-block arms of the Layer III decoder - the window itself, the
+    # subblock gains, and the reordering that short blocks need and long
+    # ones do not - are reached by a transient and by nothing else.
+    # The `^` is exponentiation in ffmpeg's expression language; `pow`
+    # would need a comma, and the filtergraph splits on commas before the
+    # expression parser sees them.
+    "transient": "0.9*(2*random(%(c)d)-1)*((t*8-floor(t*8))^16)",
     "rich": "0.15*(sin(2*PI*110*t)+sin(2*PI*113*t)+sin(2*PI*220*t)"
             "+sin(2*PI*227*t)+sin(2*PI*331*t)+sin(2*PI*337*t)"
             "+sin(2*PI*447*t))",
@@ -487,6 +498,156 @@ def flac_make(path, writer, bits, channels, rate, frames, signal, flags,
         if bits == 32:
             argv[-3:-3] = ["-strict", "-2"]
         run(oracle.command("ffmpeg", argv, scratch=DATA))
+    os.remove(raw)
+
+
+
+# Phase 5's MPEG audio fixtures. **Four writers, and three of them are not
+# LAME**, which matters more here than the two FLAC writers did: a
+# perceptual encoder's output is a set of choices rather than a
+# transformation, so a decoder that has only ever read LAME has met one
+# encoder's taste in window switching, stereo mode and bit reservoir use
+# rather than the format.
+#
+#   libmp3lame  LAME itself, which is what wrote most of the MP3s that
+#               exist, and the only one here that writes a LAME tag with
+#               an encoder delay in it.
+#   libshine    A wholly separate MP3 encoder - fixed-point, written for
+#               embedded use - and the one most likely to make choices
+#               LAME never makes.
+#   libtwolame  Layer II, from TwoLAME.
+#   mp2         Layer II again, libavcodec's own, so the Layer II half has
+#               two independent writers as well.
+#
+# The axes, and why each file is here rather than being one more of the
+# same:
+#
+#   version     MPEG-1 at 44.1 kHz, MPEG-2 at 22.05 and MPEG-2.5 at
+#               11.025. The granule count halves below MPEG-1 and the
+#               scalefactor tables change entirely, so a reader that has
+#               only met MPEG-1 has met half the format.
+#   layer       III and II. They share a frame header and nothing else.
+#   mode        Joint stereo (LAME's default, and where the decorrelation
+#               lives), true stereo, and mono - whose side information is
+#               17 bytes rather than 32.
+#   signal      A tone, silence, full-scale noise, and a transient. The
+#               last two are not decoration: noise is what fills the
+#               Huffman tables' large-value escapes, and a transient is
+#               the only thing that makes an encoder choose short blocks.
+#   length tag  With a Xing tag, with an Info tag (its constant-rate
+#               spelling), and with none at all - which is the arm where
+#               this library has to estimate a length and say so.
+#   rate        320 kbit/s stereo is the largest frame the format has and
+#               the one where the main data of a frame most often spills
+#               backwards into the previous one.
+#
+#   name, writer, channels, rate, frames, signal, extra encoder flags
+MP3_CASES = [
+    ("mp3_lame_stereo_44100", "libmp3lame", 2, 44100, 4409, "tone",
+     ["-b:a", "128k"]),
+    ("mp3_lame_mono_44100", "libmp3lame", 1, 44100, 3001, "tone",
+     ["-b:a", "96k"]),
+    # Variable rate, so the tag is spelled `Xing` rather than `Info` and
+    # the frame headers do not all carry the same bitrate index. This is
+    # the fixture that makes the constant-rate check in the loader's
+    # length estimate observable: it must NOT be believed here.
+    ("mp3_lame_vbr_stereo_44100", "libmp3lame", 2, 44100, 4409, "tone",
+     ["-q:a", "4"]),
+    # No Xing frame at all, which is what a stream cut out of a broadcast
+    # looks like. Nothing states the length and nothing states the
+    # encoder delay, so both of this library's "could not establish it"
+    # paths are reached only by this file.
+    ("mp3_lame_noxing_stereo_44100", "libmp3lame", 2, 44100, 4409, "tone",
+     ["-b:a", "128k", "-write_xing", "0"]),
+    # True stereo rather than joint: both channels coded independently,
+    # so mode_extension is zero and neither mid/side nor intensity
+    # stereo appears.
+    ("mp3_lame_truestereo_44100", "libmp3lame", 2, 44100, 4409, "tone",
+     ["-b:a", "192k", "-joint_stereo", "0"]),
+    # The transient, for short blocks.
+    ("mp3_lame_transient_44100", "libmp3lame", 2, 44100, 8819, "transient",
+     ["-b:a", "192k"]),
+    # The largest frames the format allows, and the fullest reservoir.
+    ("mp3_lame_stereo_320_48000", "libmp3lame", 2, 48000, 4799, "noise",
+     ["-b:a", "320k"]),
+    # Silence: every scalefactor band empty, so the count1 region covers
+    # the whole spectrum and the big-values region is nothing at all.
+    ("mp3_lame_silence_44100", "libmp3lame", 2, 44100, 2003, "silence",
+     ["-b:a", "128k"]),
+    # MPEG-2 and MPEG-2.5: 576-sample granules.
+    ("mp3_lame_stereo_22050", "libmp3lame", 2, 22050, 2003, "tone",
+     ["-b:a", "64k"]),
+    ("mp3_lame_mono_11025", "libmp3lame", 1, 11025, 1021, "tone",
+     ["-b:a", "32k"]),
+    # The second MP3 encoder.
+    ("mp3_shine_stereo_44100", "libshine", 2, 44100, 4409, "tone",
+     ["-b:a", "128k"]),
+    ("mp3_shine_mono_44100", "libshine", 1, 44100, 3001, "noise",
+     ["-b:a", "128k"]),
+]
+
+# Layer II, from both of its writers. Spelled `.mp2` so that the corpus
+# says which layer a file is without being decoded, and because every
+# other reader in the world keys on the extension.
+MP2_CASES = [
+    ("mp2_twolame_stereo_44100", "libtwolame", 2, 44100, 4409, "tone",
+     ["-b:a", "192k"]),
+    ("mp2_ff_mono_48000", "mp2", 1, 48000, 2399, "tone", ["-b:a", "128k"]),
+    ("mp2_ff_stereo_22050", "mp2", 2, 22050, 2003, "noise",
+     ["-b:a", "96k"]),
+]
+
+
+def mpeg_make(path, codec, channels, rate, frames, signal, flags):
+    """One MPEG audio fixture, from whichever encoder writes it.
+
+    The source is raw PCM of exactly @p frames, so that the identity the
+    loader's tests assert - stated frames, minus the stated delay and
+    padding, equals the recording - has a known right-hand side.
+
+    `-fflags +bitexact` is what keeps the bytes stable across an ffmpeg
+    upgrade, and it has one visible effect worth naming here: the LAME
+    tag's nine-character encoder string becomes `Lavf lame` rather than
+    `Lavc` and a version number. Both reference decoders read the encoder
+    delay out of that spelling, and the first draft of this library's tag
+    reader did not - it had a list of two names, and this flag writes a
+    third.
+    """
+    raw = path + ".raw"
+    raw_signal(raw, signal, 16, channels, rate, frames)
+    argv = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", raw,
+        "-c:a", codec,
+    ] + list(flags) + [
+        "-fflags", "+bitexact", "-flags:a", "+bitexact",
+        "-map_metadata", "-1",
+        "-f", "mp2" if codec in ("mp2", "libtwolame") else "mp3", path,
+    ]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+    os.remove(raw)
+
+
+def mp3_tagged_make(path, channels, rate, frames):
+    """An MP3 with an ID3v2 tag at the front and an ID3v1 trailer at the end.
+
+    The one fixture where the tags on the ends of a bare stream are the
+    point rather than an accident. Both are written by ffmpeg, which is
+    also what wrote the ID3 blocks grafted into the WAV and AIFF
+    fixtures - so the three containers' ID3 readers are scored against
+    one writer, and mutagen is the second reading of all of them.
+    """
+    raw = path + ".raw"
+    raw_signal(raw, "tone", 16, channels, rate, frames)
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", raw,
+            "-c:a", "libmp3lame", "-b:a", "128k",
+            "-write_id3v2", "1", "-write_id3v1", "1"]
+    for key, value in TAGS:
+        argv += ["-metadata", "%s=%s" % (key, value)]
+    argv += ["-fflags", "+bitexact", "-flags:a", "+bitexact",
+             "-map_metadata", "0", "-f", "mp3", path]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
     os.remove(raw)
 
 
@@ -575,6 +736,24 @@ def main():
                   ogg=True)
         made.append(path)
         print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    # Phase 5: MPEG audio, Layer III and Layer II.
+    for name, codec, channels, rate, frames, signal, flags in MP3_CASES:
+        path = os.path.join(DATA, "%s.mp3" % name)
+        mpeg_make(path, codec, channels, rate, frames, signal, flags)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    for name, codec, channels, rate, frames, signal, flags in MP2_CASES:
+        path = os.path.join(DATA, "%s.mp2" % name)
+        mpeg_make(path, codec, channels, rate, frames, signal, flags)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    path = os.path.join(DATA, "mp3_tagged_stereo_44100.mp3")
+    mp3_tagged_make(path, 2, 44100, 2003)
+    made.append(path)
+    print("  %-30s %s" % ("mp3_tagged_stereo_44100", os.path.getsize(path)))
 
     print("%d fixtures in tests/data/" % len(made))
 

@@ -2,11 +2,12 @@
 
 Sound in C, as a container of tracks with metadata, read and written.
 
-**Phases 1 through 4 of ten.** WAV, AIFF and FLAC read and write,
-losslessly, with tags and cover art, over the base object, the pull decoder
-and the public codec SDK. No lossy codec exists yet. [Status](#status) says
-precisely what that means, and `planning/audio.md` in the workspace is the
-design it is being built to.
+**Phases 1 through 4 of ten, and phase 5 begun.** WAV, AIFF and FLAC read
+and write, losslessly, with tags and cover art, over the base object, the
+pull decoder and the public codec SDK. **No lossy codec decodes a sample
+yet**: a bare MPEG audio stream is identified, measured and tagged, and
+that is all it is. [Status](#status) says precisely what that means, and
+`planning/audio.md` in the workspace is the design it is being built to.
 
 ## Formats
 
@@ -35,9 +36,21 @@ This is what is implemented:
   output that is byte-identical on every architecture - see \ref format_flac
   "formats/flac.md".
 
+- **MPEG audio** - MPEG-1, MPEG-2 and MPEG-2.5, Layers I, II and III, which
+  is to say MP3 and its relatives. **Identified and measured, not decoded.**
+  The frame header, the ID3v2 tag at the front and the ID3v1 trailer at the
+  back, and the Xing, Info, VBRI and LAME tags that are the only places such
+  a stream ever states its own length or its encoder delay - so
+  `gaud_track_frames()`, `gaud_track_trim()` and `gaud_track_duration()`
+  answer, and `gaud_decoder_create()` says `GAUD_ERR_UNSUPPORTED` rather
+  than handing back silence. How the length was arrived at is part of the
+  answer: stated by a tag, counted, estimated from the bitrate, or unknown,
+  with a diagnostic for the last three.
+
 Each has a page saying what it covers and where it differs: \ref format_wav
 "formats/wav.md", \ref format_aiff "formats/aiff.md", \ref format_coding
-"formats/coding.md" and \ref format_flac "formats/flac.md".
+"formats/coding.md", \ref format_flac "formats/flac.md" and \ref
+format_mpeg "formats/mpeg.md".
 
 WAV and AIFF were in phase 1 together deliberately. **WAV is little-endian and
 AIFF is big-endian**, and their 8-bit samples disagree about sign, so each
@@ -46,9 +59,9 @@ check-golden` runs the corpus on big-endian targets, where the two swap
 round. From phase 4 that gate also *encodes* on those targets and compares
 the files byte for byte, which is why the FLAC encoder is integer-only.
 
-What comes next, in order: MP3; Vorbis and Opus in Ogg; ISO BMFF with ALAC,
-and AAC-LC as a separate library. Every format this library reads, it
-writes.
+What comes next, in order: the MPEG audio decoder itself; Vorbis and Opus in
+Ogg; ISO BMFF with ALAC, and AAC-LC as a separate library. Every format this
+library reads, it writes.
 
 ## Before you call it
 
@@ -223,7 +236,22 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phases 1 through 4 of ten, complete. What works:
+Phases 1 through 4 of ten, complete, and phase 5 begun. What works:
+
+- **MPEG audio identified, measured and tagged - and not decoded.** A bare
+  stream of MPEG-1, MPEG-2 or MPEG-2.5 frames in any of the three layers
+  loads into a document that states its rate, its channel count, its
+  layer, its length and its encoder delay, with ID3v2 and ID3v1 read off
+  the ends. It has no decoder: the codec declares no `GAUD_CAP_DECODE`,
+  and asking a track for one answers `GAUD_ERR_UNSUPPORTED`. That is a
+  deliberate half, because the half that exists is the half a tagger and a
+  library scanner need, and because a decoder that returned silence would
+  pass every test that counts frames. **Nothing about the length is
+  assumed:** a Xing, Info or VBRI frame is believed only if the bytes
+  could hold what it claims, a stream short enough to walk is counted
+  exactly, a constant-rate stream is estimated and says so, and a
+  variable-rate stream with no tag reports an unknown length rather than a
+  number that would be wrong.
 
 - **WAV and AIFF, read and written**, across every PCM width both can carry,
   including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
@@ -274,7 +302,7 @@ How it is judged:
 | `make check-tags` | 134 comparisons across four containers and two references. Does the ID3v1 genre table match mutagen's row by row, can ffmpeg and mutagen read the tags this library writes, and can it read theirs - the third is the one a library whose reader and writer share a misunderstanding fails. The two FLAC containers also go three generations through our own reader and writer, which is what caught a vendor string being collected as a tag |
 | `make check-golden` | 57 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only |
 | `make check-outoftree` | A codec in another repository works |
-| `make fuzz` | Five harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, and `coded`, which drives the block layer below any container, because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does. It found a real defect in its first minute |
+| `make fuzz` | Six harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, `coded`, which drives the block layer below any container because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does, and `mpeg`, where the opposite is true: MPEG audio has no container to synthesise, so nearly every input reaches the frame search. `coded` found a real defect in its first minute; `mpeg` found two in its first ten, and neither was a crash - a header struct whose padding made two parses of one header compare unequal, and a document whose audio began past the end of its own file |
 | `make flac-coverage` | Not pass/fail: it counts which named arms of the FLAC frame decoder the corpus actually reaches. It exists because `check-corpus` agreed byte for byte with every reference on every fixture while a third of the subframe decoder had never run - a codec's branches are selected by the *encoder*, so a corpus samples encoders rather than the format |
 
 The corpus is generated **by** the references and never by this library: one
@@ -291,10 +319,10 @@ The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
 its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-179 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+216 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
-`image` is linked for. 78.7% line coverage from the unit tests alone, which
+`image` is linked for. 80.2% line coverage from the unit tests alone, which
 is the figure that matters for a contributor without the oracle container:
 the gates above cover a great deal that those tests do not.
 
@@ -314,8 +342,10 @@ for, so the unit tests build those frames by hand instead.
 
 What is deliberately absent:
 
-- **Any perceptual codec.** The four codings above are sample quantisers, not
-  psychoacoustic ones, and FLAC is lossless. MP3 is phase 5.
+- **Any perceptual decoder.** The four codings above are sample quantisers,
+  not psychoacoustic ones, and FLAC is lossless. MPEG audio is identified
+  and measured as of phase 5 and decodes nothing; the decoder is the rest of
+  that phase.
 - **ADPCM above two channels, on write.** The formats have no defined
   interleave for it and ffmpeg refuses both directions, so writing one would
   produce a file the most widely deployed reader cannot open. Reading stays

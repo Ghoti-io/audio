@@ -94,13 +94,36 @@ typedef enum {
    * wants one answer for all four.
    */
   GAUD_CODING_FLAC,
+  /**
+   * MPEG-1, MPEG-2 or MPEG-2.5 Layer I.
+   *
+   * **Three values and not one**, because the three layers are three
+   * bitstreams and not three settings of one. A Layer II frame and a Layer
+   * III frame of the same length at the same rate share a four-byte header
+   * and nothing after it: Layer I and II quantise subbands directly, Layer
+   * III adds an MDCT, Huffman coding and a bit reservoir that spans
+   * frames. A caller asking what is in a track and being told "mpeg" would
+   * have to go and read the frame header to find out whether anything it
+   * knows can play it, which is the question it just asked.
+   *
+   * The version is deliberately *not* in these values. MPEG-2's low
+   * sampling frequency extension changes the sample rate, the granule
+   * count and the scalefactor tables, but a Layer III decoder decodes both
+   * - so the version is a property of the stream that gaud_track_frames()
+   * and the sample rate already report, not a different coding.
+   */
+  GAUD_CODING_MPEG_LAYER1,
+  /** MPEG-1, MPEG-2 or MPEG-2.5 Layer II. */
+  GAUD_CODING_MPEG_LAYER2,
+  /** MPEG-1, MPEG-2 or MPEG-2.5 Layer III, which is to say MP3. */
+  GAUD_CODING_MPEG_LAYER3,
   /** Closes the enum so a test can check the names. */
   GAUD_CODING_COUNT
 } GAUD_Sample_Coding;
 
 /**
  * @brief A short lower-case name: "pcm", "ulaw", "alaw", "ima-wav",
- *   "ima-qt", "ms-adpcm".
+ *   "ima-qt", "ms-adpcm", "flac", "mp1", "mp2", "mp3".
  *
  * @return A static string, never NULL; "unknown" outside the enum.
  */
@@ -124,6 +147,13 @@ GAUD_API bool gaud_sample_coding_is_pcm(GAUD_Sample_Coding coding);
  * range that is conventionally carried left-aligned in 16 bits, and both
  * ADPCM families predict in 16-bit signed arithmetic. There is no wider
  * form to lose.
+ *
+ * ::GAUD_SAMPLE_S16 for all three MPEG layers, and that one is a policy
+ * rather than a property of the format: an MPEG audio frame carries
+ * quantised spectral values with no bit depth anywhere in it, so the depth
+ * of the output is chosen by the decoder. This library chooses 16, which is
+ * what every integer MPEG decoder has produced since the format existed and
+ * what the reference decoders are compared at.
  *
  * For ::GAUD_CODING_PCM **and ::GAUD_CODING_FLAC** there is no single
  * answer and this returns ::GAUD_SAMPLE_FORMAT_COUNT, which is not a

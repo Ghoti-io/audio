@@ -59,6 +59,16 @@ GAUD_API void gaud_flac_register(void);
 GAUD_API void gaud_ogg_flac_register(void);
 
 /** @brief Register every codec this library ships with. */
+/**
+ * @brief Register the bare MPEG audio codec: Layer I, II and III.
+ *
+ * Named `mp3` because that is what the files are called, and it reads all
+ * three layers because they share a frame header and a synthesis
+ * filterbank; see ::GAUD_CODING_MPEG_LAYER1 for why the *coding* keeps them
+ * apart even so.
+ */
+GAUD_API void gaud_mp3_register(void);
+
 GAUD_API void gaud_register_builtin_codecs(void);
 
 #ifdef __cplusplus

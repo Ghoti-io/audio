@@ -47,12 +47,18 @@ static const Coding_Row table[GAUD_CODING_COUNT] = {
     /* FLAC's decoded format depends on the file's bit depth, so its row
      * says "ask the track" the same way PCM's does. */
     [GAUD_CODING_FLAC] = {"flac", GAUD_SAMPLE_FORMAT_COUNT},
+    /* The MPEG layers carry no bit depth at all, so unlike FLAC's row
+     * there is nothing to ask the track: 16 is this library's choice and
+     * is the same for every file. */
+    [GAUD_CODING_MPEG_LAYER1] = {"mp1", GAUD_SAMPLE_S16},
+    [GAUD_CODING_MPEG_LAYER2] = {"mp2", GAUD_SAMPLE_S16},
+    [GAUD_CODING_MPEG_LAYER3] = {"mp3", GAUD_SAMPLE_S16},
 };
 
 /* A designated initialiser leaves an unmentioned row zeroed, and a zeroed
  * row's name is NULL rather than absent - so the count alone does not
  * prove the table is full. This is the assertion that does. */
-_Static_assert(GAUD_CODING_COUNT == 7,
+_Static_assert(GAUD_CODING_COUNT == 10,
     "a coding was added: give it a row in table[] and a case in the "
     "container that spells it");
 

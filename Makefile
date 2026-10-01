@@ -1496,7 +1496,7 @@ endef
 # decoders only through a header the fuzzer has to synthesise correctly
 # first, so nearly every input dies at the chunk walk and the nibble loops
 # see almost nothing. `coded` hands the bytes straight to the block layer.
-FUZZ_HARNESSES := wav aiff coded tags flac
+FUZZ_HARNESSES := wav aiff coded tags flac mpeg
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))

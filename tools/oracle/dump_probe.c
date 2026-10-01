@@ -99,14 +99,18 @@ int main(int argc, char ** argv) {
   GAUD_Channel_Layout layout = gaud_track_layout(track);
 
   if (!want_pcm) {
+    GAUD_Trim trim = gaud_track_trim(track);
     printf("codec=%s format=%s coding=%s rate=%u channels=%u mask=0x%x "
-           "frames=%llu duration=%.6f diagnostics=%zu\n",
+           "frames=%llu duration=%.6f delay=%llu padding=%llu stated=%d "
+           "diagnostics=%zu\n",
         gaud_doc_codec_name(doc), gaud_sample_format_string(
             gaud_track_format(track)),
         gaud_sample_coding_name(gaud_track_coding(track)),
         gaud_track_sample_rate(track), layout.channels, layout.mask,
         (unsigned long long)gaud_track_frames(track),
-        gaud_track_duration(track), diagnostics.count);
+        gaud_track_duration(track), (unsigned long long)trim.encoder_delay,
+        (unsigned long long)trim.padding, trim.stated ? 1 : 0,
+        diagnostics.count);
   }
   else {
 #if defined(_WIN32)

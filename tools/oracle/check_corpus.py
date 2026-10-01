@@ -815,6 +815,23 @@ def main():
         for line in pad_notes:
             print("  %s" % line)
 
+    # **What this gate does not look at, named.** The corpus holds files
+    # whose extension is not in the list above, and an extension that is
+    # simply absent from a glob is the most invisible exclusion there is:
+    # the score's denominator shrinks and nothing says so. As of phase 5
+    # these are the MPEG fixtures, which this library identifies and does
+    # not yet decode - so there is no decode to compare and the honest
+    # thing is to print the count rather than let the files look scored.
+    everything = sorted(os.listdir(DATA))
+    unscored = [f for f in everything
+                if not f.startswith(".") and f not in files]
+    if unscored:
+        print("\n%d file(s) in tests/data/ are NOT scored by this gate, "
+              "because this library decodes no samples from them yet:"
+              % len(unscored))
+        for name in unscored:
+            print("  %s" % name)
+
     # The denominator, stated. A score whose exclusions are invisible is
     # inflated, so both halves are printed whether or not anything failed.
     total = sum(len(refs) for _, refs in scored)
