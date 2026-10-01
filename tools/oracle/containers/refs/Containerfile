@@ -31,6 +31,24 @@
 #             above. **WAV only**: Python 3.13 removed `aifc` under PEP 594,
 #             so there is no stdlib AIFF reader any more and AIFF is scored
 #             by the other three.
+# flac        The format's own reference implementation, added in phase 4.
+#             `flac -d` is the definition of a correct decode and `flac -t`
+#             verifies the STREAMINFO MD5 of a file we wrote, which is a
+#             whole-decoder check no comparison of ours could construct.
+#             `metaflac` reads the metadata blocks.
+#
+# **For FLAC the reference count is two, not five, and that has to be said
+# out loud.** sox reaches FLAC through libsox_fmt_flac, libsndfile links
+# libFLAC directly, and the `flac` tool *is* libFLAC's front end - so three
+# of the names above are one implementation wearing three hats, and a
+# misunderstanding inside libFLAC would be agreed to by all three at once.
+# ffmpeg is the one that is genuinely separate: libavcodec has a native FLAC
+# decoder and encoder and has never had a libFLAC decoder wrapper. (The
+# `ldd` of /usr/bin/ffmpeg *does* show libFLAC, which is the trap - it
+# arrives through libavdevice -> libpulse -> libsndfile, an output-device
+# path that the demuxer and decoder never touch.) So a FLAC differential
+# here is ffmpeg against libFLAC, scored three ways on one side, and
+# tools/oracle/check_corpus.py counts it that way.
 #
 # Everything the build reads is pinned, because an image built here cannot be
 # pinned by digest: two builds of one Containerfile are not two copies of one
@@ -67,7 +85,11 @@ RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuit
 
 # libsndfile1 is pinned explicitly as well as python3-soundfile, because it is
 # the one that decides an answer: soundfile is a ctypes wrapper and the two
-# have separate versions that move independently.
+# have separate versions that move independently. libflac14 is pinned for a
+# stronger version of the same reason: it is what three of the five
+# references answer a FLAC question with, so it is not a transitive
+# dependency here - it is a reference, and leaving it unpinned would leave
+# most of the FLAC oracle unpinned.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
       ffmpeg=7:7.1.5-0+deb13u1 \
@@ -76,16 +98,18 @@ RUN apt-get update -qq \
       python3-soundfile=0.13.1-2 \
       libsndfile1=1.2.2-2+deb13u1 \
       python3-mutagen=1.47.0-1 \
+      flac=1.5.0+ds-2 \
+      libflac14=1.5.0+ds-2 \
     && rm -rf /var/lib/apt/lists/*
 
 # The probes oracle_env.py runs, copied in rather than written with printf
 # inside a RUN: font's first draft did that and its escapes reached the file
 # literally, which puts a quoting layer between a check and the fact it checks.
 COPY ffmpeg-version sox-version libsndfile-version pywave-version \
-      mutagen-version /usr/local/bin/
+      mutagen-version flac-version /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/ffmpeg-version /usr/local/bin/sox-version \
       /usr/local/bin/libsndfile-version /usr/local/bin/pywave-version \
-      /usr/local/bin/mutagen-version
+      /usr/local/bin/mutagen-version /usr/local/bin/flac-version
 
 # A locale, pinned, because regex lost 1,855 differential rows to an image
 # that had none. Nothing here reads a name out of a file yet, but sox and
@@ -100,4 +124,4 @@ ENV TZ=UTC SOURCE_DATE_EPOCH=0
 
 ENTRYPOINT []
 CMD ["sh", "-c", "ffmpeg-version; sox-version; libsndfile-version; \
-pywave-version; mutagen-version"]
+pywave-version; mutagen-version; flac-version"]

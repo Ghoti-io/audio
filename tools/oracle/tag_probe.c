@@ -25,6 +25,7 @@
  *
  *     tag_probe dump   <file>
  *     tag_probe write  <out> <codec> [key=value ...]
+ *     tag_probe copy   <in> <out> <codec>
  *     tag_probe genres
  *
  * `dump` prints one tab-separated record per line, which is what a
@@ -32,6 +33,12 @@
  * builds a file carrying exactly the tags named. `genres` prints the
  * ID3v1 genre table, so `make check-tags` can compare it against
  * mutagen's entry by entry rather than trusting a transcription.
+ *
+ * `copy` reads a file and writes a new one carrying its metadata, which
+ * is what a tagger does and what `write` cannot stand in for: `write`
+ * builds its tags in memory, so it never exercises the reader, and a
+ * scheme that lost or duplicated something on the way in would still
+ * produce a correct-looking file. The round trip is the question.
  *
  * Under tools/ and not tests/ for the reason dump_probe is: a differential
  * needs this library's answer to leave the process so another
@@ -190,11 +197,91 @@ static int write_file(int argc, char ** argv) {
   return 0;
 }
 
+/**
+ * Read @p in, and write @p out carrying its metadata and its samples.
+ *
+ * The samples go through because some containers put metadata after them
+ * and a file with no audio would not exercise that; what is being scored
+ * is the metadata, and a reference reads it back.
+ */
+static int copy_file(const char * in_path, const char * out_path,
+    const char * codec) {
+  GAUD_Stream * in = NULL;
+  if (gaud_stream_create_file(in_path, &in) != GAUD_OK) {
+    fprintf(stderr, "cannot open %s\n", in_path);
+    return 1;
+  }
+  GAUD_Doc * doc = NULL;
+  GAUD_Result result = gaud_doc_load(NULL, in, NULL, NULL, &doc);
+  if (result != GAUD_OK) {
+    fprintf(stderr, "load: %s\n", gaud_result_string(result));
+    return 1;
+  }
+  GAUD_Track * track = gaud_doc_track(doc, 0);
+  if (!track) {
+    fprintf(stderr, "no track\n");
+    return 1;
+  }
+
+  GAUD_Stream * out = NULL;
+  if (gaud_stream_create_file_writer(NULL, out_path, &out) != GAUD_OK) {
+    fprintf(stderr, "cannot write %s\n", out_path);
+    return 1;
+  }
+  GAUD_Encode_Params params;
+  gaud_encode_params_default(&params);
+  params.format = gaud_track_format(track);
+  params.layout = gaud_track_layout(track);
+  params.sample_rate = gaud_track_sample_rate(track);
+  params.meta = gaud_doc_meta(doc);
+
+  GAUD_Encoder * encoder = NULL;
+  result = gaud_encoder_create(codec, NULL, out, &params, &encoder);
+  if (result != GAUD_OK) {
+    fprintf(stderr, "encoder: %s\n", gaud_result_string(result));
+    return 1;
+  }
+  GAUD_Decoder * decoder = NULL;
+  if (gaud_decoder_create(track, &decoder) != GAUD_OK) {
+    fprintf(stderr, "no decoder\n");
+    return 1;
+  }
+  GAUD_Buffer * buffer = NULL;
+  if (gaud_decoder_buffer_create(decoder, NULL, 997, &buffer) != GAUD_OK) {
+    return 1;
+  }
+  for (;;) {
+    if (gaud_decoder_read(decoder, buffer) != GAUD_OK) {
+      fprintf(stderr, "read failed\n");
+      return 1;
+    }
+    if (gaud_buffer_frames(buffer) == 0) {
+      break;
+    }
+    if (gaud_encoder_write(encoder, buffer) != GAUD_OK) {
+      fprintf(stderr, "write failed\n");
+      return 1;
+    }
+  }
+  result = gaud_encoder_finish(encoder);
+  if (result != GAUD_OK) {
+    fprintf(stderr, "finish: %s\n", gaud_result_string(result));
+    return 1;
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+  gaud_encoder_destroy(encoder);
+  gaud_doc_destroy(doc);
+  gaud_stream_destroy(out);
+  gaud_stream_destroy(in);
+  return 0;
+}
+
 int main(int argc, char ** argv) {
   if (argc < 2) {
     fprintf(stderr,
         "usage: tag_probe dump <file> | write <out> <codec> [k=v ...] "
-        "| genres\n");
+        "| copy <in> <out> <codec> | genres\n");
     return 2;
   }
   gaud_register_builtin_codecs();
@@ -210,6 +297,9 @@ int main(int argc, char ** argv) {
   }
   if (strcmp(argv[1], "write") == 0 && argc >= 4) {
     return write_file(argc, argv);
+  }
+  if (strcmp(argv[1], "copy") == 0 && argc >= 5) {
+    return copy_file(argv[2], argv[3], argv[4]);
   }
   fprintf(stderr, "unknown mode\n");
   return 2;

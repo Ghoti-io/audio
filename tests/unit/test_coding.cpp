@@ -211,7 +211,33 @@ double snr_db(const std::vector<int16_t> & want,
 
 } // namespace
 
-TEST(Coding, EveryCodingHasADistinctNameAndDecodesToS16) {
+TEST(Coding, EveryCodingHasADistinctNameAndTheDecodedFormatItClaims) {
+  /*
+   * Which codings have a fixed decoded format, named one at a time.
+   *
+   * It was once "every coding except PCM answers S16", and phase 4 ended
+   * that: FLAC is a coding whose bit depth is the file's, so it answers
+   * ::GAUD_SAMPLE_FORMAT_COUNT as PCM does, from the other direction -
+   * PCM because it is not coded and FLAC because it is coded and carries
+   * its own depth. Listing them means adding a coding is a compile error
+   * here rather than a rule quietly becoming false.
+   */
+  struct Expected {
+    GAUD_Sample_Coding coding;
+    GAUD_Sample_Format format; /* FORMAT_COUNT for "ask the track". */
+  };
+  const Expected expected[] = {
+      {GAUD_CODING_PCM, GAUD_SAMPLE_FORMAT_COUNT},
+      {GAUD_CODING_G711_ULAW, GAUD_SAMPLE_S16},
+      {GAUD_CODING_G711_ALAW, GAUD_SAMPLE_S16},
+      {GAUD_CODING_ADPCM_IMA_WAV, GAUD_SAMPLE_S16},
+      {GAUD_CODING_ADPCM_IMA_QT, GAUD_SAMPLE_S16},
+      {GAUD_CODING_ADPCM_MS, GAUD_SAMPLE_S16},
+      {GAUD_CODING_FLAC, GAUD_SAMPLE_FORMAT_COUNT},
+  };
+  static_assert(sizeof(expected) / sizeof(expected[0]) == GAUD_CODING_COUNT,
+      "a coding was added: say here what it decodes to");
+
   std::vector<std::string> seen;
   for (int i = 0; i < GAUD_CODING_COUNT; ++i) {
     GAUD_Sample_Coding coding = (GAUD_Sample_Coding)i;
@@ -223,17 +249,11 @@ TEST(Coding, EveryCodingHasADistinctNameAndDecodesToS16) {
         << "two codings answer to " << name;
     seen.push_back(name);
 
-    if (coding == GAUD_CODING_PCM) {
-      EXPECT_TRUE(gaud_sample_coding_is_pcm(coding));
-      /* PCM has no single decoded format, and says so rather than
-       * naming one. */
-      EXPECT_EQ(gaud_sample_coding_format(coding), GAUD_SAMPLE_FORMAT_COUNT);
-    }
-    else {
-      EXPECT_FALSE(gaud_sample_coding_is_pcm(coding));
-      EXPECT_EQ(gaud_sample_coding_format(coding), GAUD_SAMPLE_S16)
-          << name << " decodes to something other than s16";
-    }
+    EXPECT_EQ(gaud_sample_coding_is_pcm(coding), coding == GAUD_CODING_PCM)
+        << name;
+    EXPECT_EQ(expected[i].coding, coding) << "the table is out of order";
+    EXPECT_EQ(gaud_sample_coding_format(coding), expected[i].format)
+        << name << " does not decode to what the table says";
   }
 }
 

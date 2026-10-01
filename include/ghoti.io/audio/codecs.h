@@ -52,6 +52,12 @@ GAUD_API void gaud_wav_register(void);
 /** @brief Register the AIFF codec (AIFF and AIFF-C). */
 GAUD_API void gaud_aiff_register(void);
 
+/** @brief Register the native FLAC codec (RFC 9639). */
+GAUD_API void gaud_flac_register(void);
+
+/** @brief Register FLAC carried in Ogg pages. */
+GAUD_API void gaud_ogg_flac_register(void);
+
 /** @brief Register every codec this library ships with. */
 GAUD_API void gaud_register_builtin_codecs(void);
 

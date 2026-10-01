@@ -25,19 +25,29 @@ This is what is implemented:
   ADPCM. Read and written. They decode to signed 16-bit and are reported
   separately from the sample format, because what is in the file and what is
   in the buffer are different questions.
+- **FLAC** - RFC 9639, in its native container and in **Ogg**. Every
+  subframe type, both Rice methods, escaped partitions, wasted bits and all
+  four channel assignments; 8, 16, 24 and 32 bits. Read and written, with a
+  seek table, a STREAMINFO MD5 that `flac -t` verifies, Vorbis comments,
+  cover art and CUESHEET carriage. The encoder uses the format's fixed
+  predictors and no LPC, which costs a few percent of compression and buys
+  output that is byte-identical on every architecture - see \ref format_flac
+  "formats/flac.md".
 
 Each has a page saying what it covers and where it differs: \ref format_wav
-"formats/wav.md", \ref format_aiff "formats/aiff.md" and \ref format_coding
-"formats/coding.md".
+"formats/wav.md", \ref format_aiff "formats/aiff.md", \ref format_coding
+"formats/coding.md" and \ref format_flac "formats/flac.md".
 
-The two are in phase 1 together deliberately. **WAV is little-endian and AIFF
-is big-endian**, and their 8-bit samples disagree about sign, so each codec
-exercises exactly the paths the other does not - and `make check-golden` runs
-the corpus on big-endian targets, where the two swap round.
+WAV and AIFF are in phase 1 together deliberately. **WAV is little-endian and
+AIFF is big-endian**, and their 8-bit samples disagree about sign, so each
+codec exercises exactly the paths the other does not - and `make
+check-golden` runs the corpus on big-endian targets, where the two swap
+round. From phase 4 that gate also *encodes* on those targets and compares
+the files byte for byte, which is why the FLAC encoder is integer-only.
 
-What comes next, in order: µ-law, A-law and ADPCM inside these containers;
-FLAC; MP3; Ogg with Vorbis and Opus; ISO BMFF with ALAC, and AAC-LC as a
-separate library. Every format this library reads, it writes.
+What comes next, in order: MP3; Vorbis and Opus in Ogg; ISO BMFF with ALAC,
+and AAC-LC as a separate library. Every format this library reads, it
+writes.
 
 ## Before you call it
 
@@ -270,17 +280,21 @@ in the file and our encoder only ever names pair 0.
 What is deliberately absent:
 
 - **Any perceptual codec.** The four codings above are sample quantisers, not
-  psychoacoustic ones. FLAC is phase 4 and MP3 phase 5.
+  psychoacoustic ones, and FLAC is lossless. MP3 is phase 5.
 - **ADPCM above two channels, on write.** The formats have no defined
   interleave for it and ffmpeg refuses both directions, so writing one would
   produce a file the most widely deployed reader cannot open. Reading stays
   liberal.
-- **Vorbis comment, MP4 `ilst`, APEv2 and Matroska tags.** Phase 3 covers the
-  schemes the two phase 1 containers carry; the rest arrive with the
-  containers that hold them.
-- **Chapters and cues.** WAV's `cue `/`adtl`, FLAC's CUESHEET and the other
-  two spellings of the same idea. A `LIST` that is not an `INFO` is kept raw
-  today, so nothing is lost while they wait.
+- **MP4 `ilst`, APEv2 and Matroska tags.** Vorbis comment arrived with FLAC
+  in phase 4; the rest arrive with the containers that hold them.
+- **LPC subframes on the writing side.** They are read, at every order the
+  format allows. Writing them means an autocorrelation and a Levinson-Durbin
+  recursion in floating point, and that would end the promise that this
+  library's output is byte-identical across architectures.
+- **A model for chapters and cues.** WAV's `cue `/`adtl`, FLAC's CUESHEET and
+  the other two spellings of one idea. FLAC's is checked and round-tripped
+  byte for byte today, and a `LIST` that is not an `INFO` is kept raw, so
+  nothing is lost while they wait for a second caller to design against.
 - **`GAUD_SAMPLE_DSD1` and `GAUD_SAMPLE_OPAQUE` exist and nothing produces
   them.** They are in the base object because a registered codec cannot add a
   case to it later; DSD is phase 9 and remux needs the opaque one.

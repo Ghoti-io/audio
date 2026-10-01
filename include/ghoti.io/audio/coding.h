@@ -82,6 +82,18 @@ typedef enum {
    *  spelling for it, and a writer asked for one answers
    *  ::GAUD_ERR_UNSUPPORTED rather than inventing a compression type. */
   GAUD_CODING_ADPCM_MS,
+  /**
+   * FLAC, as RFC 9639 defines it.
+   *
+   * **The first coding here that is a codec rather than a sample
+   * representation**, and the first whose decoded format is not fixed: a
+   * FLAC stream is 8, 16, 24 or 32 bits and the track says which. It is a
+   * coding rather than only a codec name because the bitstream outlives
+   * its container - it is carried natively, in Ogg from phase 4, and in
+   * MP4 and Matroska later, and a caller asking "what is in this track"
+   * wants one answer for all four.
+   */
+  GAUD_CODING_FLAC,
   /** Closes the enum so a test can check the names. */
   GAUD_CODING_COUNT
 } GAUD_Sample_Coding;
@@ -107,14 +119,20 @@ GAUD_API bool gaud_sample_coding_is_pcm(GAUD_Sample_Coding coding);
  * @brief The ::GAUD_Sample_Format that @p coding decodes to and encodes
  *   from.
  *
- * ::GAUD_SAMPLE_S16 for all four coded values, which is not a simplification:
- * G.711 is defined onto a 14-bit (µ-law) or 13-bit (A-law) range that is
- * conventionally carried left-aligned in 16 bits, and both ADPCM families
- * predict in 16-bit signed arithmetic. There is no wider form to lose.
+ * ::GAUD_SAMPLE_S16 for G.711 and both ADPCM families, which is not a
+ * simplification: G.711 is defined onto a 14-bit (µ-law) or 13-bit (A-law)
+ * range that is conventionally carried left-aligned in 16 bits, and both
+ * ADPCM families predict in 16-bit signed arithmetic. There is no wider
+ * form to lose.
  *
- * For ::GAUD_CODING_PCM there is no single answer and this returns
- * ::GAUD_SAMPLE_FORMAT_COUNT, which is not a format. Callers ask this only
- * about a coded value.
+ * For ::GAUD_CODING_PCM **and ::GAUD_CODING_FLAC** there is no single
+ * answer and this returns ::GAUD_SAMPLE_FORMAT_COUNT, which is not a
+ * format. The two reach it from opposite directions - PCM is not coded at
+ * all, and FLAC is coded but carries its own bit depth - and in both cases
+ * the track is what to ask. Phase 4 is where this stopped being "every
+ * coded value answers S16"; a caller that had hard-coded that assumption
+ * would be wrong about FLAC, so the contract says it out loud rather than
+ * leaving the new value to surprise it.
  */
 GAUD_API GAUD_Sample_Format gaud_sample_coding_format(
     GAUD_Sample_Coding coding);

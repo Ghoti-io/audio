@@ -58,6 +58,16 @@ void gaud_diagnostics_init(
   if (!diagnostics) {
     return;
   }
+  // The whole struct, not only the allocator.
+  //
+  // This set the allocator and nothing else, and the header said so - so
+  // a caller had to zero the struct itself before calling a function
+  // named init. Every call site in the library happened to, and the first
+  // one that did not wrote through a pointer made of stack garbage on its
+  // first append. A function whose name says "initialise" and whose
+  // contract says "only if you already did" is a trap however carefully
+  // the contract is worded; the fix is to make the name true.
+  memset(diagnostics, 0, sizeof(*diagnostics));
   diagnostics->allocator = allocator;
 }
 

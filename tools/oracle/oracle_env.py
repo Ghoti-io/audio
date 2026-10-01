@@ -72,7 +72,39 @@ PROBE = {
     "libsndfile": (["libsndfile-version"], "libsndfile 1.2.2"),
     "pywave": (["pywave-version"], "Python 3.13.5 wave"),
     "mutagen": (["mutagen-version"], "mutagen 1.47.0"),
+    "flac": (["flac-version"], "flac 1.5.0"),
 }
+
+# Which implementation each reference actually answers a FLAC question with.
+#
+# **This is the one place the reference count is not the name count.** sox
+# loads libsox_fmt_flac, libsndfile links libFLAC, and `flac` is libFLAC's
+# own front end, so those three are one implementation asked three times: a
+# defect inside libFLAC is agreed to by all of them at once and reads as
+# corroboration. ffmpeg is separate - libavcodec has a native FLAC decoder
+# and has never had a libFLAC decoder wrapper. (`ldd /usr/bin/ffmpeg` does
+# list libFLAC, which is why this is written down rather than assumed: it
+# comes in through libavdevice -> libpulse -> libsndfile, an output-device
+# path the demuxer never enters.)
+#
+# A reference absent from this table answers with something of its own for
+# every format it reads, which is the ordinary case.
+FLAC_ENGINE = {
+    "ffmpeg": "ffmpeg-native",
+    "sox": "libFLAC",
+    "libsndfile": "libFLAC",
+    "flac": "libFLAC",
+}
+
+
+def distinct_engines(names, table=FLAC_ENGINE):
+    """How many independent implementations @p names really is.
+
+    Used by a gate to report "2 implementations (4 references)" rather than
+    "4 references", because the second sentence is a claim about corroboration
+    that the first does not make.
+    """
+    return sorted({table.get(name, name) for name in names})
 
 # The program each reference is invoked as, where it differs from the name.
 # libsndfile and wave are reached through python3 rather than being commands,

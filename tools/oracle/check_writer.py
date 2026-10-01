@@ -34,6 +34,7 @@ perfectly, and only something outside this library can see it.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,17 @@ CANNOT = {
     ("u8", "aiff"): "AIFF's 8-bit is signed; there is no unsigned spelling",
     ("s8", "wav"): "WAV's 8-bit is unsigned; there is no signed spelling",
 }
+# Phase 4. FLAC carries signed integers of 8, 16, 24 or 32 bits and
+# nothing else, so three of the corpus's formats have no spelling in it.
+# Named rather than skipped, for the reason the two above are: a refusal
+# that is not recorded is indistinguishable from a combination nobody
+# tried.
+for _container in ("flac", "ogg-flac"):
+    CANNOT[("u8", _container)] = (
+        "FLAC's 8-bit samples are signed; writing WAV's unsigned bytes "
+        "would move every sample by half the scale")
+    CANNOT[("f32", _container)] = "FLAC carries integers only"
+    CANNOT[("f64", _container)] = "FLAC carries integers only"
 
 # Phase 2: the coded writers, and planning/audio.md 11.3's two gates.
 #
@@ -143,12 +155,34 @@ def snr_db(want, got):
     return 10.0 * math.log10(power / error)
 
 
+def flac_verify(path, ogg):
+    """`flac -t`: does the file's own MD5 match what libFLAC decodes?
+
+    Returns a complaint, or None. **An all-zero signature is a failure
+    here, not a pass.** RFC 9639 allows one and `flac -t` then prints a
+    warning and exits zero, so a writer that stopped computing the digest
+    would silently turn this gate off - which is exactly the shape of
+    gate that reports success forever.
+    """
+    argv = ["flac", "-t", "--silent", "--warnings-as-errors"]
+    if ogg:
+        argv.append("--ogg")
+    argv.append(path)
+    finished = subprocess.run(oracle.command("flac", argv),
+                              capture_output=True)
+    if finished.returncode != 0:
+        message = (finished.stderr.decode() or finished.stdout.decode())
+        return "flac -t rejected it: %s" % " ".join(message.split())[:160]
+    return None
+
+
 def main():
-    print(oracle.provenance(["ffmpeg", "sox", "libsndfile", "pywave"]))
+    print(oracle.provenance(
+        ["ffmpeg", "sox", "libsndfile", "pywave", "flac"]))
     if not os.path.isfile(WRITE_PROBE):
         raise SystemExit("write_probe is not built: %s" % WRITE_PROBE)
     files = sorted(f for f in os.listdir(DATA)
-                   if f.endswith((".wav", ".aiff", ".aifc")))
+                   if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga")))
     if not files:
         raise SystemExit("tests/data is empty, so this gate measures nothing.")
 
@@ -162,6 +196,11 @@ def main():
     os.makedirs(scratch_root, exist_ok=True)
 
     bad, refused, pairs = [], [], 0
+    md5_checked = 0
+    # One of the FLAC files we write, kept for the control below. It has
+    # to be a file this encoder produced: the control exists to show that
+    # the check would catch OUR digest going missing.
+    md5_sample = None
     with tempfile.TemporaryDirectory(dir=scratch_root) as tmp:
         for name in files:
             source = os.path.join(DATA, name)
@@ -169,7 +208,8 @@ def main():
             fmt = meta["format"]
             original = corpus.ours_pcm(source)
 
-            for codec, ext in (("wav", "wav"), ("aiff", "aiff")):
+            for codec, ext in (("wav", "wav"), ("aiff", "aiff"),
+                               ("flac", "flac"), ("ogg-flac", "oga")):
                 if (fmt, codec) in CANNOT:
                     refused.append("  %-27s -> %-4s  refused: %s"
                                    % (name, codec, CANNOT[(fmt, codec)]))
@@ -194,10 +234,30 @@ def main():
                 for line in complaints:
                     bad.append("%s -> %s: %s" % (name, codec,
                                                  line.split(": ", 1)[-1]))
+                # **FLAC's own whole-decoder check, which no other format
+                # here offers.** STREAMINFO carries an MD5 of the
+                # unencoded audio; `flac -t` decodes the file and compares
+                # the digest. That scores every subframe type, every
+                # predictor order and every stereo mode at once against a
+                # number computed by a different implementation - and it
+                # is the thing that would catch an encoder whose output we
+                # also decode wrongly, which the comparisons above cannot.
+                verified = True
+                if codec in ("flac", "ogg-flac"):
+                    problem = flac_verify(out, codec == "ogg-flac")
+                    if problem:
+                        bad.append("%s -> %s: %s" % (name, codec, problem))
+                        verified = False
+                    else:
+                        md5_checked += 1
+                        if md5_sample is None and codec == "flac":
+                            md5_sample = os.path.join(
+                                scratch_root, "md5-sample.flac")
+                            shutil.copyfile(out, md5_sample)
                 pairs += 1
-                print("  %-27s -> %-4s  %s"
+                print("  %-27s -> %-8s  %s"
                       % (name, codec, "OK" if not complaints
-                         and back == original else "FAIL"))
+                         and back == original and verified else "FAIL"))
 
     # ---- the coded writers -------------------------------------------
     #
@@ -367,6 +427,39 @@ def main():
         print("\nRefused by design, and why:")
         for line in refused:
             print(line)
+
+    # The figure, with the instrument beside it. A count collected and not
+    # printed is one nobody can tell went to zero.
+    print("\n%d FLAC file(s) additionally verified by `flac -t "
+          "--warnings-as-errors`, which checks the STREAMINFO MD5 we wrote "
+          "against libFLAC's own decode." % md5_checked)
+    if md5_checked == 0:
+        bad.append("no FLAC file reached `flac -t`, so that half of this "
+                   "gate measured nothing")
+    else:
+        # **The control, and it is not optional.** Without
+        # --warnings-as-errors, `flac -t` prints "cannot check MD5
+        # signature since it was unset" and exits ZERO - so a writer that
+        # stopped computing the digest would turn this check off and the
+        # gate would keep reporting a pass. The control proves the flag is
+        # doing the work, by handing the reference a file whose digest has
+        # been zeroed and requiring a refusal.
+        probe = os.path.join(scratch_root, "md5-control.flac")
+        shutil.copyfile(md5_sample, probe)
+        with open(probe, "r+b") as handle:
+            # STREAMINFO's body starts at 8 and its last 16 bytes are the
+            # digest: four magic bytes, four of block header, eighteen of
+            # fields.
+            handle.seek(8 + 18)
+            handle.write(bytes(16))
+        if flac_verify(probe, False) is None:
+            bad.append("CONTROL FAILED: `flac -t` accepted a FLAC whose "
+                       "MD5 signature was zeroed, so this check is not "
+                       "measuring the digest")
+        else:
+            print("  control: a zeroed MD5 signature is rejected")
+        os.remove(probe)
+        os.remove(md5_sample)
 
     print("\n%d lossless round trips and %d coded ones through this "
           "library's writer, each read back by every reference that can."

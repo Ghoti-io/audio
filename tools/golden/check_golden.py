@@ -61,6 +61,8 @@ IMAGE = os.environ.get("GHOTI_XARCH_IMAGE", "localhost/ghoti-xarch:deb13")
 ENGINE = os.environ.get("GHOTI_CONTAINER_ENGINE", "docker")
 PROBE = os.path.join(ROOT, "build", "linux", "release", "apps", "oracle",
                      "dump_probe")
+WRITE_PROBE = os.path.join(ROOT, "build", "linux", "release", "apps",
+                           "oracle", "write_probe")
 
 # Every one of them big-endian, which is the axis that matters here. A
 # little-endian cross target would be a second copy of this host.
@@ -75,11 +77,38 @@ TARGETS = {
 def fixtures():
     data = os.path.join(ROOT, "tests", "data")
     return sorted(f for f in os.listdir(data)
-                  if f.endswith((".wav", ".aiff", ".aifc")))
+                  if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga")))
+
+
+# Fixtures that are also ENCODED on the target, and the file hashed.
+#
+# **The writer's half of section 11.1's promise, and the reason the FLAC
+# encoder has no floating point in it.** Decoding identically everywhere
+# is one claim; producing identical bytes everywhere is another, and
+# until phase 4 nothing tested it - WAV and AIFF writers copy samples
+# around, so there was little to differ. A FLAC encoder makes choices:
+# predictor orders, Rice parameters, partition orders, stereo modes. Made
+# in integers those choices are the same on every machine; made in
+# floating point they would not be, and the difference would be a file
+# that decodes correctly and hashes differently, which no other gate here
+# would see.
+#
+# A handful rather than all of them, because each one is a cross-compiled
+# encode under qemu and the gate already takes minutes. One per shape
+# that makes a different choice: mono and stereo (the decorrelation
+# search), a wide depth (the 64-bit accumulation), and silence (the
+# escaped-partition arm).
+ENCODE_FIXTURES = [
+    "wav_s16_stereo_44100.wav",
+    "wav_s24_stereo_48000.wav",
+    "aiff_s16_stereo_44100.aiff",
+    "flac_lib_silence_44100.flac",
+    "flac_lib_s32_stereo_96000.flac",
+]
 
 
 def host_hashes():
-    """What this machine decodes, per fixture."""
+    """What this machine decodes, and what it encodes, per fixture."""
     out = {}
     for name in fixtures():
         path = os.path.join(ROOT, "tests", "data", name)
@@ -87,7 +116,21 @@ def host_hashes():
                                   capture_output=True)
         if finished.returncode != 0:
             raise SystemExit("dump_probe failed on %s" % name)
-        out[name] = hashlib.sha256(finished.stdout).hexdigest()
+        out["decode " + name] = hashlib.sha256(finished.stdout).hexdigest()
+
+    scratch = os.path.join(ROOT, "tests", "out")
+    os.makedirs(scratch, exist_ok=True)
+    for name in ENCODE_FIXTURES:
+        source = os.path.join(ROOT, "tests", "data", name)
+        target = os.path.join(scratch, "golden-host.flac")
+        finished = subprocess.run([WRITE_PROBE, source, target, "flac"],
+                                  capture_output=True)
+        if finished.returncode != 0:
+            raise SystemExit("write_probe failed on %s:\n%s"
+                             % (name, finished.stderr.decode()[-600:]))
+        with open(target, "rb") as handle:
+            out["encode " + name] = hashlib.sha256(handle.read()).hexdigest()
+        os.remove(target)
     return out
 
 
@@ -97,30 +140,50 @@ def script(compiler, qemu, triple):
 set -e
 mkdir -p %(out)s
 cd %(root)s
+SRC="$(find src -name '*.c') %(md5)s %(shim)s"
 %(cc)s -std=c17 -O2 -w -fno-strict-aliasing \
     -I include -I src -I build/linux/release/generated -I %(cutil)s \
-    -o %(out)s/dump_probe \
-    $(find src -name '*.c') tools/oracle/dump_probe.c %(shim)s -lm
-for f in tests/data/*.wav tests/data/*.aiff tests/data/*.aifc; do
-    printf '%%s ' "$(basename "$f")"
+    -I %(security)s \
+    -o %(out)s/dump_probe $SRC tools/oracle/dump_probe.c -lm
+%(cc)s -std=c17 -O2 -w -fno-strict-aliasing \
+    -I include -I src -I build/linux/release/generated -I %(cutil)s \
+    -I %(security)s \
+    -o %(out)s/write_probe $SRC tools/oracle/write_probe.c -lm
+for f in tests/data/*.wav tests/data/*.aiff tests/data/*.aifc \
+         tests/data/*.flac tests/data/*.oga; do
+    printf 'decode %%s ' "$(basename "$f")"
     %(qemu)s -L /usr/%(triple)s %(out)s/dump_probe "$f" --pcm-le | sha256sum \
         | cut -d' ' -f1
 done
+for f in %(encode)s; do
+    printf 'encode %%s ' "$(basename "$f")"
+    %(qemu)s -L /usr/%(triple)s %(out)s/write_probe \
+        "tests/data/$(basename "$f")" %(out)s/out.flac flac >/dev/null
+    sha256sum %(out)s/out.flac | cut -d' ' -f1
+done
 """ % {"out": out, "root": ROOT, "cc": compiler, "qemu": qemu,
        "triple": triple, "shim": SHIM,
+       "encode": " ".join(ENCODE_FIXTURES),
+       "md5": os.path.join(WORKSPACE, "libs", "security", "src", "md5",
+                           "md5.c"),
        "cutil": os.path.join(WORKSPACE, ".local", "include", "ghoti.io",
-                             "cutil-0")}
+                             "cutil-0"),
+       "security": os.path.join(WORKSPACE, ".local", "include", "ghoti.io",
+                                "security-0")}
 
 
 def main():
-    if not os.path.isfile(PROBE):
-        raise SystemExit("dump_probe is not built. Run `make oracle-probe`.")
-    names = fixtures()
+    if not os.path.isfile(PROBE) or not os.path.isfile(WRITE_PROBE):
+        raise SystemExit(
+            "the oracle probes are not built. Run `make oracle-probe`.")
+    names = ["decode " + name for name in fixtures()]
+    names += ["encode " + name for name in ENCODE_FIXTURES]
     if not names:
         raise SystemExit("tests/data is empty, so this gate measures nothing.")
 
     host = host_hashes()
-    print("host (%s): %d fixtures decoded" % (os.uname().machine, len(host)))
+    print("host (%s): %d fixtures decoded, %d re-encoded"
+          % (os.uname().machine, len(fixtures()), len(ENCODE_FIXTURES)))
 
     wanted = sys.argv[1:] or list(TARGETS)
     bad = []
@@ -142,15 +205,15 @@ def main():
         seen = {}
         for line in finished.stdout.strip().splitlines():
             parts = line.split()
-            if len(parts) == 2:
-                seen[parts[0]] = parts[1]
+            if len(parts) == 3:
+                seen["%s %s" % (parts[0], parts[1])] = parts[2]
         if not seen:
             # A gate that compared nothing would report success.
             bad.append("%s: produced no hashes at all" % label)
             continue
         for name in names:
             if name not in seen:
-                bad.append("%s: %s was not decoded there" % (label, name))
+                bad.append("%s: %s did not happen there" % (label, name))
                 continue
             if seen[name] != host[name]:
                 bad.append("%s: %s differs - host %s, target %s"
@@ -163,8 +226,11 @@ def main():
         for line in bad:
             print("  " + line, file=sys.stderr)
         return 1
-    print("\n%d fixtures decode identically on %d big-endian targets and "
-          "here." % (len(names), len(wanted)))
+    print("\n%d fixtures decode identically on %d big-endian target(s) and "
+          "here, and %d re-encode to identical BYTES - which is section "
+          "11.1's promise applied to the writer, and what the FLAC "
+          "encoder's integer-only predictors are for."
+          % (len(fixtures()), len(wanted), len(ENCODE_FIXTURES)))
     return 0
 
 

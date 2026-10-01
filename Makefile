@@ -366,6 +366,36 @@ endif
 endif
 INCLUDE += $(COMPRESS_CFLAGS)
 
+# ghoti.io-security, for MD5. FLAC's STREAMINFO carries an MD5 of the
+# unencoded audio, and that one field is the reason this dependency exists.
+#
+# It is not a hash used as a hash here. It is a whole-decoder self-check the
+# format hands over for free: after decoding a file we can compute the digest
+# of what came out and compare it with what the encoder recorded, which scores
+# every subframe type, every predictor order and every stereo mode at once
+# against a number written by a different implementation. No test this library
+# could write covers as much. On the writing side it is mandatory in practice
+# rather than in the specification - RFC 9639 allows an all-zero signature, and
+# a file carrying one makes `flac -t` print that it cannot verify, which would
+# leave the plan's strongest gate (planning/audio.md 12, class 1) measuring
+# nothing.
+#
+# The alternative was a private MD5 in this library, and it was rejected: the
+# suite has a security library precisely so that nobody writes a second one,
+# and a second implementation is a second thing to get wrong in a place where
+# being wrong looks like a decoder defect. security is line 2 of
+# suite/libraries.txt and audio is line 14, so nothing about the build order
+# changes.
+SECURITY_PC ?= ghoti.io-security$(BRANCH)
+SECURITY_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(SECURITY_PC) 2>/dev/null)
+SECURITY_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(SECURITY_PC) 2>/dev/null)
+ifeq ($(strip $(SECURITY_CFLAGS)),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-security was not found by pkg-config. Run ./bootstrap.sh at the root of the workspace - two levels up, the directory holding libs/ - to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback, for the reason cutil's error above gives.)
+endif
+endif
+INCLUDE += $(SECURITY_CFLAGS)
+
 # ghoti.io-image, OPTIONALLY, and only to validate embedded cover art. This is
 # the one dependency whose absence is not an error: planning/audio.md 11.4
 # decided it, and `?image` in suite/libraries.txt is the same statement.
@@ -409,7 +439,7 @@ endif
 
 # One variable for "the libraries this links", so that a rule cannot pick up one
 # dependency and miss the other. Every link line below reads this.
-DEP_LIBS := $(CUTIL_LIBS) $(COMPRESS_LIBS) $(IMAGE_LIBS)
+DEP_LIBS := $(CUTIL_LIBS) $(COMPRESS_LIBS) $(SECURITY_LIBS) $(IMAGE_LIBS)
 
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')
@@ -702,13 +732,16 @@ $(TAG_PROBE): $(ORACLE)/tag_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 oracle-probe: ## Build the probes the differentials drive
 oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE)
 
-oracle-build: ## Build the pinned ffmpeg, sox, libsndfile, python3 and mutagen image
+oracle-build: ## Build the pinned ffmpeg, sox, libsndfile, python3, mutagen and flac image
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if none would
+# Every reference the gates use, not a subset: this target exists to answer
+# "is the oracle reachable", and a list that quietly omitted mutagen and
+# flac would answer yes while two of the gates could not run.
 	@python3 -c "import sys; sys.path.insert(0, '$(ORACLE)'); \
 import oracle_env as o; \
-print(o.provenance(['ffmpeg','sox','libsndfile','pywave']))"
+print(o.provenance(['ffmpeg','sox','libsndfile','pywave','mutagen','flac']))"
 
 corpus: ## Regenerate tests/data/ with the pinned references (deliberate)
 	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/make_corpus.py
@@ -803,6 +836,28 @@ check-golden: $(DUMP_PROBE)
 # Fixture hygiene
 ####################################################################
 
+flac-coverage: ## Which arms of the FLAC frame decoder the corpus reaches
+# Not in TEST_GATES, and not a pass/fail: it is a measurement, and what to
+# do about a zero is a judgement about the corpus rather than a defect.
+# Built into its own tree so that an ordinary build is never the
+# instrumented one - the counters are behind GAUD_FLAC_TRACE and compile to
+# nothing without it, but an object file that happened to carry them would
+# be a library that writes to stderr on exit.
+#
+# The figures this last produced, and what each fixture was added to reach,
+# are in notes/audio/flac-coverage.md in the workspace.
+flac-coverage:
+	@rm -rf build/flac-coverage && mkdir -p build/flac-coverage
+# The rpath, which an ordinary probe gets from the examples rule: without
+# it the binary builds and then cannot find cutil at run time, and the
+# symptom is "the probe produced no counters" - which reads like the
+# instrumentation being absent rather than the loader failing.
+	@$(CC) $(CFLAGS) -DGAUD_FLAC_TRACE=1 $(INCLUDE) \
+		-o build/flac-coverage/probe \
+		$(SOURCES) $(ORACLE)/dump_probe.c \
+		-Wl,-rpath,$(LIB_INSTALL_PATH)/$(SUITE) $(DEP_LIBS) -lm
+	@python3 tools/flac_coverage.py build/flac-coverage/probe
+
 check-fixtures: ## Fail if a test input is excluded from the repository
 # Needs git and nothing else, which is why it is in TEST_GATES rather than
 # behind a container. The failure it catches leaves `git status` clean and only
@@ -816,7 +871,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 # General commands
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-outoftree check-golden
-.PHONY: check-fixtures corpus check-corpus check-writer
+.PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
@@ -1434,7 +1489,7 @@ endef
 # decoders only through a header the fuzzer has to synthesise correctly
 # first, so nearly every input dies at the chunk walk and the nibble loops
 # see almost nothing. `coded` hands the bytes straight to the block layer.
-FUZZ_HARNESSES := wav aiff coded tags
+FUZZ_HARNESSES := wav aiff coded tags flac
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
@@ -1456,7 +1511,7 @@ LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
 # What goes in the .pc Requires: field. Built from the same variables the
 # compile uses, so a dependency on another branch cannot be named one way for
 # the build and another way for consumers.
-PC_REQUIRES := $(CUTIL_PC) $(COMPRESS_PC)$(if $(HAVE_IMAGE), $(IMAGE_PC),)
+PC_REQUIRES := $(CUTIL_PC) $(COMPRESS_PC) $(SECURITY_PC)$(if $(HAVE_IMAGE), $(IMAGE_PC),)
 
 # Where this project's own .pc file is installed.
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)

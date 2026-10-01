@@ -1,0 +1,4 @@
+#!/bin/sh
+# "flac <version>", from the first line of its banner, which it writes to
+# stderr and which continues with a copyright line on the same stream.
+flac --version 2>&1 | head -1 | awk '{print $1, $2}'

@@ -44,12 +44,15 @@ static const Coding_Row table[GAUD_CODING_COUNT] = {
     [GAUD_CODING_ADPCM_IMA_WAV] = {"ima-wav", GAUD_SAMPLE_S16},
     [GAUD_CODING_ADPCM_IMA_QT] = {"ima-qt", GAUD_SAMPLE_S16},
     [GAUD_CODING_ADPCM_MS] = {"ms-adpcm", GAUD_SAMPLE_S16},
+    /* FLAC's decoded format depends on the file's bit depth, so its row
+     * says "ask the track" the same way PCM's does. */
+    [GAUD_CODING_FLAC] = {"flac", GAUD_SAMPLE_FORMAT_COUNT},
 };
 
 /* A designated initialiser leaves an unmentioned row zeroed, and a zeroed
  * row's name is NULL rather than absent - so the count alone does not
  * prove the table is full. This is the assertion that does. */
-_Static_assert(GAUD_CODING_COUNT == 6,
+_Static_assert(GAUD_CODING_COUNT == 7,
     "a coding was added: give it a row in table[] and a case in the "
     "container that spells it");
 

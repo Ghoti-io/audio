@@ -301,9 +301,199 @@ def cycle_ms_predictors(path):
     open(path, "wb").write(bytes(data))
 
 
+# Phase 4's FLAC fixtures, and **two writers rather than one**.
+#
+# ffmpeg's FLAC encoder is native to libavcodec and the `flac` tool is
+# libFLAC's own, and they make different choices: different LPC orders,
+# different partition orders, different stereo decorrelations on the same
+# input. A decoder that had only ever met one of them has met an encoder's
+# habits rather than the format. This matters more for FLAC than for PCM,
+# where there is nothing to choose.
+#
+# The signals are chosen to reach subframe types a musical signal never
+# does. Four of the five arms of the subframe decoder - CONSTANT, VERBATIM,
+# FIXED and LPC - are selected by the encoder from the signal, so the only
+# way to exercise them from a corpus is to supply signals that force each.
+#
+#   name, writer, bits, channels, rate, frames, signal, extra flags
+FLAC_CASES = [
+    # ffmpeg's encoder, which is the independent implementation of the two.
+    ("flac_ff_s16_stereo_44100", "ffmpeg", 16, 2, 44100, 4409, "tone", []),
+    ("flac_ff_s24_stereo_48000", "ffmpeg", 24, 2, 48000, 2399, "tone", []),
+    # libFLAC, at both ends of its effort range. -0 picks fixed predictors
+    # and -8 picks LPC with an exhaustive search, so the two differ in which
+    # subframe type almost every block uses.
+    ("flac_lib0_s16_stereo_44100", "flac", 16, 2, 44100, 4409, "tone",
+     ["-0"]),
+    ("flac_lib8_s16_stereo_44100", "flac", 16, 2, 44100, 4409, "tone",
+     ["-8"]),
+    # -e is exhaustive model search, which is where libFLAC emits escaped
+    # Rice partitions: without it the escape arm of the residual reader is
+    # reached by nothing in this corpus.
+    ("flac_lib8e_s16_mono_44100", "flac", 16, 1, 44100, 3001, "tone",
+     ["-8", "-e"]),
+    ("flac_lib_s8_mono_8000", "flac", 8, 1, 8000, 2003, "tone", ["-5"]),
+    ("flac_lib_s32_stereo_96000", "flac", 32, 2, 96000, 1777, "tone", ["-5"]),
+    ("flac_lib_s16_5dot1_48000", "flac", 16, 6, 48000, 1499, "tone", ["-5"]),
+    # Silence: every subframe CONSTANT, which no musical fixture produces.
+    ("flac_lib_silence_44100", "flac", 16, 2, 44100, 2003, "silence",
+     ["-5"]),
+    # Full-scale noise: nothing predicts, so the encoder falls back to
+    # VERBATIM or a zero-order fixed predictor with large residuals.
+    ("flac_lib_noise_44100", "flac", 16, 1, 44100, 3001, "noise", ["-5"]),
+    # Every sample a multiple of 256, which is what 8-bit material carried
+    # in a 16-bit file looks like - and the only thing that exercises the
+    # wasted-bits path on either side.
+    ("flac_lib_wasted_44100", "flac", 16, 2, 44100, 2003, "wasted", ["-5"]),
+
+    # The six below are not "more coverage" in the vague sense. Each was
+    # added because an instrumented decode of the corpus above showed a
+    # named arm of the subframe reader that nothing reached, and each was
+    # kept only after the measurement showed it now does. The arms, and
+    # what forces them, are in notes/audio/flac-coverage.md.
+    #
+    # A square wave: long constant runs inside a block that is not
+    # constant, which is what makes libFLAC pick the first-order
+    # predictor and a deep partition order.
+    ("flac_lib_square_44100", "flac", 16, 1, 44100, 4409, "square",
+     ["-8", "-e"]),
+    # A sawtooth with LPC switched off, so the fixed orders compete
+    # against each other rather than all losing to LPC.
+    ("flac_lib_ramp_44100", "flac", 16, 1, 44100, 4409, "ramp",
+     ["-0", "--max-lpc-order=0"]),
+    # Noise so quiet that nothing predicts it: the zeroth-order fixed
+    # predictor, which predicts zero, is the one that wins.
+    ("flac_lib_tiny_44100", "flac", 16, 1, 44100, 4409, "tiny",
+     ["-0", "--max-lpc-order=0"]),
+    # The right channel plus a little independent noise in the left. The
+    # side is then cheap and the right is cheap and the left is not,
+    # which is the only arrangement that makes **side/right** the
+    # cheapest of the four channel assignments. A stereo corpus of
+    # ordinary music reaches independent, left/side and mid/side and
+    # never this one.
+    ("flac_lib_sideright_44100", "flac", 16, 2, 44100, 4409, "sideright",
+     ["-8"]),
+    # Seven closely spaced partials, and an exhaustive search up to order
+    # 32 - which is outside the FLAC Subset, hence --lax. Nothing at the
+    # default maximum of 12 reaches the top half of the coefficient loop.
+    ("flac_lib_rich_44100", "flac", 16, 1, 44100, 8819, "rich",
+     ["-8", "-e", "-l", "32", "--lax"]),
+    # A sample rate the frame header has no code for, so it is written as
+    # a 16-bit field at the end of the header. Every rate in the rest of
+    # the corpus is one of the twelve the format tabulates.
+    ("flac_lib_rate12345", "flac", 16, 1, 12345, 2003, "tone", ["-5"]),
+]
+
+# The same bitstream in Ogg, from both writers. The frame decoder is shared
+# with the native container, so what these score is the page layer: lacing,
+# the granule positions, and the mapping's first packet.
+FLAC_OGG_CASES = [
+    ("oggflac_ff_s16_stereo_44100", "ffmpeg", 16, 2, 44100, 4409, "tone"),
+    ("oggflac_lib_s16_stereo_44100", "flac", 16, 2, 44100, 4409, "tone"),
+    ("oggflac_lib_s24_mono_48000", "flac", 24, 1, 48000, 2399, "tone"),
+]
+
+SIGNALS = {
+    "tone": "0.6*sin(2*PI*%(f)d*t)+0.25*sin(2*PI*%(g)d*t)",
+    "silence": "0",
+    # Bipolar, and the `2*x-1` is the whole of why. ffmpeg's `random()`
+    # returns [0,1), so `0.98*random()` is a signal with a DC offset of
+    # half its amplitude - and the gate's DC check, which exists to catch
+    # a sign error in a decoder, correctly reported 0.49 on it. A fixture
+    # that forces a gate to be relaxed is a bad fixture, not a reason to
+    # relax the gate.
+    "noise": "0.98*(2*random(%(c)d)-1)",
+    # Quantised to 256, so every sample has eight low zero bits. The
+    # rounding has to happen in the signal rather than afterwards, because
+    # ffmpeg's own sample conversion would reintroduce the low bits.
+    "wasted": "floor(256*(0.5*sin(2*PI*%(f)d*t)))*0.0078125",
+    # No commas in any of these: ffmpeg's filtergraph splits its arguments
+    # on a comma before the expression parser ever sees it, so `mod(a,b)`
+    # silently becomes two filters. It is spelled out as
+    # `a-b*floor(a/b)` instead, which is the same function.
+    "square": "0.7*(2*floor(2*(t*50-floor(t*50)))-1)",
+    "ramp": "2*(t*20-floor(t*20))-1",
+    "tiny": "0.004*(2*random(%(c)d)-1)",
+    "sideright": "0.5*sin(2*PI*220*t)+0.02*(2*random(1)-1)"
+                 "|0.5*sin(2*PI*220*t)",
+    "rich": "0.15*(sin(2*PI*110*t)+sin(2*PI*113*t)+sin(2*PI*220*t)"
+            "+sin(2*PI*227*t)+sin(2*PI*331*t)+sin(2*PI*337*t)"
+            "+sin(2*PI*447*t))",
+}
+
+
+def raw_signal(path, signal, bits, channels, rate, frames):
+    """Write raw signed little-endian PCM for an encoder to read."""
+    duration = frames / float(rate)
+    if "|" in SIGNALS[signal]:
+        # An expression that already names every channel - the only way
+        # to make two channels that are deliberately related rather than
+        # independent, which is what the side/right case needs.
+        exprs = SIGNALS[signal]
+    else:
+        exprs = "|".join(
+            SIGNALS[signal] % {"c": i, "f": 220 * (i + 1), "g": 1330 + 97 * i}
+            for i in range(channels))
+    fmt = {8: "s8", 16: "s16le", 24: "s32le", 32: "s32le"}[bits]
+    argv = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi",
+        "-i", "aevalsrc=%s:s=%d:d=%.9f" % (exprs, rate, duration),
+        "-af", "atrim=end_sample=%d" % frames,
+        "-fflags", "+bitexact", "-flags:a", "+bitexact", "-map_metadata", "-1",
+        "-f", fmt, path,
+    ]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+    if bits == 24:
+        # ffmpeg has no packed 24-bit raw output, so the samples come out
+        # as 32-bit and the low byte is dropped here. Dropping the LOW byte
+        # and not the high one: a 24-bit sample is the top 24 bits of the
+        # 32-bit one ffmpeg produced, and taking the other three bytes
+        # would be a signal with a quarter of the amplitude and a sawtooth
+        # of noise on it.
+        with open(path, "rb") as handle:
+            wide = handle.read()
+        narrow = bytearray()
+        for i in range(0, len(wide), 4):
+            narrow += wide[i + 1:i + 4]
+        with open(path, "wb") as handle:
+            handle.write(bytes(narrow))
+
+
+def flac_make(path, writer, bits, channels, rate, frames, signal, flags,
+              ogg=False):
+    """One FLAC fixture, from whichever reference writes it."""
+    raw = path + ".raw"
+    raw_signal(raw, signal, bits, channels, rate, frames)
+    if writer == "flac":
+        argv = ["flac", "-s", "-f", "--force-raw-format", "--endian=little",
+                "--sign=signed", "--channels=%d" % channels,
+                "--bps=%d" % bits, "--sample-rate=%d" % rate,
+                "--no-padding", "--no-seektable"]
+        if ogg:
+            argv.append("--ogg")
+        argv += list(flags) + ["-o", path, raw]
+        run(oracle.command("flac", argv, scratch=DATA))
+    else:
+        fmt = {8: "s8", 16: "s16le", 24: "s24le", 32: "s32le"}[bits]
+        argv = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", fmt, "-ar", str(rate), "-ac", str(channels), "-i", raw,
+            "-c:a", "flac", "-bits_per_raw_sample", str(bits),
+            "-fflags", "+bitexact", "-flags:a", "+bitexact",
+            "-map_metadata", "-1",
+            "-f", "ogg" if ogg else "flac", path,
+        ]
+        if bits == 32:
+            argv[-3:-3] = ["-strict", "-2"]
+        run(oracle.command("ffmpeg", argv, scratch=DATA))
+    os.remove(raw)
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
-    print(oracle.provenance(["ffmpeg", "sox", "libsndfile", "pywave"]))
+    print(oracle.provenance(
+        ["ffmpeg", "sox", "libsndfile", "pywave", "flac"]))
 
     made = []
     for name, container, codec, channels, rate, frames in CASES:
@@ -370,6 +560,21 @@ def main():
     ], scratch=DATA))
     made.append(path)
     print("  %-26s %s" % ("sox_s16_stereo_44100", os.path.getsize(path)))
+
+    # FLAC, from both writers.
+    for name, writer, bits, channels, rate, frames, signal, flags \
+            in FLAC_CASES:
+        path = os.path.join(DATA, "%s.flac" % name)
+        flac_make(path, writer, bits, channels, rate, frames, signal, flags)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    for name, writer, bits, channels, rate, frames, signal in FLAC_OGG_CASES:
+        path = os.path.join(DATA, "%s.oga" % name)
+        flac_make(path, writer, bits, channels, rate, frames, signal, [],
+                  ogg=True)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
 
     print("%d fixtures in tests/data/" % len(made))
 

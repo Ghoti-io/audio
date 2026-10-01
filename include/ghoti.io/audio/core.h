@@ -104,7 +104,17 @@ typedef struct {
   const GAUD_Allocator * allocator; ///< NULL means the default.
 } GAUD_Diagnostics;
 
-/** @brief Set the allocator a diagnostics list will grow with. */
+/**
+ * @brief Empty a diagnostics list and set the allocator it will grow with.
+ *
+ * Writes every field, so it is safe on memory that has not been zeroed -
+ * which is the whole point of calling it rather than assigning `{0}`. It
+ * does **not** free anything: calling it on a list that already holds
+ * entries abandons them, so clear or destroy such a list first.
+ *
+ * @param diagnostics The list to empty. NULL is ignored.
+ * @param allocator NULL for the default.
+ */
 GAUD_API void gaud_diagnostics_init(
     GAUD_Diagnostics * diagnostics, const GAUD_Allocator * allocator);
 

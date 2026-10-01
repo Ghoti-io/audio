@@ -103,3 +103,32 @@ void gcu_allocator_free(const GCU_Allocator * allocator, void * ptr) {
   const GCU_Allocator * a = allocator ? allocator : &shim_allocator;
   a->free_fn(a->ctx, ptr);
 }
+
+/*
+ * security's gsec_wipe, for the cross-architecture build only.
+ *
+ * Phase 4 made `security` a dependency, for one function: FLAC's
+ * STREAMINFO carries an MD5 of the unencoded audio. That digest **is** on
+ * the path this gate measures - it goes into a file this library writes,
+ * and §11.1's promise covers what we write as well as what we read - so
+ * unlike cutil's allocator it cannot be stubbed with something that
+ * returns a plausible answer. The real md5.c is compiled for the target
+ * instead, and this is the one function it needs that lives elsewhere.
+ *
+ * Volatile through the pointer, so that a compiler cannot decide the
+ * stores are dead and remove them. That is the whole content of a secure
+ * wipe and the reason it is not a plain memset.
+ */
+
+#include <ghoti.io/security/secret.h>
+
+GSEC_Result gsec_wipe(void * p, size_t n) {
+  if (!p && n) {
+    return GSEC_ERR_INVALID;
+  }
+  volatile unsigned char * at = (volatile unsigned char *)p;
+  while (n--) {
+    *at++ = 0;
+  }
+  return GSEC_OK;
+}

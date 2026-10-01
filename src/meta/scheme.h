@@ -95,6 +95,17 @@ const char * gaud_id3v1_genre(unsigned index);
 /** @brief How many genre numbers gaud_id3v1_genre() knows. */
 unsigned gaud_id3v1_genre_count(void);
 
+/**
+ * @brief Map an APIC-registry picture type onto ::GAUD_Picture_Kind.
+ *
+ * Here rather than in the ID3 reader because FLAC's PICTURE block uses the
+ * same registry; see the definition in `id3_frames.c`.
+ */
+GAUD_Picture_Kind gaud_picture_kind_from_apic(unsigned type);
+
+/** @brief The APIC type number ::GAUD_Picture_Kind @p kind is written as. */
+unsigned gaud_picture_kind_to_apic(GAUD_Picture_Kind kind);
+
 /* ------------------------------------------------------- RIFF LIST INFO */
 
 /**
@@ -136,6 +147,45 @@ GAUD_Result gaud_riff_info_build(const GAUD_Meta * meta,
  */
 GAUD_Result gaud_bext_parse(const unsigned char * data, size_t size,
     GAUD_Meta * meta, GAUD_Diagnostics * diagnostics);
+
+/* -------------------------------------------------- Vorbis comment */
+
+/**
+ * @brief Parse a Vorbis comment block into @p meta.
+ *
+ * Here rather than under `src/codec/flac/` because FLAC's VORBIS_COMMENT
+ * block, Vorbis's comment header packet and Opus's `OpusTags` packet are
+ * byte-for-byte the same structure. Phase 6 adds the other two callers.
+ *
+ * @param data The block body: the vendor length onwards, with no framing
+ *   bit and no packet header.
+ * @param size How many bytes that is.
+ * @param limits Never NULL; caps how many comments are kept.
+ * @param meta Where the tags go. The **vendor string does not reach it**:
+ *   it names the software that wrote the file rather than anything about
+ *   the recording, and the writer replaces it, so a reader that collected
+ *   it would make the round trip gain a value per generation.
+ * @param diagnostics May be NULL.
+ * @return ::GAUD_ERR_CORRUPT when a length runs past the block, which is
+ *   what a reader that applied FLAC's big-endian order to these
+ *   little-endian fields would see on the very first one.
+ */
+GAUD_Result gaud_vorbis_comment_parse(const unsigned char * data, size_t size,
+    const GAUD_Limits * limits, GAUD_Meta * meta,
+    GAUD_Diagnostics * diagnostics);
+
+/**
+ * @brief Build a Vorbis comment block from @p meta.
+ *
+ * @param meta What to write.
+ * @param vendor The vendor string, or NULL for an empty one.
+ * @param allocator NULL for the default.
+ * @param out_data Receives an allocated block; the caller frees it.
+ * @param out_size Receives its length.
+ */
+GAUD_Result gaud_vorbis_comment_build(const GAUD_Meta * meta,
+    const char * vendor, const GAUD_Allocator * allocator,
+    unsigned char ** out_data, size_t * out_size);
 
 /* ------------------------------------------------- AIFF's text chunks */
 

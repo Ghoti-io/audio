@@ -113,6 +113,32 @@ TEST(Diagnostics, ZeroInitialisedListAccepts) {
   EXPECT_EQ(diagnostics.items, nullptr);
 }
 
+TEST(Diagnostics, InitLeavesTheListEmptyWhateverWasInTheMemory) {
+  // A function called init that required its caller to have zeroed the
+  // struct first is a trap, and this is the shape of falling into it: a
+  // stack local holds whatever the previous frame left, and a `count` and
+  // `capacity` of garbage with an `items` of garbage is a write through a
+  // wild pointer on the first append. Every call site in this library
+  // happened to zero the struct, so nothing caught it until a new one did
+  // not.
+  //
+  // Dirtied deliberately rather than left to chance: an uninitialised
+  // local is often zero, and a test that relied on it being otherwise
+  // would pass whether or not the fix was there.
+  GAUD_Diagnostics diagnostics;
+  memset(&diagnostics, 0xA5, sizeof(diagnostics));
+  gaud_diagnostics_init(&diagnostics, nullptr);
+  EXPECT_EQ(diagnostics.count, 0u);
+  EXPECT_EQ(diagnostics.capacity, 0u);
+  EXPECT_EQ(diagnostics.items, nullptr);
+
+  GAUD_Diagnostic entry = {};
+  entry.codec_name = "flac";
+  ASSERT_EQ(gaud_diagnostics_append(&diagnostics, &entry), GAUD_OK);
+  EXPECT_EQ(diagnostics.count, 1u);
+  gaud_diagnostics_destroy(&diagnostics);
+}
+
 TEST(Diagnostics, GrowsPastItsInitialCapacity) {
   // More entries than the first allocation holds, so that the realloc path
   // runs. A single append would leave it untested.

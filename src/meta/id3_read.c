@@ -377,20 +377,9 @@ static void read_picture(GAUD_Meta * meta, const GAUD_Allocator * allocator,
     gcu_allocator_free(allocator, description);
     return;
   }
-  /* ID3's picture type byte follows the same list as GAUD_Picture_Kind
-   * for the values that matter; anything past it is OTHER rather than a
-   * read past the enum. */
-  GAUD_Picture_Kind mapped = GAUD_PICTURE_OTHER;
-  switch (kind) {
-  case 3: mapped = GAUD_PICTURE_FRONT_COVER; break;
-  case 4: mapped = GAUD_PICTURE_BACK_COVER; break;
-  case 5: mapped = GAUD_PICTURE_LEAFLET; break;
-  case 6: mapped = GAUD_PICTURE_MEDIA; break;
-  case 8: mapped = GAUD_PICTURE_ARTIST; break;
-  case 1:
-  case 2: mapped = GAUD_PICTURE_ICON; break;
-  default: break;
-  }
+  /* The mapping is in id3_frames.c because FLAC's PICTURE block uses this
+   * same registry, and two copies of it would drift. */
+  GAUD_Picture_Kind mapped = gaud_picture_kind_from_apic(kind);
   /* APIC states no dimensions, so every picture from ID3 is
    * NOT_STATED - which planning/audio.md 11.4 keeps distinct from
    * "this build could not check". */

@@ -74,6 +74,17 @@ RAW = {
 }
 
 
+def container_of(name):
+    """Which container a fixture's name says it is in."""
+    if name.endswith(".wav"):
+        return "wav"
+    if name.endswith(".flac"):
+        return "flac"
+    if name.endswith((".oga", ".ogg")):
+        return "ogg-flac"
+    return "aiff"
+
+
 # Where a reference cannot answer, why, and what was measured to establish
 # it. **Named here rather than skipped quietly**: an exclusion that is not
 # written down is indistinguishable from a reference nobody thought to ask,
@@ -102,6 +113,33 @@ EXCLUSIONS = {
     # samples. sox reads mu-law in WAV perfectly well and cannot read the
     # same coding in AIFF-C, so a per-format key would have excluded it
     # from both or neither, and either answer is wrong.
+    # Phase 4. Each measured by running the reference on the fixture and
+    # keeping what it said, not by assuming what it supports - and sox's
+    # was checked three ways, because its first refusal was about the file
+    # extension and "no handler for `oga'" is not the same statement as
+    # "cannot read this format".
+    ("sox", "ogg-flac", "flac"): (
+        "sox has no Ogg FLAC reader. Measured three ways on "
+        "oggflac_lib_s16_stereo_44100: by extension, `no handler for file "
+        "extension `oga''; renamed to .ogg, `Input not an Ogg Vorbis audio "
+        "stream'; forced with -t flac, `FLAC ERROR whilst decoding "
+        "metadata'. Its Ogg handler is Vorbis-only and its FLAC handler "
+        "is native-container-only. It reads native FLAC, where it is "
+        "still scored."),
+    ("libsndfile", "ogg-flac", "flac"): (
+        "libsndfile 1.2.2 has no Ogg FLAC reader: `Error : unknown error "
+        "in flac decoder', measured on oggflac_lib_s16_stereo_44100 under "
+        "both extensions. It reads Ogg Vorbis and Ogg Opus, and native "
+        "FLAC, where it is still scored."),
+    ("libsndfile", "flac", "fmt", "s32"): (
+        "libsndfile 1.2.2 refuses 32-bit FLAC: `File contains data in an "
+        "unimplemented format', measured on flac_lib_s32_stereo_96000. "
+        "RFC 9639 allows 4 to 32 bits and libFLAC gained 32-bit support "
+        "in 1.4; libsndfile has not followed. sox, through the same "
+        "libFLAC, reads the file - so this is libsndfile's own limit and "
+        "not libFLAC's, and the fixture is still scored by sox, ffmpeg "
+        "and flac."),
+
     ("sox", "aiff", "ulaw"): (
         "sox refuses every AIFF-C compression type: `sox FAIL formats: "
         "can't open input file ...: Unsupported AIFC compression type "
@@ -257,6 +295,15 @@ def libsndfile_pcm(path, fmt):
                               ["python3", "-c", script, path])).stdout
 
 
+def flac_pcm(path, fmt):
+    """`flac -d` to raw, which is the format's own reference decode."""
+    _, _, width, _ = RAW[fmt]
+    argv = ["flac", "-d", "-s", "-f", "--force-raw-format",
+            "--endian=" + ("little" if HOST_LE else "big"),
+            "--sign=signed", "-o", "-", path]
+    return run(oracle.command("flac", argv)).stdout
+
+
 def pywave_pcm(path):
     script = (
         "import sys,wave;"
@@ -409,7 +456,29 @@ QUIET_FIXTURES = {
     "wav_imaadpcm_lsbnoise_8000.wav": (0.00052, 0.000191),
     "wav_imaadpcm_midnoise_8000.wav": (0.05371, 0.028858),
     "wav_imaadpcm_quietnoise_8000.wav": (0.00262, 0.001459),
+    # Phase 4. Quiet on purpose for the same kind of reason the ADPCM
+    # ones are, but about a different table: noise this far down is what
+    # makes libFLAC choose the ZEROTH-order fixed predictor, which
+    # predicts zero and so only wins when nothing predicts. No other
+    # fixture in the corpus reaches that arm.
+    "flac_lib_tiny_44100.flac": (0.003998, 0.002323),
 }
+# Fixtures that are SILENT on purpose, and why each one is here.
+#
+# Kept apart from QUIET_FIXTURES rather than folded in with a band of
+# zero, because the two say different things. A quiet fixture has a
+# measured level and the band asserts it; a silent one has no level to
+# assert and is in the corpus for a structural reason, which has to be
+# written down or the entry reads as the level check being switched off
+# for convenience. What still scores these files is the byte comparison
+# against every reference that can read them, and the frame count.
+SILENT_FIXTURES = {
+    "flac_lib_silence_44100.flac":
+        "Digital silence, so every subframe in it is CONSTANT - the one "
+        "subframe type a musical signal never selects. Nothing else in "
+        "the corpus reaches that arm of the decoder.",
+}
+
 # +/- 30%: wide enough that a regenerated fixture does not trip it,
 # narrow enough that the nearest interesting error (6 dB, a factor of two)
 # is outside it in both directions.
@@ -442,7 +511,7 @@ def classify_excess(coding, excess_frames):
 
 
 def compare(path, ours, quiet=False, excluded=None, scored=None,
-            pad_notes=None, as_name=None):
+            pad_notes=None, as_name=None, unstated=None):
     """Score one reading of one fixture. Returns a list of complaints.
 
     `ours` is passed in rather than read here so that the control can hand
@@ -455,6 +524,8 @@ def compare(path, ours, quiet=False, excluded=None, scored=None,
         scored = []
     if pad_notes is None:
         pad_notes = []
+    if unstated is None:
+        unstated = []
     name = os.path.basename(path)
     # A round trip's output is a temporary file, and the level band that
     # belongs to the fixture it came from has to follow it there or the
@@ -463,30 +534,49 @@ def compare(path, ours, quiet=False, excluded=None, scored=None,
     meta = ours_meta(path)
     fmt = meta["format"]
     coding = meta.get("coding", "pcm")
-    container = "wav" if name.endswith(".wav") else "aiff"
+    container = container_of(name)
     channels = int(meta["channels"])
     frames = int(meta["frames"])
     rate = int(meta["rate"])
 
     width = RAW[fmt][2]
-    expect_bytes = frames * channels * width
-    if len(ours) != expect_bytes:
-        bad.append("%s: decoded %d bytes, the header says %d frames means %d"
-                   % (name, len(ours), frames, expect_bytes))
+    # UINT64_MAX is gaud_track_frames()'s "the container did not say", and
+    # a FLAC stream written to a pipe says exactly that - ffmpeg's Ogg FLAC
+    # muxer leaves STREAMINFO's total-sample field zero because it does not
+    # know. **The frame count is still asserted wherever there is one**;
+    # what changes is that an unknown count is reported as unknown rather
+    # than multiplied out into a nonsense byte figure. The first draft did
+    # the multiplication and complained that 17,636 bytes was not
+    # 73,786,976,294,838,206,460.
+    stated_frames = frames != (1 << 64) - 1
+    if stated_frames:
+        expect_bytes = frames * channels * width
+        if len(ours) != expect_bytes:
+            bad.append(
+                "%s: decoded %d bytes, the header says %d frames means %d"
+                % (name, len(ours), frames, expect_bytes))
+    elif len(ours) % (channels * width) != 0:
+        bad.append("%s: decoded %d bytes, which is not a whole number of "
+                   "%d-channel %s frames" % (name, len(ours), channels, fmt))
+    else:
+        unstated.append(name)
 
     wanted = ["ffmpeg", "sox"]
     # libsndfile widens u8/s8 to int16 and s24 to int32, so for those its
     # bytes are a different width and cannot be compared directly.
     if fmt in ("s16", "s32", "f32", "f64"):
         wanted.append("libsndfile")
-    if name.endswith(".wav"):
+    if container == "wav":
         wanted.append("pywave")
+    if container in ("flac", "ogg-flac"):
+        wanted.append("flac")
 
     getters = {
         "ffmpeg": lambda: ffmpeg_pcm(path, fmt),
         "sox": lambda: sox_pcm(path, fmt, channels, rate),
         "libsndfile": lambda: libsndfile_pcm(path, fmt),
         "pywave": lambda: pywave_pcm(path),
+        "flac": lambda: flac_pcm(path, fmt),
     }
     refs = {}
     for ref in wanted:
@@ -495,6 +585,11 @@ def compare(path, ours, quiet=False, excluded=None, scored=None,
             key = (ref, name)
         elif (ref, container, coding) in EXCLUSIONS:
             key = (ref, container, coding)
+        elif (ref, container, "fmt", fmt) in EXCLUSIONS:
+            # A reference that reads the container but not that width.
+            # Keyed on both because the same width is fine elsewhere:
+            # libsndfile reads 32-bit WAV and refuses 32-bit FLAC.
+            key = (ref, container, "fmt", fmt)
         elif (ref, fmt) in EXCLUSIONS:
             key = (ref, fmt)
         if key:
@@ -546,6 +641,12 @@ def compare(path, ours, quiet=False, excluded=None, scored=None,
     # reference looks small - which is the case a threshold scaled to the
     # signal forgives.
     stats = measure(ours, fmt, channels)
+    if level_name in SILENT_FIXTURES:
+        # The level checks have nothing to say about a file that is
+        # silence by construction. Everything else about it is still
+        # scored: the byte comparison, the frame count, and the CRC of
+        # every frame inside the decoder.
+        return bad
     band = QUIET_FIXTURES.get(level_name)
     for index, (peak, rms, dc) in enumerate(stats):
         if band:
@@ -580,21 +681,22 @@ def compare(path, ours, quiet=False, excluded=None, scored=None,
 
 
 def check(path, quiet=False, excluded=None, scored=None, pad_notes=None,
-          as_name=None):
+          as_name=None, unstated=None):
     return compare(path, ours_pcm(path), quiet, excluded, scored, pad_notes,
-                   as_name)
+                   as_name, unstated)
 
 
 def main():
     args = sys.argv[1:]
     self_check = "--self-check" in args
-    print(oracle.provenance(["ffmpeg", "sox", "libsndfile", "pywave"]))
+    print(oracle.provenance(
+        ["ffmpeg", "sox", "libsndfile", "pywave", "flac"]))
 
     if not os.path.isfile(PROBE):
         raise SystemExit(
             "dump_probe is not built: %s\nRun `make oracle-probe`." % PROBE)
     files = sorted(f for f in os.listdir(DATA)
-                   if f.endswith((".wav", ".aiff", ".aifc")))
+                   if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga")))
     if not files:
         raise SystemExit("tests/data is empty, so this gate is measuring "
                          "nothing. Run `make corpus`.")
@@ -603,9 +705,10 @@ def main():
     excluded = set()
     scored = []
     pad_notes = []
+    unstated = []
     for f in files:
         bad += check(os.path.join(DATA, f), excluded=excluded, scored=scored,
-                     pad_notes=pad_notes)
+                     pad_notes=pad_notes, unstated=unstated)
 
     if self_check:
         # The control, and the first draft of it was wrong in a way worth
@@ -717,6 +820,31 @@ def main():
     total = sum(len(refs) for _, refs in scored)
     print("\n%d fixtures, %d fixture-reference comparisons." % (len(files),
                                                                 total))
+
+    # **For FLAC the reference count overstates the corroboration, and
+    # saying so is the point of this block.** sox loads libsox_fmt_flac,
+    # libsndfile links libFLAC, and the `flac` tool is libFLAC's front
+    # end: three of the four names are one implementation asked three
+    # times, and a defect inside libFLAC would be agreed to by all of them
+    # at once. ffmpeg is the one that is separate. Reporting "4 references
+    # agreed" without this would be a claim about independence that the
+    # image does not support.
+    flac_fixtures = [(name, refs) for name, refs in scored
+                     if container_of(name) in ("flac", "ogg-flac")]
+    if flac_fixtures:
+        names = sorted({ref for _, refs in flac_fixtures for ref in refs})
+        engines = oracle.distinct_engines(names)
+        print("  Of those, %d are FLAC, scored by %d reference(s) that are "
+              "%d independent implementation(s): %s."
+              % (len(flac_fixtures), len(names), len(engines),
+                 ", ".join(engines)))
+    if unstated:
+        print("\n%d fixture(s) state no frame count, so the count could "
+              "not be asserted for them - the byte comparison still was:"
+              % len(unstated))
+        for name in sorted(unstated):
+            print("  %s" % name)
+
     if excluded:
         print("\nExcluded, with the reason each was established by:")
         for key in sorted(excluded):

@@ -30,4 +30,6 @@
 void gaud_register_builtin_codecs(void) {
   gaud_wav_register();
   gaud_aiff_register();
+  gaud_flac_register();
+  gaud_ogg_flac_register();
 }

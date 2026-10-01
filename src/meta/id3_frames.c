@@ -108,3 +108,56 @@ const char * gaud_id3_tag_frame(GAUD_Tag tag) {
   }
   return NULL;
 }
+
+/**
+ * @brief Map an APIC-registry picture type onto ::GAUD_Picture_Kind.
+ *
+ * **Shared with FLAC on purpose.** RFC 9639's PICTURE block does not have
+ * a numbering of its own - it adopts ID3v2's APIC table wholesale, down to
+ * the value for "a fish" - so a second copy of this switch in the FLAC
+ * reader would be one mapping in two places, drifting the first time
+ * either is touched. The vocabulary this maps onto is deliberately
+ * coarser than the registry: twenty-one kinds, most of them unused by any
+ * real tagger, would be twenty-one cases every caller had to handle.
+ */
+GAUD_Picture_Kind gaud_picture_kind_from_apic(unsigned type) {
+  switch (type) {
+  case 1:
+  case 2:
+    return GAUD_PICTURE_ICON;
+  case 3:
+    return GAUD_PICTURE_FRONT_COVER;
+  case 4:
+    return GAUD_PICTURE_BACK_COVER;
+  case 5:
+    return GAUD_PICTURE_LEAFLET;
+  case 6:
+    return GAUD_PICTURE_MEDIA;
+  case 8:
+    return GAUD_PICTURE_ARTIST;
+  default:
+    return GAUD_PICTURE_OTHER;
+  }
+}
+
+/** @brief The APIC type number ::GAUD_Picture_Kind @p kind is written as. */
+unsigned gaud_picture_kind_to_apic(GAUD_Picture_Kind kind) {
+  switch (kind) {
+  case GAUD_PICTURE_ICON:
+    return 1u;
+  case GAUD_PICTURE_FRONT_COVER:
+    return 3u;
+  case GAUD_PICTURE_BACK_COVER:
+    return 4u;
+  case GAUD_PICTURE_LEAFLET:
+    return 5u;
+  case GAUD_PICTURE_MEDIA:
+    return 6u;
+  case GAUD_PICTURE_ARTIST:
+    return 8u;
+  case GAUD_PICTURE_OTHER:
+  case GAUD_PICTURE_KIND_COUNT:
+  default:
+    return 0;
+  }
+}

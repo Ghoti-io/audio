@@ -28,6 +28,14 @@
 #     alone would be asking one implementation whether it agrees with
 #     itself. A misunderstanding held in both its writer and its reader is
 #     invisible to that. mutagen shares no code with it.
+#   - For flac it is the reference implementation's own version, and it is
+#     the one pin here that covers three of the lines below. sox reaches
+#     FLAC through libsox_fmt_flac, libsndfile links libFLAC, and `flac`
+#     is libFLAC's front end - so **for FLAC there are two implementations
+#     in this image, not five**: ffmpeg's native decoder, and libFLAC
+#     answering three times. libflac14 is pinned in the Containerfile for
+#     that reason. Do not read "three references agree about a FLAC file"
+#     as corroboration; check_corpus.py groups them.
 #   - For pywave it is the interpreter version, because `wave` is a stdlib
 #     module with no version of its own and its behaviour has changed
 #     between releases. Note what that same release took away: **Python 3.13
@@ -46,10 +54,11 @@ sox	localhost/ghoti-audio-oracle-refs:deb13	SoX 14.4.2	A separate lineage from f
 libsndfile	localhost/ghoti-audio-oracle-refs:deb13	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
 pywave	localhost/ghoti-audio-oracle-refs:deb13	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
 mutagen	localhost/ghoti-audio-oracle-refs:deb13	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
+flac	localhost/ghoti-audio-oracle-refs:deb13	flac 1.5.0	The format's own reference implementation. `flac -t` verifies a file's STREAMINFO MD5, which scores the whole decoder at once; libFLAC underneath is also what sox and libsndfile answer FLAC questions with
 
 # Not here yet:
 #   afconvert  Apple's own, and the reference that decides what AIFF-C really
 #              means. It is macOS-only, so it cannot live in this image; when
 #              something turns on a disagreement about AIFF-C it will have to
 #              be run by hand and its answer committed.
-#   flac/opusdec  Phase 4 and phase 6 bring the codecs they answer about.
+#   opusdec    Phase 6 brings the codec it answers about.
