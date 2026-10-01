@@ -89,10 +89,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   GAUD_Result meta_result
       = gaud_meta_create(gaud_stream_allocator(stream), &pending_meta);
   if (meta_result != GAUD_OK) {
-    {
-      failure = meta_result;
-      goto Fail;
-    }
+    failure = meta_result;
+    goto Fail;
   }
 
   uint32_t channels = 0;
@@ -115,10 +113,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   uint32_t depth = 0;
   for (;;) {
     if (++depth > limits->max_nesting_depth) {
-      {
       failure = GAUD_ERR_LIMIT;
       goto Fail;
-    }
     }
     unsigned char chunk[CHUNK_HEADER];
     uint64_t chunk_at = gaud_stream_tell(stream);
@@ -143,10 +139,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       unsigned char comm[22];
       size_t want = size < sizeof(comm) ? (size_t)size : sizeof(comm);
       if (gaud_stream_read(stream, comm, want) != want) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
       channels = gaud_rd_u16be(comm);
       frames_stated = gaud_rd_u32be(comm + 2);
@@ -188,10 +182,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
           /* Refused by name rather than decoded as PCM. An AIFF-C in a
            * compression this does not implement, read as though it were
            * PCM, produces loud noise - a worse answer than saying no. */
-          {
-      failure = GAUD_ERR_UNSUPPORTED;
-      goto Fail;
-    }
+          failure = GAUD_ERR_UNSUPPORTED;
+          goto Fail;
         }
       }
       have_comm = true;
@@ -199,10 +191,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       if (size > want
           && gaud_stream_seek(stream, (int64_t)(size - want), GAUD_SEEK_CUR)
               != GAUD_OK) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
     }
     else if (id_is(chunk, "SSND")) {
@@ -213,10 +203,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       if (size < sizeof(preamble)
           || gaud_stream_read(stream, preamble, sizeof(preamble))
               != sizeof(preamble)) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
       uint32_t offset = gaud_rd_u32be(preamble);
       data_offset = gaud_stream_tell(stream) + offset;
@@ -241,26 +229,20 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
         || gaud_aiff_text_tag((const char *)chunk, &(GAUD_Tag){0})) {
       if (size > limits->max_element_size
           || size > limits->max_metadata_bytes) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
       if (size > 0) {
         unsigned char * block
             = gcu_allocator_malloc(gaud_stream_allocator(stream), size);
         if (!block) {
-          {
-      failure = GAUD_ERR_OOM;
-      goto Fail;
-    }
+          failure = GAUD_ERR_OOM;
+          goto Fail;
         }
         if (gaud_stream_read(stream, block, (size_t)size) != (size_t)size) {
           gcu_allocator_free(gaud_stream_allocator(stream), block);
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
         GAUD_Tag tag;
         if (gaud_aiff_text_tag((const char *)chunk, &tag)) {
@@ -294,10 +276,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     }
     else {
       if (size > limits->max_element_size) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
       uint64_t advance = size + (size & 1u);
       if (!gaud_stream_seekable(stream)
@@ -309,28 +289,20 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   }
 
   if (!have_comm || !have_ssnd) {
-    {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_CORRUPT;
+    goto Fail;
   }
   if (channels == 0 || !(rate > 0.0)) {
-    {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_CORRUPT;
+    goto Fail;
   }
   if (channels > limits->max_channels) {
-    {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_LIMIT;
+    goto Fail;
   }
   if (rate > (double)limits->max_sample_rate) {
-    {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_LIMIT;
+    goto Fail;
   }
 
   GAUD_Sample_Format format;
@@ -345,10 +317,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       format = GAUD_SAMPLE_F64;
     }
     else {
-      {
       failure = GAUD_ERR_UNSUPPORTED;
       goto Fail;
-    }
     }
   }
   else {
@@ -371,10 +341,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   if (coding == GAUD_CODING_PCM) {
     frame_size = gaud_frame_size(format, channels);
     if (frame_size == 0) {
-      {
       failure = GAUD_ERR_CORRUPT;
       goto Fail;
-    }
     }
     uint64_t frames_present = data_length / frame_size;
     /* COMM states the frame count and SSND carries the bytes. Where they
@@ -393,10 +361,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     GAUD_Result result
         = gaud_coded_geometry(coding, channels, 0, 0, &geometry);
     if (result != GAUD_OK) {
-      {
       failure = result;
       goto Fail;
-    }
     }
     uint64_t whole = data_length / geometry.block_bytes;
     uint64_t tail = data_length % geometry.block_bytes;
@@ -427,10 +393,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     }
   }
   if (frames > limits->max_frames) {
-    {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_LIMIT;
+    goto Fail;
   }
 
   const GAUD_Allocator * allocator = gaud_stream_allocator(stream);
@@ -438,20 +402,16 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   GAUD_Result result
       = gaud_doc_create_internal(codec, stream, allocator, &doc);
   if (result != GAUD_OK) {
-    {
-      failure = result;
-      goto Fail;
-    }
+    failure = result;
+    goto Fail;
   }
 
   AIFF_Track_State * state
       = gcu_allocator_malloc(allocator, sizeof(AIFF_Track_State));
   if (!state) {
     gaud_doc_destroy(doc);
-    {
-      failure = GAUD_ERR_OOM;
-      goto Fail;
-    }
+    failure = GAUD_ERR_OOM;
+    goto Fail;
   }
   /* The file is big-endian unless a `sowt`-style compression type said
    * otherwise, so whether a swap is needed depends on both. */
@@ -491,10 +451,8 @@ GAUD_Result gaud_aiff_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   if (result != GAUD_OK) {
     gcu_allocator_free(allocator, state);
     gaud_doc_destroy(doc);
-    {
-      failure = result;
-      goto Fail;
-    }
+    failure = result;
+    goto Fail;
   }
   gaud_doc_take_meta(doc, pending_meta);
   gaud_meta_verify_pictures(gaud_doc_meta(doc));

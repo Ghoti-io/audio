@@ -137,10 +137,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   GAUD_Result meta_result
       = gaud_meta_create(gaud_stream_allocator(stream), &pending_meta);
   if (meta_result != GAUD_OK) {
-    {
-      failure = meta_result;
-      goto Fail;
-    }
+    failure = meta_result;
+    goto Fail;
   }
 
   /* Filled from ds64 when present. A plain RIFF file leaves them at
@@ -175,10 +173,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   uint32_t depth = 0;
   for (;;) {
     if (++depth > limits->max_nesting_depth) {
-      {
       failure = GAUD_ERR_LIMIT;
       goto Fail;
-    }
     }
     unsigned char chunk[CHUNK_HEADER];
     uint64_t chunk_at = gaud_stream_tell(stream);
@@ -200,10 +196,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       unsigned char ds64[28];
       if (size < sizeof(ds64)
           || gaud_stream_read(stream, ds64, sizeof(ds64)) != sizeof(ds64)) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
       ds64_data_size = gaud_rd_u64le(ds64 + 8);
       /* Skip whatever else the chunk carried: a table of sizes for other
@@ -213,10 +207,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
           && gaud_stream_seek(stream, (int64_t)(size - consumed),
                  GAUD_SEEK_CUR)
               != GAUD_OK) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
     }
     else if (id_is(chunk, "fmt ")) {
@@ -237,10 +229,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
           "the fmt buffer must still cover WAVE_FORMAT_EXTENSIBLE");
       size_t want = size < sizeof(fmt) ? (size_t)size : sizeof(fmt);
       if (gaud_stream_read(stream, fmt, want) != want) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
       uint16_t tag = gaud_rd_u16le(fmt);
       uint16_t channels = gaud_rd_u16le(fmt + 2);
@@ -249,32 +239,24 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       bits = gaud_rd_u16le(fmt + 14);
 
       if (channels == 0 || sample_rate == 0) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
       if (channels > limits->max_channels) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
       if (sample_rate > limits->max_sample_rate) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
 
       layout = gaud_channel_layout_unspecified(channels);
 
       if (tag == WAV_FORMAT_EXTENSIBLE) {
         if (want < 40) {
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
         /* The extension carries the channel mask - the one place any of
          * these containers states which speaker each channel is for - and
@@ -282,10 +264,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
         uint32_t mask = gaud_rd_u32le(fmt + 20);
         uint16_t real_tag = gaud_rd_u16le(fmt + 24);
         if (memcmp(fmt + 26, ext_guid_suffix, sizeof(ext_guid_suffix)) != 0) {
-          {
-      failure = GAUD_ERR_UNSUPPORTED;
-      goto Fail;
-    }
+          failure = GAUD_ERR_UNSUPPORTED;
+          goto Fail;
         }
         tag = real_tag;
         if (mask != 0) {
@@ -318,35 +298,27 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
         if (coding == GAUD_CODING_ADPCM_IMA_WAV
             || coding == GAUD_CODING_ADPCM_MS) {
           if (want < 20) {
-            {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+            failure = GAUD_ERR_CORRUPT;
+            goto Fail;
           }
           stated_block_frames = gaud_rd_u16le(fmt + 18);
         }
         if (coding == GAUD_CODING_ADPCM_MS) {
           if (want < 22) {
-            {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+            failure = GAUD_ERR_CORRUPT;
+            goto Fail;
           }
           coef_count = gaud_rd_u16le(fmt + 20);
           if (coef_count == 0 || coef_count > GAUD_MS_MAX_COEF) {
-            {
-      failure = GAUD_ERR_UNSUPPORTED;
-      goto Fail;
-    }
+            failure = GAUD_ERR_UNSUPPORTED;
+            goto Fail;
           }
           if (want < 22u + 4u * (size_t)coef_count) {
             /* The header promises a table it did not carry. Falling back
              * to the standard seven would decode most files and produce
              * noise for the ones that meant it, so it is refused. */
-            {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+            failure = GAUD_ERR_CORRUPT;
+            goto Fail;
           }
           for (uint16_t i = 0; i < coef_count; ++i) {
             coef[2u * i] = (int16_t)gaud_rd_u16le(fmt + 22u + 4u * i);
@@ -358,10 +330,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       else {
         GAUD_Result result = format_for(tag, bits, &format);
         if (result != GAUD_OK) {
-          {
-      failure = result;
-      goto Fail;
-    }
+          failure = result;
+          goto Fail;
         }
       }
       have_fmt = true;
@@ -369,10 +339,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       if (size > want
           && gaud_stream_seek(stream, (int64_t)(size - want), GAUD_SEEK_CUR)
               != GAUD_OK) {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
     }
     else if (id_is(chunk, "LIST") || id_is(chunk, "id3 ")
@@ -386,26 +354,20 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
        * what goes out. */
       if (size > limits->max_element_size
           || size > limits->max_metadata_bytes) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
       if (size > 0) {
         unsigned char * block
             = gcu_allocator_malloc(gaud_stream_allocator(stream), size);
         if (!block) {
-          {
-      failure = GAUD_ERR_OOM;
-      goto Fail;
-    }
+          failure = GAUD_ERR_OOM;
+          goto Fail;
         }
         if (gaud_stream_read(stream, block, (size_t)size) != (size_t)size) {
           gcu_allocator_free(gaud_stream_allocator(stream), block);
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
         if (id_is(chunk, "LIST")) {
           /* A LIST may be any type; only INFO is metadata. An `adtl`
@@ -455,24 +417,18 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
             && gaud_stream_seek(stream, (int64_t)(rest + (size & 1u)),
                    GAUD_SEEK_CUR)
                 != GAUD_OK) {
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
         if (rest == 0 && (size & 1u)
             && gaud_stream_seek(stream, 1, GAUD_SEEK_CUR) != GAUD_OK) {
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
       }
       else {
-        {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_CORRUPT;
+        goto Fail;
       }
     }
     else if (id_is(chunk, "data")) {
@@ -482,10 +438,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
        * enormous. */
       if (rf64 && size == 0xFFFFFFFFu) {
         if (ds64_data_size == UINT64_MAX) {
-          {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+          failure = GAUD_ERR_CORRUPT;
+          goto Fail;
         }
         data_length = ds64_data_size;
       }
@@ -518,10 +472,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     }
     else {
       if (size > limits->max_element_size) {
-        {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+        failure = GAUD_ERR_LIMIT;
+        goto Fail;
       }
       uint64_t advance = size + (size & 1u);
       if (!gaud_stream_seekable(stream)
@@ -533,10 +485,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   }
 
   if (!have_fmt || !have_data) {
-    {
-      failure = GAUD_ERR_CORRUPT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_CORRUPT;
+    goto Fail;
   }
 
   size_t frame_size = 0;
@@ -544,10 +494,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   if (coding == GAUD_CODING_PCM) {
     frame_size = gaud_frame_size(format, layout.channels);
     if (frame_size == 0) {
-      {
       failure = GAUD_ERR_CORRUPT;
       goto Fail;
-    }
     }
     frames = data_length / frame_size;
   }
@@ -555,10 +503,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     GAUD_Result result = gaud_coded_geometry(
         coding, layout.channels, block_align, stated_block_frames, &geometry);
     if (result != GAUD_OK) {
-      {
       failure = result;
       goto Fail;
-    }
     }
     if (coef_count > 0) {
       memcpy(geometry.coef, coef, 2u * (size_t)coef_count * sizeof(int16_t));
@@ -602,30 +548,24 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
     }
   }
   if (frames > limits->max_frames) {
-    {
-      failure = GAUD_ERR_LIMIT;
-      goto Fail;
-    }
+    failure = GAUD_ERR_LIMIT;
+    goto Fail;
   }
 
   GAUD_Doc * doc = NULL;
   GAUD_Result result = gaud_doc_create_internal(
       codec, stream, gaud_stream_allocator(stream), &doc);
   if (result != GAUD_OK) {
-    {
-      failure = result;
-      goto Fail;
-    }
+    failure = result;
+    goto Fail;
   }
 
   WAV_Track_State * state = gcu_allocator_malloc(
       gaud_stream_allocator(stream), sizeof(WAV_Track_State));
   if (!state) {
     gaud_doc_destroy(doc);
-    {
-      failure = GAUD_ERR_OOM;
-      goto Fail;
-    }
+    failure = GAUD_ERR_OOM;
+    goto Fail;
   }
   /* For a coded track the bytes are the container's blocks, not
    * frames * frame_size, and truncating to the frame count would cut the
@@ -664,10 +604,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
   if (result != GAUD_OK) {
     gcu_allocator_free(gaud_stream_allocator(stream), state);
     gaud_doc_destroy(doc);
-    {
-      failure = result;
-      goto Fail;
-    }
+    failure = result;
+    goto Fail;
   }
 
   /* The document owns the metadata from here, so the failure path below
