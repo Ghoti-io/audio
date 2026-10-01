@@ -228,18 +228,40 @@ static GAUD_Result decoder_read(GAUD_Decoder * decoder, GAUD_Buffer * buffer) {
 }
 
 /**
- * Seek by rewinding to the first audio page and decoding forward.
+ * Position at a page boundary, with @p granule samples already behind it.
  *
- * **Linear, and knowingly so.** Ogg is designed to be bisected - the
- * granule positions are monotonic and a page boundary can be found by
- * scanning for `OggS` - and a bisection would turn this from time
- * proportional to the seek target into time proportional to the logarithm
- * of the file. What it would also do is introduce a search that is subtly
- * wrong near the ends and on files with a false `OggS` in a page body, and
- * that is the kind of defect that shows up as "seeking is occasionally off
- * by a frame" years later. The linear version is correct now; the
- * bisection belongs with phase 6, where Vorbis and Opus will want it too
- * and it can be written once against three codecs' worth of fixtures.
+ * ::gaud_ogg_reader_seek() drops a packet continued from before the
+ * landing page, so the first packet this yields is whole - which is the
+ * one thing a mid-stream landing has to get right and the one thing that
+ * cannot be noticed by looking at the decoded audio, because the tail of
+ * a FLAC frame decodes to *something*.
+ */
+static GAUD_Result seek_to_page(
+    OGG_FLAC_Decoder * state, uint64_t offset, uint64_t granule) {
+  state->position = granule;
+  state->frame_live = false;
+  state->frame_used = 0;
+  return gaud_ogg_reader_seek(&state->reader, offset);
+}
+
+/**
+ * Seek by bisecting the file to a page, then decoding forward from it.
+ *
+ * **Phase 4 wrote this linearly and said why**, which is worth repeating
+ * because the reasons have been answered rather than withdrawn: a
+ * bisection can be subtly wrong near the ends of a file, and a scan for
+ * `OggS` can find a page that is not there. Both now have an owner.
+ * src/container/ogg/ogg_seek.c identifies a page by its checksum and not
+ * by its magic, so a false `OggS` costs a read and nothing else; and its
+ * bisection returns the first audio page when it finds nothing better, so
+ * the end that is easy to get wrong has one answer rather than a special
+ * case. The remaining risk is in the forward decode from the landing page,
+ * which is the same code that ran for every seek before this change.
+ *
+ * What is gained is not speed here - these fixtures are small - but that
+ * the search exists once, for three codecs. Vorbis and Opus state their
+ * length nowhere but in a granule position, so they need the same code to
+ * open a file at all, not only to seek in one.
  */
 static GAUD_Result decoder_seek(
     GAUD_Decoder * decoder, uint64_t frame, uint64_t * out_landed) {
@@ -259,7 +281,23 @@ static GAUD_Result decoder_seek(
     return GAUD_OK;
   }
 
-  GAUD_Result result = rewind_to_audio(state);
+  /*
+   * The floor is byte zero rather than the first audio page's offset, for
+   * the reason rewind_to_audio() gives: where the audio starts is only
+   * knowable by assuming no page mixes a header packet with a frame, and
+   * decode_next() skips metadata packets anyway. A bisection that lands on
+   * byte zero is then exactly a rewind.
+   */
+  uint64_t offset = 0;
+  uint64_t granule = 0;
+  GAUD_Result result = GAUD_OK;
+  if (gaud_ogg_bisect(&state->reader, frame, 0, &offset, &granule) != GAUD_OK
+      || granule > frame) {
+    result = rewind_to_audio(state);
+  }
+  else {
+    result = seek_to_page(state, offset, granule);
+  }
   if (result != GAUD_OK) {
     return result;
   }

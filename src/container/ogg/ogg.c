@@ -174,6 +174,32 @@ static GAUD_Result read_page(OGG_Reader * reader) {
   reader->next_body = 0;
   reader->page_live = true;
   reader->eos = (reader->flags & OGG_FLAG_EOS) != 0;
+  if (serial == reader->serial && reader->drop_continued) {
+    /*
+     * This page was landed on by a seek, and its first packet may have
+     * begun on a page the reader never read. Throw that fragment away:
+     * its segments are consumed here so that packet assembly below starts
+     * at a packet boundary.
+     *
+     * The flag survives a page that does not finish the fragment, because
+     * a packet may span three pages and a seek may land in the middle one.
+     * A page whose whole table is 255s ends no packet, and the next page's
+     * CONTINUED flag is the same fragment still arriving.
+     */
+    if ((reader->flags & OGG_FLAG_CONTINUED) == 0) {
+      reader->drop_continued = false;
+    }
+    else {
+      while (reader->next_segment < reader->segments) {
+        unsigned value = reader->table[reader->next_segment++];
+        reader->next_body += value;
+        if (value < 255u) {
+          reader->drop_continued = false;
+          break;
+        }
+      }
+    }
+  }
   if (serial != reader->serial) {
     /* Another logical stream's page. Skipped rather than refused: an Ogg
      * file is allowed to multiplex, and a FLAC stream inside one is still
@@ -250,6 +276,7 @@ GAUD_Result gaud_ogg_reader_seek(OGG_Reader * reader, uint64_t offset) {
   reader->next_body = 0;
   reader->packet_size = 0;
   reader->eos = false;
+  reader->drop_continued = true;
   return GAUD_OK;
 }
 
@@ -262,9 +289,14 @@ void gaud_ogg_writer_init(
   writer->serial = serial;
 }
 
-/** Emit the buffered segments as one page. */
-static GAUD_Result emit_page(
-    OGG_Writer * writer, bool eos, bool last_of_packet) {
+/**
+ * Emit the buffered segments as one page.
+ *
+ * @param complete Whether the last segment on it ended a packet, which
+ *   decides both the granule position and whether the next page is marked
+ *   as a continuation. See OGG_Writer::page_complete.
+ */
+static GAUD_Result emit_page(OGG_Writer * writer, bool eos, bool complete) {
   unsigned char header[OGG_HEADER_FIXED + OGG_MAX_SEGMENTS];
   memcpy(header, OGG_MAGIC, 4);
   header[4] = 0;
@@ -274,7 +306,7 @@ static GAUD_Result emit_page(
    * Ogg spells as all ones. Stamping the packet's eventual position on a
    * page that stops in the middle of it would tell a seeker that samples
    * are available that are not. */
-  uint64_t granule = last_of_packet ? writer->granule : UINT64_MAX;
+  uint64_t granule = complete ? writer->granule : UINT64_MAX;
   gaud_wr_u32le(header + 6, (uint32_t)granule);
   gaud_wr_u32le(header + 10, (uint32_t)(granule >> 32));
   gaud_wr_u32le(header + 14, writer->serial);
@@ -299,9 +331,10 @@ static GAUD_Result emit_page(
   }
   writer->body_size = 0;
   writer->segments = 0;
+  writer->page_complete = false;
   ++writer->sequence;
   writer->started = true;
-  writer->continued = !last_of_packet;
+  writer->continued = !complete;
   return result;
 }
 
@@ -313,7 +346,11 @@ GAUD_Result gaud_ogg_writer_packet(OGG_Writer * writer,
   bool ended = false;
   while (!ended) {
     if (writer->segments == OGG_MAX_SEGMENTS) {
-      GAUD_Result result = emit_page(writer, false, false);
+      /* No room for another lacing value. Whether this page finished a
+       * packet is page_complete's question and not "are we mid-packet": a
+       * table that filled exactly on a packet boundary ends a packet, and
+       * granule is this packet's only when it does not. */
+      GAUD_Result result = emit_page(writer, false, writer->page_complete);
       if (result != GAUD_OK) {
         return result;
       }
@@ -332,6 +369,7 @@ GAUD_Result gaud_ogg_writer_packet(OGG_Writer * writer,
      * then joins the packet to the one after it and both are lost. */
     if (value < 255u) {
       ended = true;
+      writer->page_complete = true;
     }
   }
   if (flush || eos) {
@@ -344,5 +382,10 @@ GAUD_Result gaud_ogg_writer_flush(OGG_Writer * writer, bool eos) {
   if (writer->segments == 0 && !eos) {
     return GAUD_OK;
   }
-  return emit_page(writer, eos, true);
+  /* A page with nothing on it finishes no packet and so states no position
+   * - except that an empty end-of-stream page is the last place left to
+   * state the stream's length, and a reader learns a length from the last
+   * stated position. So that one page keeps the granule. */
+  return emit_page(
+      writer, eos, writer->segments == 0 || writer->page_complete);
 }

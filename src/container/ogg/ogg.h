@@ -47,6 +47,13 @@
  * carries a 64-bit number per page and attaches no meaning to it beyond
  * "monotonic". For FLAC it is the sample number of the last sample
  * finished on the page, and `-1` means no packet finished there.
+ *
+ * **A page is found by its checksum and not by its magic.** `OggS` is four
+ * bytes of compressed audio away from being a coincidence, and a page body
+ * may contain it; a scan that trusted the magic alone would find pages that
+ * are not there. Everything below that looks for a page reads the candidate
+ * header, reads the body it claims, and believes it only if the CRC agrees
+ * - which is what makes bisection safe (gaud_ogg_bisect()).
  */
 
 #ifndef GHOTI_IO_GAUD_SRC_CONTAINER_OGG_OGG_H
@@ -73,6 +80,12 @@ extern "C" {
 
 /** The most body bytes one page can hold: 255 segments of 255 bytes. */
 #define OGG_MAX_BODY (255u * 255u)
+
+/** The most bytes one page can occupy: fixed header, table, body. */
+#define OGG_MAX_PAGE (OGG_HEADER_FIXED + OGG_MAX_SEGMENTS + OGG_MAX_BODY)
+
+/** The granule position a page states when no packet finished on it. */
+#define OGG_NO_GRANULE UINT64_MAX
 
 /** Page flags, from the header's type byte. */
 enum {
@@ -113,6 +126,17 @@ typedef struct {
   uint32_t flags;          ///< The current page's type byte.
   bool page_live;          ///< Whether a page has been read at all.
   bool eos;                ///< Whether the last page read ended the stream.
+  /**
+   * Whether a packet continued from before this reader's position must be
+   * thrown away.
+   *
+   * Set by gaud_ogg_reader_seek(), because a seek lands on a page boundary
+   * and the first packet finishing there may have *started* on a page the
+   * reader never saw. Handing that fragment to a codec as a whole packet
+   * is the defect this flag exists to prevent: it is not corrupt, it is
+   * the tail of something, and a decoder has no way to tell.
+   */
+  bool drop_continued;
 
   unsigned char * packet;  ///< The packet being assembled. Owned.
   size_t packet_size;      ///< Bytes of it so far.
@@ -152,6 +176,131 @@ GAUD_Result gaud_ogg_reader_packet(OGG_Reader * reader,
  */
 GAUD_Result gaud_ogg_reader_seek(OGG_Reader * reader, uint64_t offset);
 
+/* ------------------------------------------------- finding pages by hand */
+
+/** What a page scan found, without any of the reader's packet state. */
+typedef struct {
+  uint64_t offset;  ///< Where the page begins.
+  uint64_t next;    ///< The byte just past it, where the next page may be.
+  uint64_t granule; ///< Its granule position, or ::OGG_NO_GRANULE.
+  uint32_t serial;  ///< Which logical stream it belongs to.
+  uint32_t flags;   ///< Its type byte.
+  uint32_t segments; ///< How many lacing values its table holds.
+  uint32_t body;    ///< How many body bytes it carries.
+} OGG_Page_Info;
+
+/**
+ * @brief Find the first valid page at or after @p from.
+ *
+ * Scans for `OggS`, reads what the candidate claims, and accepts it only
+ * if its CRC agrees - see the note at the head of this file about why the
+ * magic alone is not enough.
+ *
+ * @param stream Seekable. Left positioned past the page that was found.
+ * @param allocator For the scratch buffer.
+ * @param from Where to start looking.
+ * @param limit One past the last byte a page may begin at.
+ * @param out Receives what was found.
+ * @return ::GAUD_OK; ::GAUD_ERR_FORMAT if no page begins before @p limit,
+ *   which is the ordinary way a scan ends and not an error in the file.
+ */
+GAUD_Result gaud_ogg_find_page(GAUD_Stream * stream,
+    const GAUD_Allocator * allocator, uint64_t from, uint64_t limit,
+    OGG_Page_Info * out);
+
+/** The most logical streams gaud_ogg_scan_logical() will report. */
+#define OGG_MAX_LOGICAL 16u
+
+/** The bytes of a logical stream's first packet that are kept for it. */
+#define OGG_HEAD_KEPT 64u
+
+/**
+ * @brief One logical stream, as its beginning-of-stream page describes it.
+ *
+ * `head` is what identifies the codec: every Ogg mapping puts a signature
+ * at the start of its first packet (`\x01vorbis`, `OpusHead`, `\x7FFLAC`),
+ * and that packet is required to be alone on the BOS page, so the first
+ * bytes of the page body are the signature without any packet assembly.
+ */
+typedef struct {
+  uint32_t serial;                    ///< Its serial number.
+  uint64_t offset;                    ///< Where its BOS page begins.
+  size_t head_size;                   ///< How much of @p head is filled.
+  unsigned char head[OGG_HEAD_KEPT];  ///< The start of its first packet.
+} OGG_Logical;
+
+/**
+ * @brief List the logical streams an Ogg file begins with.
+ *
+ * Ogg requires every logical stream's BOS page to precede any other page,
+ * so the whole list is at the head of the file and this does not read the
+ * body. A file with one stream - which is what every audio-only Ogg file
+ * is - reports one, and the caller may then stop thinking about
+ * multiplexing. A file with several is a container the caller has to
+ * choose from, and choosing is the caller's job because only the codec
+ * knows which signature it answers to.
+ *
+ * @param stream Seekable; its position is not preserved.
+ * @param allocator For the scan's scratch buffers.
+ * @param out Receives the streams found, in the order their BOS pages
+ *   appear, which is the order Ogg requires them to be written in.
+ * @param capacity How many @p out holds.
+ * @param out_count Receives how many were written; never more than
+ *   @p capacity, and a file with more streams than that is reported up to
+ *   the capacity rather than refused.
+ * @return ::GAUD_OK; ::GAUD_ERR_FORMAT if the file does not begin with a
+ *   page at all.
+ */
+GAUD_Result gaud_ogg_scan_logical(GAUD_Stream * stream,
+    const GAUD_Allocator * allocator, OGG_Logical * out, size_t capacity,
+    size_t * out_count);
+
+/**
+ * @brief The granule position the last page of @p serial states.
+ *
+ * Which, for the three codecs Ogg carries here, is the stream's length.
+ * Vorbis and Opus state their length nowhere else - there is no field for
+ * it in either codec's headers - so this is not an optimisation, it is the
+ * only way to answer how long the file is.
+ *
+ * Scans backwards in windows from the end of the file, because the last
+ * page of the file need not belong to @p serial and a multiplexed file's
+ * streams need not end together.
+ *
+ * @return ::GAUD_OK; ::GAUD_ERR_FORMAT if no page of @p serial anywhere in
+ *   the file states a granule position.
+ */
+GAUD_Result gaud_ogg_last_granule(GAUD_Stream * stream,
+    const GAUD_Allocator * allocator, uint32_t serial, uint64_t * out_granule);
+
+/**
+ * @brief Find a page to start decoding at, for a target granule position.
+ *
+ * Bisects the file, which is what Ogg's monotonic granule positions are
+ * for. Returns the offset of a page of the reader's own serial whose
+ * granule position is at or before @p target, and as close to it as
+ * bisection can get - so the caller decodes forward from there and
+ * discards, rather than decoding from the beginning and discarding.
+ *
+ * **The result is a page whose first packet is whole**, or @p floor. A
+ * bisection that returned a page carrying the tail of a packet would hand
+ * the caller's reader a fragment, so gaud_ogg_reader_seek() drops a
+ * leading continuation and this is safe either way.
+ *
+ * @param reader A reader whose serial is already chosen; used for its
+ *   stream and allocator only, and left untouched.
+ * @param target The granule position wanted.
+ * @param floor The offset of the first page it is legal to start at - past
+ *   the headers. Returned as-is when @p target is at or before the first
+ *   audio page, which is the end the search is easiest to get wrong at.
+ * @param out_offset Receives the offset to start reading pages from.
+ * @param out_granule Receives the granule position of the page before it,
+ *   i.e. how many of the codec's units are already behind @p out_offset,
+ *   or 0 when the answer is @p floor.
+ */
+GAUD_Result gaud_ogg_bisect(OGG_Reader * reader, uint64_t target,
+    uint64_t floor, uint64_t * out_offset, uint64_t * out_granule);
+
 /** @brief Builds pages around packets. */
 typedef struct {
   GAUD_Stream * stream;             ///< Borrowed.
@@ -164,6 +313,20 @@ typedef struct {
   uint64_t granule;                 ///< To stamp on the next page.
   bool started;                     ///< Whether the BOS page has gone out.
   bool continued;                   ///< Whether the next page continues one.
+  /**
+   * Whether the last lacing value buffered ended a packet.
+   *
+   * Which is not the same question as "is a packet being written", and
+   * conflating the two is a defect that only appears when the segment
+   * table fills *exactly* at a packet boundary. A page is then emitted
+   * because there is no room for another lacing value, and it did finish a
+   * packet - so it must state that packet's granule position, and the page
+   * after it must not be marked as a continuation. A writer that decided
+   * both from "we are part way through paging a packet" gets both wrong on
+   * one page in however many, which is the kind of arithmetic no fixture
+   * from a real encoder reaches.
+   */
+  bool page_complete;
 } OGG_Writer;
 
 /** @brief Start a writer for logical stream @p serial over @p stream. */
