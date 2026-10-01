@@ -42,6 +42,16 @@ tables come from, since no standard contains them. The output is signed
 16-bit, and **there is no floating point anywhere in the decoder** -
 which is what makes the next paragraph possible.
 
+**Saturating arithmetic, not wrapping.** `global_gain` is eight bits and
+every one of its 256 values is legal, so an ordinary frame can ask for a
+spectrum near the end of what a Q28 int32 holds - and then ask for two
+such values to be added. Mid/side, the alias-reduction butterflies, the
+overlap-add between granules, the frequency inversion and both
+filterbank accumulators all clamp rather than wrap. A wrap turns a loud
+passage into a click; a saturation turns it into a loud passage, and
+signed overflow is undefined besides. The clamping is counted, so a loud
+file and a clipping decoder are different facts from outside.
+
 **The same bytes on every architecture.** `make check-golden`
 cross-compiles this library for s390x and powerpc64, decodes the whole
 corpus under qemu, and compares hashes with this machine. That is a

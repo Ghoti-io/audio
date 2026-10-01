@@ -140,6 +140,34 @@ static int32_t saturate(MP3_Layer3 * state, int64_t value) {
   return (int32_t)value;
 }
 
+/**
+ * @p a + @p b, clamped into an int32 rather than wrapped.
+ *
+ * **Every addition in the Q28 pipeline needs this and not one of them is
+ * bounded by the format.** A granule states its own global_gain, its
+ * subblock gains and its scalefactors, so a corrupt or hostile frame can
+ * ask for a spectral line near the top of the range and then ask for it
+ * to be added to another one. The products are fine - mul() accumulates
+ * in 64 bits - and it is the *sums* of already-requantised values that
+ * overflow: mid/side, the alias-reduction butterflies, and the
+ * overlap-add between one granule and the next.
+ *
+ * Signed overflow is undefined, and what the compiler is entitled to do
+ * with it is worse than the wrong sample: this is the same choice
+ * gaud_mp3_synth_output() documents, where a wrap turns a loud passage
+ * into a click and a saturation turns it into a loud passage.
+ */
+static int32_t add_sat(MP3_Layer3 * state, int32_t a, int32_t b) {
+  /* Two int32 values cannot overflow an int64, so the widening is the
+   * whole of the check. */
+  return saturate(state, (int64_t)a + (int64_t)b);
+}
+
+/** @p a - @p b, clamped the same way; see add_sat(). */
+static int32_t sub_sat(MP3_Layer3 * state, int32_t a, int32_t b) {
+  return saturate(state, (int64_t)a - (int64_t)b);
+}
+
 bool gaud_mp3_band_row(const MP3_Header * header, unsigned * out_row) {
   if (header->version == MP3_MPEG1) {
     *out_row = header->rate_index;
@@ -859,8 +887,10 @@ static void stereo(MP3_Layer3 * state, const MP3_Header * header,
         else if (middle_side) {
           int32_t middle = left[index];
           int32_t difference = side[index];
-          left[index] = mul(middle + difference, gaud_mp3_inv_sqrt2);
-          side[index] = mul(middle - difference, gaud_mp3_inv_sqrt2);
+          left[index]
+              = mul(add_sat(state, middle, difference), gaud_mp3_inv_sqrt2);
+          side[index]
+              = mul(sub_sat(state, middle, difference), gaud_mp3_inv_sqrt2);
         }
       }
     }
@@ -870,7 +900,8 @@ static void stereo(MP3_Layer3 * state, const MP3_Header * header,
 /* -------------------------------------------- the hybrid filterbank */
 
 /** The eight butterflies at each subband boundary, 11172-3 Figure 3-A.5. */
-static void antialias(int32_t xr[576], const MP3_Granule * granule) {
+static void antialias(
+    MP3_Layer3 * state, int32_t xr[576], const MP3_Granule * granule) {
   unsigned boundaries = 31u;
   if (granule->block_type == 2u) {
     /* Three short windows have no aliasing to reduce - the butterflies
@@ -883,9 +914,10 @@ static void antialias(int32_t xr[576], const MP3_Granule * granule) {
     for (unsigned i = 0; i < 8u; ++i) {
       int32_t above = lower[i];
       int32_t below = lower[-1 - (int)i];
-      lower[-1 - (int)i]
-          = mul(below, gaud_mp3_cs[i]) - mul(above, gaud_mp3_ca[i]);
-      lower[i] = mul(above, gaud_mp3_cs[i]) + mul(below, gaud_mp3_ca[i]);
+      lower[-1 - (int)i] = sub_sat(
+          state, mul(below, gaud_mp3_cs[i]), mul(above, gaud_mp3_ca[i]));
+      lower[i] = add_sat(
+          state, mul(above, gaud_mp3_cs[i]), mul(below, gaud_mp3_ca[i]));
     }
   }
 }
@@ -898,8 +930,9 @@ static void antialias(int32_t xr[576], const MP3_Granule * granule) {
  *   with this one's second half.
  * @param out The 18 time samples this granule contributes.
  */
-static void hybrid(const int32_t in[18], const MP3_Granule * granule,
-    bool force_long, int32_t overlap[18], int32_t out[18]) {
+static void hybrid(MP3_Layer3 * state, const int32_t in[18],
+    const MP3_Granule * granule, bool force_long, int32_t overlap[18],
+    int32_t out[18]) {
   int32_t block[36];
   if (granule->block_type == 2u && !force_long) {
     memset(block, 0, sizeof(block));
@@ -913,7 +946,9 @@ static void hybrid(const int32_t in[18], const MP3_Granule * granule,
         /* Each short block is windowed on its own and then the three are
          * overlapped six values apart, which is what spreads twelve
          * samples over the middle twenty-four of the thirty-six. */
-        block[6u + window * 6u + i] += mul(value, gaud_mp3_short_window[i]);
+        block[6u + window * 6u + i] = add_sat(state,
+            block[6u + window * 6u + i],
+            mul(value, gaud_mp3_short_window[i]));
       }
     }
   }
@@ -931,7 +966,7 @@ static void hybrid(const int32_t in[18], const MP3_Granule * granule,
     }
   }
   for (unsigned i = 0; i < 18u; ++i) {
-    out[i] = block[i] + overlap[i];
+    out[i] = add_sat(state, block[i], overlap[i]);
     overlap[i] = block[18u + i];
   }
 }
@@ -1032,17 +1067,23 @@ GAUD_Result gaud_mp3_layer3_frame(MP3_Layer3 * state, const MP3_Header * header,
 
     for (unsigned ch = 0; ch < channels; ++ch) {
       const MP3_Granule * granule = &state->side.granule[gr][ch];
-      antialias(state->xr[ch], granule);
+      antialias(state, state->xr[ch], granule);
       for (unsigned sb = 0; sb < 32u; ++sb) {
         bool force_long = granule->mixed_block && sb < 2u;
         int32_t out[18];
-        hybrid(state->xr[ch] + sb * 18u, granule, force_long,
+        hybrid(state, state->xr[ch] + sb * 18u, granule, force_long,
             state->channel[ch].overlap[sb], out);
         /* Frequency inversion: every second value of every second
-         * subband, to undo the polyphase filterbank's own inversion. */
+         * subband, to undo the polyphase filterbank's own inversion.
+         *
+         * Through sub_sat() and not a bare `-`, because INT32_MIN has no
+         * negation in an int32 and now reaches here: it is exactly what
+         * the saturating overlap-add above produces at the bottom of the
+         * range. The clamp is the right answer anyway - the inverse of a
+         * value pinned at one end is the other end. */
         for (unsigned i = 0; i < 18u; ++i) {
           state->scratch[sb * 18u + i]
-              = (sb & 1u) && (i & 1u) ? -out[i] : out[i];
+              = (sb & 1u) && (i & 1u) ? sub_sat(state, 0, out[i]) : out[i];
         }
       }
       /* Eighteen passes of the polyphase filterbank, one per time slot,

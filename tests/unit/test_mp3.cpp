@@ -1439,6 +1439,106 @@ private:
 };
 
 /**
+ * A side information like SideInfo()'s but with a chosen global_gain.
+ *
+ * global_gain is eight bits and every one of its 256 values is legal, so
+ * 255 is an ordinary frame and not a malformed one. It scales the whole
+ * spectrum by 2^((gain - 210 - 8*subblock)/4), which at the top of the
+ * range asks for values far outside what an int32 of Q28 can hold - so
+ * this is how a file reaches the saturating arithmetic without being
+ * corrupt in any way a decoder is entitled to refuse.
+ */
+std::vector<unsigned char> SideInfoWithGain(unsigned gain) {
+  Writer w;
+  w.put(0, 9);
+  w.put(0, 3);
+  w.put(0, 4);
+  w.put(0, 4);
+  for (unsigned gr = 0; gr < 2u; ++gr) {
+    for (unsigned ch = 0; ch < 2u; ++ch) {
+      w.put(500, 12);
+      w.put(100, 9);
+      w.put(gain, 8);
+      w.put(0, 4);
+      w.put(0, 1);
+      w.put(1, 5);
+      w.put(1, 5);
+      w.put(1, 5);
+      w.put(7, 4);
+      w.put(7, 3);
+      w.put(0, 1);
+      w.put(0, 1);
+      w.put(0, 1);
+    }
+  }
+  std::vector<unsigned char> out = w.bytes();
+  out.resize(32u, 0u);
+  return out;
+}
+
+TEST(Mp3Decode, AFrameAtTheTopOfTheGainRangeDecodesWithoutOverflowing) {
+  /* **Every addition in the Q28 pipeline can overflow and none of them is
+   * bounded by the format.** A granule states its own global_gain, all
+   * 256 values of which are legal, and at the top of that range the
+   * requantised spectrum sits near the end of int32 - where mid/side, the
+   * alias-reduction butterflies, the overlap-add between granules and the
+   * frequency inversion were all signed overflow, which is undefined.
+   *
+   * Found by the fuzzer, on a corpus that had grown since the decoder
+   * landed; the same eight sites reproduce on the commit that wrote them,
+   * so the saturation is a fix and not a consequence of MPEG-2.5.
+   *
+   * **What proves the arithmetic is defined is the sanitizer build, not
+   * this test.** `make test-asan` compiles with -fsanitize=undefined and
+   * `make fuzz-run-mpeg` runs the same code over
+   * tests/fuzz/corpus/mpeg; either one reports every site above on the
+   * unfixed decoder. What this test does is keep an input that reaches
+   * those sites inside `make test`, so that the sanitizer has something
+   * to look at without the fuzzer having to rediscover it - and assert
+   * the part that is observable from outside: the decode finishes and
+   * produces the frames it claimed.
+   *
+   * The two gains are the control pair. 180 is the ordinary frame
+   * SideInfo() uses and saturates nothing; 255 is the same frame with
+   * only that field changed. They must decode *differently*, or the gain
+   * never took effect and this input reaches none of the arithmetic it
+   * was written for. */
+  std::vector<int16_t> decoded[2];
+  unsigned gains[2] = {180u, 255u};
+  for (int which = 0; which < 2; ++which) {
+    std::vector<unsigned char> side = SideInfoWithGain(gains[which]);
+    std::vector<unsigned char> frame
+        = Frame(Header(V1, L3, false, 9u, 0u, false, 0u));
+    std::memcpy(frame.data() + 4u, side.data(), side.size());
+    size_t at = 4u + side.size();
+    for (size_t k = 0; at + k < frame.size(); ++k) {
+      frame[at + k] = (unsigned char)(0x80u + (k * 37u) % 0x7Fu);
+    }
+    std::vector<unsigned char> stream;
+    for (unsigned i = 0; i < 6u; ++i) {
+      stream.insert(stream.end(), frame.begin(), frame.end());
+    }
+    Loaded loaded;
+    ASSERT_EQ(OpenBytes(loaded, stream), GAUD_OK) << gains[which];
+    decoded[which] = DecodeAll(loaded.track());
+    EXPECT_EQ(decoded[which].size(), 6u * 1152u * 2u) << gains[which];
+    bool any = false;
+    for (int16_t value : decoded[which]) {
+      if (value != 0) {
+        any = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(any) << "gain " << gains[which] << " decoded to pure "
+                     << "silence, so this exercised none of the arithmetic";
+  }
+  EXPECT_NE(decoded[0], decoded[1])
+      << "the two gains decoded identically, so global_gain had no effect "
+      << "and the loud frame is not reaching the arithmetic this test is "
+      << "about";
+}
+
+/**
  * A stereo MPEG-1 Layer III side information that decodes.
  *
  * Every field the format requires, with values chosen to be legal rather

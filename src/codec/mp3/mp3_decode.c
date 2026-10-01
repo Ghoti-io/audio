@@ -181,7 +181,11 @@ static GAUD_Result decode_next(MP3_Decoder * state) {
 
 /** Q28 to signed 16-bit, rounded to nearest and clipped. */
 static int16_t to_s16(int32_t value) {
-  int32_t scaled = (value + (1 << (MP3_Q - 16))) >> (MP3_Q - 15);
+  /* The rounding term is added in 64 bits because `value` reaches the
+   * ends of its own range: the decoder saturates there rather than
+   * wrapping, so INT32_MAX is a value this sees, and INT32_MAX plus the
+   * rounding term is undefined in 32. */
+  int64_t scaled = ((int64_t)value + (1 << (MP3_Q - 16))) >> (MP3_Q - 15);
   if (scaled > 32767) {
     return 32767;
   }

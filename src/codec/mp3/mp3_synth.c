@@ -38,14 +38,34 @@
  * moving origin.
  *
  * Everything is Q28 with 64-bit accumulation, and the two places a sum can
- * grow are both bounded by the standard: the matrixing sums 32 products of
- * values below 1.0, and the windowing sums 16. Both are saturated rather
- * than wrapped, because a wrap turns a loud passage into a click and a
- * saturation turns it into a loud passage.
+ * grow are the matrixing, which sums 32 products, and the windowing, which
+ * sums 16. **A conforming stream keeps those products below 1.0 and an
+ * arbitrary file does not**: global_gain is eight bits, all 256 values are
+ * legal, and near the top of that range the subband values arriving here
+ * sit at the end of int32 - where 32 such products exceed an int64. So the
+ * accumulator is checked as well as its result; see accumulate() below.
+ * Both saturate rather than wrapping, because a wrap turns a loud passage
+ * into a click and a saturation turns it into a loud passage.
  */
 
 #include "mp3_internal.h"
 #include "mp3_tables.h"
+
+/**
+ * @p sum + @p term, clamped at the ends of int64 rather than wrapped.
+ *
+ * **The accumulator itself can overflow, not only its result**, for the
+ * reason the file comment above gives. saturate() clamps what comes out;
+ * this keeps the arithmetic on the way there defined, which the sum of 32
+ * products of near-full int32 values otherwise is not.
+ */
+static int64_t accumulate(int64_t sum, int64_t term) {
+  int64_t out = 0;
+  if (__builtin_add_overflow(sum, term, &out)) {
+    return term > 0 ? INT64_MAX : INT64_MIN;
+  }
+  return out;
+}
 
 /** Clamp a 64-bit Q28 accumulator into the Q28 range an int32 can hold. */
 static int32_t saturate(int64_t value) {
@@ -76,7 +96,9 @@ void gaud_mp3_synth_run(MP3_Synth * synth, const int32_t subband[32],
     int64_t sum = 0;
     const int32_t * row = gaud_mp3_synth_cos[i];
     for (unsigned k = 0; k < 32u; ++k) {
-      sum += (int64_t)row[k] * subband[k];
+      /* The product cannot overflow an int64 - it is two int32 values -
+       * so only the running sum needs the check. */
+      sum = accumulate(sum, (int64_t)row[k] * subband[k]);
     }
     state[(at + i) & 1023u] = saturate(sum >> MP3_Q);
   }
@@ -97,7 +119,8 @@ void gaud_mp3_synth_run(MP3_Synth * synth, const int32_t subband[32],
       unsigned block = u >> 6;   /* which 64-value block of U */
       unsigned inside = u & 63u; /* where in it */
       unsigned v = block * 128u + (inside < 32u ? inside : inside - 32u + 96u);
-      sum += (int64_t)state[(at + v) & 1023u] * gaud_mp3_window[u];
+      sum = accumulate(sum,
+          (int64_t)state[(at + v) & 1023u] * gaud_mp3_window[u]);
     }
     out[j * stride] = saturate(sum >> MP3_Q);
   }
