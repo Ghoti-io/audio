@@ -88,21 +88,58 @@ TARGETS = {
 #: decode to hash. **Named rather than filtered by extension**: an
 #: exclusion that is a missing glob is the most invisible kind there is.
 #:
-#: **It is empty, and that is the interesting state.** It held one entry -
-#: MPEG-2.5 Layer III, refused because its scalefactor band tables are in
-#: no standard - and emptying it is what this gate records about that work:
-#: the denominator below went up rather than the numerator, which is the
-#: only direction that means anything. The set stays because the next
-#: refusal wants naming here rather than filtering silently.
-UNDECODABLE = set()
+#: It was empty between phase 5 and phase 6, and emptying it is what the
+#: MPEG-2.5 work recorded: the denominator went up rather than the
+#: numerator, which is the only direction that means anything. These ten
+#: entries are the other direction, and they are here rather than being a
+#: `.ogg` left out of the glob below for exactly the reason the paragraph
+#: above gives - a format whose fixtures are in the corpus and not in this
+#: gate's denominator is a hole, and a hole that is a missing extension is
+#: a hole nobody can see.
+#:
+#: **Every one of them goes when the Vorbis decoder lands**, and the count
+#: below is asserted so that a fixture added to the corpus and forgotten
+#: here fails rather than vanishing.
+UNDECODABLE = {
+    "vorbis_ff_stereo_44100.ogg",
+    "vorbis_lib_5dot1_48000.ogg",
+    "vorbis_lib_mono_22050.ogg",
+    "vorbis_lib_mono_44100.ogg",
+    "vorbis_lib_mono_8000.ogg",
+    "vorbis_lib_noise_48000.ogg",
+    "vorbis_lib_silence_44100.ogg",
+    "vorbis_lib_stereo_44100.ogg",
+    "vorbis_lib_transient_44100.ogg",
+    "vorbis_tagged_stereo_44100.ogg",
+}
+
+#: Every extension the corpus holds that this gate reasons about. A file
+#: with an extension not in here is not excluded - it is invisible, which
+#: is why the two sets are checked against each other below.
+EXTENSIONS = (".wav", ".aiff", ".aifc", ".flac", ".oga", ".ogg", ".mp3",
+              ".mp2", ".mp1")
 
 
 def fixtures():
     data = os.path.join(ROOT, "tests", "data")
-    return sorted(f for f in os.listdir(data)
-                  if f.endswith((".wav", ".aiff", ".aifc", ".flac", ".oga",
-                                 ".mp3", ".mp2", ".mp1"))
-                  and f not in UNDECODABLE)
+    present = sorted(f for f in os.listdir(data) if f.endswith(EXTENSIONS))
+    stale = sorted(UNDECODABLE - set(present))
+    if stale:
+        raise SystemExit(
+            "check-golden: these files are excluded as undecodable and are "
+            "not in the corpus, so the exclusion is hiding nothing and the "
+            "name has probably changed:\n  " + "\n  ".join(stale))
+    unknown = sorted(f for f in os.listdir(data)
+                     if not f.endswith(EXTENSIONS)
+                     and not f.startswith(".")
+                     and os.path.isfile(os.path.join(data, f)))
+    if unknown:
+        raise SystemExit(
+            "check-golden: these corpus files have an extension this gate "
+            "does not know, so they are neither hashed nor excluded - "
+            "which is the invisible kind of hole:\n  "
+            + "\n  ".join(unknown))
+    return [f for f in present if f not in UNDECODABLE]
 
 
 # Fixtures that are also ENCODED on the target, and the file hashed.
@@ -259,6 +296,15 @@ def main():
           "11.1's promise applied to the writer, and what the FLAC "
           "encoder's integer-only predictors are for."
           % (len(fixtures()), len(wanted), len(ENCODE_FIXTURES)))
+    if UNDECODABLE:
+        print("\n%d fixture(s) are identified and not decoded, so they are "
+              "not in that number:" % len(UNDECODABLE))
+        for name in sorted(UNDECODABLE):
+            print("  %s" % name)
+        print("  All of them are Vorbis, which phase 6 reads and does not "
+              "yet decode. They are named rather than left out of the "
+              "extension list, because a hole that is a missing glob is "
+              "one nobody can see.")
     return 0
 
 

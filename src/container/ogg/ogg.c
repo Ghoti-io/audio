@@ -108,6 +108,7 @@ static bool reserve(const GAUD_Allocator * allocator, unsigned char ** buffer,
  */
 static GAUD_Result read_page(OGG_Reader * reader) {
   unsigned char header[OGG_HEADER_FIXED];
+  uint64_t began_at = gaud_stream_tell(reader->stream);
   size_t got = gaud_stream_read(reader->stream, header, sizeof(header));
   if (got == 0) {
     return GAUD_ERR_FORMAT;
@@ -172,6 +173,7 @@ static GAUD_Result read_page(OGG_Reader * reader) {
   reader->body_at = want;
   reader->body_size = body;
   reader->next_body = 0;
+  reader->page_offset = began_at;
   reader->page_live = true;
   reader->eos = (reader->flags & OGG_FLAG_EOS) != 0;
   if (serial == reader->serial && reader->drop_continued) {

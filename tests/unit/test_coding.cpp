@@ -237,6 +237,8 @@ TEST(Coding, EveryCodingHasADistinctNameAndTheDecodedFormatItClaims) {
       {GAUD_CODING_MPEG_LAYER1, GAUD_SAMPLE_S16},
       {GAUD_CODING_MPEG_LAYER2, GAUD_SAMPLE_S16},
       {GAUD_CODING_MPEG_LAYER3, GAUD_SAMPLE_S16},
+      {GAUD_CODING_VORBIS, GAUD_SAMPLE_S16},
+      {GAUD_CODING_OPUS, GAUD_SAMPLE_S16},
   };
   static_assert(sizeof(expected) / sizeof(expected[0]) == GAUD_CODING_COUNT,
       "a coding was added: say here what it decodes to");

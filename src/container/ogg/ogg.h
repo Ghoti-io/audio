@@ -116,6 +116,17 @@ typedef struct {
 
   unsigned char * page;    ///< The current page, header and body. Owned.
   size_t page_capacity;    ///< Room in @p page.
+  /**
+   * Where the current page begins in the stream.
+   *
+   * Which is what a caller needs to record "start reading again here":
+   * the stream's own position after a packet is somewhere inside a page
+   * body, and seeking back to that is not a page boundary. Vorbis needs
+   * it because its setup header's last page may also carry the first
+   * audio packet, so the place to resume is that page and not the byte
+   * after the header.
+   */
+  uint64_t page_offset;
   size_t body_at;          ///< Where the body starts within @p page.
   size_t body_size;        ///< How many body bytes the page holds.
   unsigned char table[OGG_MAX_SEGMENTS]; ///< The lacing values.

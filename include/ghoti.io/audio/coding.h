@@ -117,6 +117,38 @@ typedef enum {
   GAUD_CODING_MPEG_LAYER2,
   /** MPEG-1, MPEG-2 or MPEG-2.5 Layer III, which is to say MP3. */
   GAUD_CODING_MPEG_LAYER3,
+  /**
+   * Vorbis I, as the Xiph specification defines it.
+   *
+   * **One value although a Vorbis stream carries two block sizes**, which
+   * is the opposite of the MPEG layers' decision above and for the same
+   * reason: the two block sizes are two settings of one bitstream, chosen
+   * per packet by a mode the stream's own setup header defines, and one
+   * decoder reads both. Nothing a caller could do differs between them.
+   *
+   * The decoded format is fixed at 16 bits here, like the MPEG layers and
+   * unlike FLAC: Vorbis carries no bit depth, so there is nothing to ask
+   * the track.
+   */
+  GAUD_CODING_VORBIS,
+  /**
+   * Opus, as RFC 6716 defines it.
+   *
+   * **One value although Opus is two codecs inside.** A packet is SILK,
+   * CELT, or both at once, and which it is changes with the bandwidth and
+   * the bitrate - and may change from one packet to the next within a
+   * stream, which is the point of the design. So unlike the MPEG layers,
+   * where the three bitstreams need three decoders, here the three modes
+   * need one and a caller cannot usefully be told which a file is.
+   *
+   * The sample rate reported for an Opus track is **always 48,000**, and
+   * that is the format's decision rather than this library's: RFC 6716
+   * says a decoder may output at 8, 12, 16, 24 or 48 kHz whatever the
+   * encoder's input was, the Ogg mapping's granule positions are counted
+   * at 48 kHz, and the original rate the encoder saw is recorded in
+   * `OpusHead` as advice and nothing more.
+   */
+  GAUD_CODING_OPUS,
   /** Closes the enum so a test can check the names. */
   GAUD_CODING_COUNT
 } GAUD_Sample_Coding;

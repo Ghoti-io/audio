@@ -53,12 +53,18 @@ static const Coding_Row table[GAUD_CODING_COUNT] = {
     [GAUD_CODING_MPEG_LAYER1] = {"mp1", GAUD_SAMPLE_S16},
     [GAUD_CODING_MPEG_LAYER2] = {"mp2", GAUD_SAMPLE_S16},
     [GAUD_CODING_MPEG_LAYER3] = {"mp3", GAUD_SAMPLE_S16},
+    /* Vorbis and Opus carry no bit depth either, and both decode to 16
+     * bits here. Opus's row says nothing about its sample rate, which is
+     * always 48 kHz and is the track's business rather than the
+     * coding's. */
+    [GAUD_CODING_VORBIS] = {"vorbis", GAUD_SAMPLE_S16},
+    [GAUD_CODING_OPUS] = {"opus", GAUD_SAMPLE_S16},
 };
 
 /* A designated initialiser leaves an unmentioned row zeroed, and a zeroed
  * row's name is NULL rather than absent - so the count alone does not
  * prove the table is full. This is the assertion that does. */
-_Static_assert(GAUD_CODING_COUNT == 10,
+_Static_assert(GAUD_CODING_COUNT == 12,
     "a coding was added: give it a row in table[] and a case in the "
     "container that spells it");
 

@@ -395,6 +395,88 @@ FLAC_OGG_CASES = [
     ("oggflac_lib_s24_mono_48000", "flac", 24, 1, 48000, 2399, "tone"),
 ]
 
+#: The Ogg logical stream number every fixture here is written with.
+#:
+#: Any value is legal - it has to be unique within a file and means
+#: nothing else - so pinning one is free and makes `make corpus`
+#: idempotent. See flac_make() for what happens without it.
+OGG_SERIAL = 1
+
+
+# Phase 6's Vorbis fixtures. **Two writers, and the second one is not
+# libvorbis**, which matters here for the reason it mattered for MP3: a
+# Vorbis stream *defines its own* codebooks, floor curves, residue layout
+# and block modes in its setup header, so a decoder that has only ever read
+# libvorbis output has met one encoder's taste in all five rather than the
+# format.
+#
+#   libvorbis  Xiph's own, reached through ffmpeg's wrapper, and what wrote
+#              essentially every Vorbis file that exists.
+#   vorbis     libavcodec's native encoder, which shares no code with it.
+#              Stereo only - it says so and refuses anything else - and it
+#              needs `-strict -2` because ffmpeg marks it experimental.
+#
+# The axes, and what each file is for:
+#
+#   block sizes  The pair in the identification header, which libvorbis
+#                chooses from the sample rate and quality and which no
+#                single setting reaches more than one of. The corpus below
+#                has 256/2048, 512/1024, 512/512, 1024/1024 and
+#                2048/2048 - **and the three where the two are equal are
+#                the interesting ones**: a stream whose long and short
+#                blocks are the same size never switches, so the window
+#                shape and the overlap length are constant and a decoder
+#                that assumed switching always happens works on it. The
+#                other direction - 256/2048 - is the one where a wrong
+#                overlap is four blocks' worth of error.
+#   channels     Mono, stereo and 5.1. Above two channels the mapping's
+#                coupling list is what decides which channels are
+#                magnitude/angle pairs, and with one channel there is no
+#                coupling at all.
+#   signal       A tone, broadband noise, silence, and a transient. The
+#                transient is the only thing that makes an encoder choose
+#                a short block, which is to say the only fixture that
+#                reaches block switching; silence empties every residue
+#                partition.
+#   rate         44.1 and 48 kHz, and 8 kHz where libvorbis changes the
+#                block sizes outright.
+#
+#   name, writer, channels, rate, frames, signal, extra encoder flags
+VORBIS_CASES = [
+    ("vorbis_lib_stereo_44100", "libvorbis", 2, 44100, 4409, "tone",
+     ["-q:a", "4"]),
+    ("vorbis_lib_mono_44100", "libvorbis", 1, 44100, 3001, "tone",
+     ["-q:a", "3"]),
+    # The transient, for the long/short block switch and the lapping
+    # across a change of block size - which is the one piece of Vorbis
+    # arithmetic that has no analogue in any earlier codec here.
+    ("vorbis_lib_transient_44100", "libvorbis", 2, 44100, 8819, "transient",
+     ["-q:a", "6"]),
+    # Broadband at the top of the quality range, which fills the residue
+    # codebooks' larger partitions.
+    ("vorbis_lib_noise_48000", "libvorbis", 2, 48000, 4799, "noisestereo",
+     ["-q:a", "8"]),
+    # Silence: every residue partition empty, and the floor curve flat at
+    # its minimum. The arm where a decoder's "no energy in this band"
+    # path is the only one taken.
+    ("vorbis_lib_silence_44100", "libvorbis", 2, 44100, 2003, "silence",
+     ["-q:a", "1"]),
+    # 8 kHz, where libvorbis writes 512/512 - equal block sizes, so this
+    # stream never switches and its window is the same every packet.
+    ("vorbis_lib_mono_8000", "libvorbis", 1, 8000, 1601, "noise",
+     ["-q:a", "-2"]),
+    # 22.05 kHz at the bottom of the quality range gives 512/1024, a
+    # third pair, and a 2:1 ratio where the stereo fixtures have 8:1.
+    ("vorbis_lib_mono_22050", "libvorbis", 1, 22050, 2003, "tone",
+     ["-q:a", "-1"]),
+    # Six channels, for the coupling list and the channel order.
+    ("vorbis_lib_5dot1_48000", "libvorbis", 6, 48000, 1499, "tone",
+     ["-q:a", "3"]),
+    # The second writer. 2048/2048, which libvorbis never writes.
+    ("vorbis_ff_stereo_44100", "vorbis", 2, 44100, 4409, "tone",
+     ["-strict", "-2", "-b:a", "128k"]),
+]
+
 SIGNALS = {
     "tone": "0.6*sin(2*PI*%(f)d*t)+0.25*sin(2*PI*%(g)d*t)",
     "silence": "0",
@@ -537,7 +619,17 @@ def flac_make(path, writer, bits, channels, rate, frames, signal, flags,
                 "--bps=%d" % bits, "--sample-rate=%d" % rate,
                 "--no-padding", "--no-seektable"]
         if ogg:
-            argv.append("--ogg")
+            # **--serial-number, or the fixture changes every run.** An
+            # Ogg logical stream is identified by a 32-bit number that is
+            # required to be unique within a file and is otherwise
+            # arbitrary, so `flac --ogg` picks a random one - which lands
+            # in the page headers and in every page's checksum, so two
+            # runs of `make corpus` produce two different files that
+            # decode identically. Both Ogg FLAC fixtures from this writer
+            # had to be reverted by hand after every run before this.
+            # ffmpeg's muxer is already deterministic under
+            # `-fflags +bitexact`, which is why only this arm needs it.
+            argv += ["--ogg", "--serial-number=%d" % OGG_SERIAL]
         argv += list(flags) + ["-o", path, raw]
         run(oracle.command("flac", argv, scratch=DATA))
     else:
@@ -735,6 +827,37 @@ def mpeg_make(path, codec, channels, rate, frames, signal, flags):
     os.remove(raw)
 
 
+def vorbis_make(path, codec, channels, rate, frames, signal, flags,
+                tags=False):
+    """One Vorbis fixture.
+
+    `-serial_offset 1` rather than nothing, for the reason flac_make()
+    gives at length: ffmpeg's Ogg muxer is deterministic under
+    `-fflags +bitexact` but picks its serial from the offset, and pinning
+    it keeps every Ogg fixture in this corpus using the same number -
+    which makes a multiplexed file something a test has to build on
+    purpose rather than something the corpus has by accident.
+    """
+    raw = path + ".raw"
+    raw_signal(raw, signal, 16, channels, rate, frames)
+    argv = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", raw,
+        "-c:a", codec,
+    ] + list(flags)
+    if tags:
+        for key, value in TAGS:
+            argv += ["-metadata", "%s=%s" % (key, value)]
+    argv += [
+        "-fflags", "+bitexact", "-flags:a", "+bitexact",
+        "-serial_offset", str(OGG_SERIAL),
+        "-map_metadata", "0" if tags else "-1",
+        "-f", "ogg", path,
+    ]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+    os.remove(raw)
+
+
 def mp3_tagged_make(path, channels, rate, frames):
     """An MP3 with an ID3v2 tag at the front and an ID3v1 trailer at the end.
 
@@ -906,7 +1029,7 @@ def multichannel_signals():
     for name, writer, bits, channels, rate, frames, signal in FLAC_OGG_CASES:
         if channels > 1:
             used.add(signal)
-    for table in (MP3_CASES, MP2_CASES):
+    for table in (MP3_CASES, MP2_CASES, VORBIS_CASES):
         for name, writer, channels, rate, frames, signal, flags in table:
             if channels > 1:
                 used.add(signal)
@@ -1087,6 +1210,28 @@ def main():
     mp3_tagged_make(path, 2, 44100, 2003)
     made.append(path)
     print("  %-30s %s" % ("mp3_tagged_stereo_44100", os.path.getsize(path)))
+
+    # Phase 6: Vorbis. Spelled `.ogg` rather than `.oga`, which is the
+    # other way round from the Ogg FLAC fixtures above - and matches what
+    # the world does: `.ogg` meant Vorbis for a decade before Xiph asked
+    # for `.oga`, so every reader keys Vorbis on `.ogg` and this library
+    # must too.
+    for name, codec, channels, rate, frames, signal, flags in VORBIS_CASES:
+        path = os.path.join(DATA, "%s.ogg" % name)
+        vorbis_make(path, codec, channels, rate, frames, signal, flags)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    # Tagged, so the comment header is read by a gate rather than only by
+    # a unit test. The tags are the same six every other tagged fixture
+    # carries, so check_tags.py scores one vocabulary across five
+    # containers.
+    path = os.path.join(DATA, "vorbis_tagged_stereo_44100.ogg")
+    vorbis_make(path, "libvorbis", 2, 44100, 2003, "tone", ["-q:a", "3"],
+                tags=True)
+    made.append(path)
+    print("  %-30s %s" % ("vorbis_tagged_stereo_44100",
+                          os.path.getsize(path)))
 
     print("%d fixtures in tests/data/" % len(made))
 

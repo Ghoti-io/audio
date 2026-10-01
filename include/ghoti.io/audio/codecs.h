@@ -69,6 +69,18 @@ GAUD_API void gaud_ogg_flac_register(void);
  */
 GAUD_API void gaud_mp3_register(void);
 
+/**
+ * @brief Register Vorbis in Ogg (Vorbis I).
+ *
+ * Reads what the stream says about itself - channels, sample rate, block
+ * sizes, tags, and the length its last page's granule position states -
+ * and does not yet decode it. The codec declares
+ * ::GAUD_CAP_METADATA_READ and not ::GAUD_CAP_DECODE, so a caller that
+ * asks for a decoder is told ::GAUD_ERR_UNSUPPORTED rather than finding
+ * out from documentation.
+ */
+GAUD_API void gaud_vorbis_register(void);
+
 GAUD_API void gaud_register_builtin_codecs(void);
 
 #ifdef __cplusplus

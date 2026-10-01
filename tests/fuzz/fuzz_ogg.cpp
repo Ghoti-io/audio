@@ -1,0 +1,318 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io Audio.
+ *
+ * Ghoti.io Audio is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io Audio is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * @file
+ *
+ * Fuzz the Ogg page layer, the seek layer over it, and the two mappings.
+ *
+ * **The seek layer is the reason this harness exists separately.** The
+ * page reader has been exercised since phase 4 through the Ogg FLAC
+ * fuzzer's whole-file arm, but gaud_ogg_find_page(), gaud_ogg_bisect()
+ * and gaud_ogg_last_granule() are a byte-offset search over
+ * attacker-controlled data: they take an offset from outside, read a
+ * length out of the bytes at it, and read that many more. Reaching them
+ * through a loader means almost every input dies at the mapping's
+ * signature first, so the first byte of the input chooses the entry
+ * point instead.
+ *
+ * What it asserts beyond not crashing:
+ *
+ * - **A packet never claims more bytes than the pages carried.** The
+ *   reader hands out a pointer into its own buffer and a length, and a
+ *   length past the buffer is a read a caller cannot defend against.
+ * - **A found page's extent is inside the file.** `next` is where the
+ *   scan resumes, so a `next` past the end is an infinite loop in every
+ *   caller, and a `next` at or before `offset` is an infinite loop in
+ *   the scan itself.
+ * - **The bisection's answer is never past the target.** A caller
+ *   decodes forward from it; an answer past the target is samples that
+ *   cannot be reached at all.
+ * - **A scan is a function of its input.** The same offset searched
+ *   twice gives the same page, so nothing is carried between calls.
+ *
+ * Build with: make fuzz-ogg
+ * Run:        make fuzz-run-ogg FUZZ_TIME=300
+ */
+
+#include "../../src/codec/vorbis/vorbis_internal.h"
+#include "../../src/container/ogg/ogg.h"
+#include <ghoti.io/audio/audio.h>
+#include <ghoti.io/audio/codecs.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size);
+
+namespace {
+
+/** Registers the codecs once, however many inputs run. */
+struct Registered {
+  Registered() { gaud_register_builtin_codecs(); }
+};
+const Registered registered;
+
+/** Drain packets from arbitrary bytes read as pages. */
+void fuzz_packets(const uint8_t * data, size_t size) {
+  GAUD_Stream * stream = NULL;
+  if (gaud_stream_create_memory(data, size, &stream) != GAUD_OK) {
+    return;
+  }
+  OGG_Reader reader;
+  gaud_ogg_reader_init(&reader, stream, NULL);
+  for (int i = 0; i < 256; ++i) {
+    const unsigned char * packet = NULL;
+    size_t packet_size = 0;
+    uint64_t granule = 0;
+    uint32_t flags = 0;
+    if (gaud_ogg_reader_packet(&reader, &packet, &packet_size, &granule,
+            &flags)
+        != GAUD_OK) {
+      break;
+    }
+    /* A packet is assembled out of page bodies, and no number of pages
+     * can hold more than the file does. A length past that is a read the
+     * caller has no way to bound. */
+    if (packet_size > size) {
+      abort();
+    }
+    if (packet_size && !packet) {
+      abort();
+    }
+    /* Touch every byte, so ASan sees a length that overruns the
+     * reader's own buffer rather than only one past the file. */
+    volatile unsigned char sink = 0;
+    for (size_t at = 0; at < packet_size; ++at) {
+      sink = (unsigned char)(sink ^ packet[at]);
+    }
+    (void)sink;
+  }
+  gaud_ogg_reader_free(&reader);
+  gaud_stream_destroy(stream);
+}
+
+/** Scan for pages from an offset the input chooses. */
+void fuzz_scan(const uint8_t * data, size_t size) {
+  if (size < 3) {
+    return;
+  }
+  uint64_t from = ((uint64_t)data[0] << 8 | data[1]) % (size + 1u);
+  data += 2;
+  size -= 2;
+
+  GAUD_Stream * stream = NULL;
+  if (gaud_stream_create_memory(data, size, &stream) != GAUD_OK) {
+    return;
+  }
+  OGG_Page_Info page;
+  memset(&page, 0, sizeof(page));
+  if (gaud_ogg_find_page(stream, NULL, from, size, &page) == GAUD_OK) {
+    if (page.offset < from || page.offset >= size) {
+      abort(); /* Outside the window it was asked about. */
+    }
+    if (page.next <= page.offset || page.next > size) {
+      abort(); /* A `next` like this is an infinite loop in the caller. */
+    }
+    if (page.body > OGG_MAX_BODY || page.segments > OGG_MAX_SEGMENTS) {
+      abort();
+    }
+    /* A function of its input: the same question twice, same answer. */
+    OGG_Page_Info again;
+    memset(&again, 0, sizeof(again));
+    if (gaud_ogg_find_page(stream, NULL, from, size, &again) != GAUD_OK
+        || memcmp(&page, &again, sizeof(page)) != 0) {
+      abort();
+    }
+
+    /* The bisection and the length, which both need a serial. The one
+     * just found is used, so they are asked about a stream that exists
+     * rather than one that does not. */
+    OGG_Reader reader;
+    gaud_ogg_reader_init(&reader, stream, NULL);
+    reader.serial = page.serial;
+    reader.have_serial = true;
+    uint64_t target = page.granule == OGG_NO_GRANULE ? 0 : page.granule;
+    uint64_t offset = UINT64_MAX;
+    uint64_t granule = UINT64_MAX;
+    if (gaud_ogg_bisect(&reader, target, 0, &offset, &granule) == GAUD_OK) {
+      if (offset > size) {
+        abort();
+      }
+      if (granule > target) {
+        abort(); /* Past the target: samples the caller cannot reach. */
+      }
+      /* And reading from where it landed must yield packets or stop. */
+      if (gaud_ogg_reader_seek(&reader, offset) == GAUD_OK) {
+        for (int i = 0; i < 16; ++i) {
+          const unsigned char * packet = NULL;
+          size_t packet_size = 0;
+          if (gaud_ogg_reader_packet(&reader, &packet, &packet_size, NULL,
+                  NULL)
+              != GAUD_OK) {
+            break;
+          }
+          if (packet_size > size) {
+            abort();
+          }
+        }
+      }
+    }
+    gaud_ogg_reader_free(&reader);
+
+    uint64_t last = 0;
+    (void)gaud_ogg_last_granule(stream, NULL, page.serial, &last);
+
+    OGG_Logical streams[OGG_MAX_LOGICAL];
+    size_t count = 0;
+    if (gaud_ogg_scan_logical(stream, NULL, streams, OGG_MAX_LOGICAL, &count)
+        == GAUD_OK) {
+      if (count > OGG_MAX_LOGICAL) {
+        abort();
+      }
+      for (size_t i = 0; i < count; ++i) {
+        if (streams[i].head_size > OGG_HEAD_KEPT) {
+          abort();
+        }
+        if (streams[i].offset >= size) {
+          abort();
+        }
+      }
+    }
+  }
+  gaud_stream_destroy(stream);
+}
+
+/** One Vorbis identification header, read directly. */
+void fuzz_identification(const uint8_t * data, size_t size) {
+  VORBIS_Info info;
+  memset(&info, 0, sizeof(info));
+  if (gaud_vorbis_parse_identification(data, size, &info) != GAUD_OK) {
+    return;
+  }
+  /* What a caller is entitled to assume about an accepted header, which
+   * is what every later arm of the decoder will be sized from. */
+  if (info.version != 0 || info.channels == 0 || info.sample_rate == 0) {
+    abort();
+  }
+  if (info.blocksize_short < VORBIS_MIN_BLOCKSIZE
+      || info.blocksize_long > VORBIS_MAX_BLOCKSIZE
+      || info.blocksize_short > info.blocksize_long) {
+    abort();
+  }
+  /* Both are powers of two, which is what makes a half-block an exact
+   * shift rather than a division. */
+  if ((info.blocksize_short & (info.blocksize_short - 1u)) != 0
+      || (info.blocksize_long & (info.blocksize_long - 1u)) != 0) {
+    abort();
+  }
+}
+
+/** Load a whole file, for whichever Ogg mapping claims it. */
+void fuzz_file(const uint8_t * data, size_t size) {
+  GAUD_Stream * stream = NULL;
+  if (gaud_stream_create_memory(data, size, &stream) != GAUD_OK) {
+    return;
+  }
+  GAUD_Limits limits;
+  gaud_limits_default(&limits);
+  limits.max_metadata_bytes = 1u << 20;
+  limits.max_picture_bytes = 1u << 18;
+  limits.max_frames = 1u << 22;
+
+  GAUD_Doc * doc = NULL;
+  GAUD_Diagnostics diagnostics;
+  gaud_diagnostics_init(&diagnostics, NULL);
+  if (gaud_doc_load(NULL, stream, &limits, &diagnostics, &doc) == GAUD_OK) {
+    GAUD_Track * track = gaud_doc_track(doc, 0);
+    if (track) {
+      uint64_t frames = gaud_track_frames(track);
+      if (frames != UINT64_MAX && frames > limits.max_frames) {
+        abort(); /* A limit that was checked and then exceeded. */
+      }
+      GAUD_Decoder * decoder = NULL;
+      if (gaud_decoder_create(track, &decoder) == GAUD_OK) {
+        GAUD_Buffer * buffer = NULL;
+        if (gaud_decoder_buffer_create(decoder, NULL, 503u, &buffer)
+            == GAUD_OK) {
+          for (int i = 0; i < 64; ++i) {
+            if (gaud_decoder_read(decoder, buffer) != GAUD_OK) {
+              break;
+            }
+            if (gaud_buffer_frames(buffer) == 0) {
+              break;
+            }
+            if (gaud_buffer_frames(buffer) > gaud_buffer_capacity(buffer)) {
+              abort();
+            }
+          }
+          uint64_t target = ((uint64_t)data[size - 1u] << 8) | data[0];
+          uint64_t landed = UINT64_MAX;
+          if (gaud_decoder_seek(decoder, target, &landed) == GAUD_OK) {
+            if (frames != UINT64_MAX && landed > frames) {
+              abort();
+            }
+            if (gaud_decoder_read(decoder, buffer) == GAUD_OK
+                && frames != UINT64_MAX
+                && landed + gaud_buffer_frames(buffer) > frames) {
+              abort();
+            }
+          }
+          gaud_buffer_destroy(buffer);
+        }
+        gaud_decoder_destroy(decoder);
+      }
+    }
+    gaud_doc_destroy(doc);
+  }
+  gaud_diagnostics_destroy(&diagnostics);
+  gaud_stream_destroy(stream);
+}
+
+} // namespace
+
+int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
+  if (size < 2) {
+    return 0;
+  }
+  /* The first byte selects the entry point. Without it a corpus of whole
+   * files would never reach the seek layer: a loader reaches it only
+   * after the mapping's signature has already been accepted, and almost
+   * every mutation breaks that first. */
+  unsigned mode = data[0] % 4u;
+  const uint8_t * body = data + 1;
+  size_t body_size = size - 1u;
+  switch (mode) {
+  case 0:
+    fuzz_file(body, body_size);
+    break;
+  case 1:
+    fuzz_packets(body, body_size);
+    break;
+  case 2:
+    fuzz_scan(body, body_size);
+    break;
+  default:
+    fuzz_identification(body, body_size);
+    break;
+  }
+  return 0;
+}

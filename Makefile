@@ -772,6 +772,11 @@ check-mpeg-input: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_mpeg_input.py
 
+check-vorbis: ## Fail if a reference disagrees about what a Vorbis stream is
+check-vorbis: $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
+		python3 $(ORACLE)/check_vorbis.py
+
 check-writer: ## Fail if a reference cannot read what our writer produced
 check-tags: ## Fail if a reference reads our tags differently than we do
 check-tags: $(TAG_PROBE)
@@ -906,7 +911,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: check-outoftree check-golden
 .PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
 .PHONY: oracle-build oracle-probe oracle-version check-tags
-.PHONY: check-mpeg check-mpeg-input mpeg-coverage
+.PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1523,7 +1528,7 @@ endef
 # decoders only through a header the fuzzer has to synthesise correctly
 # first, so nearly every input dies at the chunk walk and the nibble loops
 # see almost nothing. `coded` hands the bytes straight to the block layer.
-FUZZ_HARNESSES := wav aiff coded tags flac mpeg
+FUZZ_HARNESSES := wav aiff coded tags flac mpeg ogg
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
