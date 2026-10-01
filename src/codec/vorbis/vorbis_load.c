@@ -33,13 +33,16 @@
  * that is not seekable cannot be opened into a document at all - the same
  * refusal mp3_load.c makes, for the same reason.
  *
- * **Why the setup header is read and thrown away.** It holds the
- * codebooks, floors, residues and modes - the entire definition of how the
- * audio packets are coded - and none of that is a property a caller can
- * ask a document about. It is validated here, because a stream missing it
- * is not a Vorbis stream and saying so at open time is better than saying
- * it at the first read, and then discarded; the decoder parses it when
- * there is a decoder.
+ * **The setup header is parsed at open and kept on the document**, not on
+ * the decoder. None of it is a property a caller can ask about - the
+ * codebooks, floors, residues and modes are the definition of how the
+ * audio packets are coded and nothing else - but every decoder on the
+ * track needs the same parsed copy, and parsing it per decoder would make
+ * opening two decoders on one track twice the work for identical results.
+ * It is also where a stream that is malformed in a way no later packet
+ * could recover from is refused: a mapping names a floor by number, and
+ * checking that number once here is what lets the audio path index an
+ * array without a bound check in its inner loop.
  */
 
 #include "../../container/ogg/ogg.h"
@@ -181,8 +184,14 @@ static GAUD_Result read_headers(OGG_Reader * reader, VORBIS_File * state,
   if (!gaud_vorbis_is_header(packet, size, VORBIS_PACKET_SETUP)) {
     return GAUD_ERR_CORRUPT;
   }
-  /* Validated and discarded: see the note at the head of this file. */
-  (void)diagnostics;
+  state->setup.allocator = state->allocator;
+  result = gaud_vorbis_parse_setup(
+      packet, size, state->info.channels, limits, &state->setup);
+  if (result != GAUD_OK) {
+    note(diagnostics, 0, GAUD_DIAG_ERROR,
+        "the setup header does not describe a stream this can decode");
+    return result;
+  }
   return GAUD_OK;
 }
 
@@ -306,6 +315,7 @@ Fail:
     gaud_doc_destroy(doc);
   }
   else if (state) {
+    gaud_vorbis_setup_free(&state->setup);
     gcu_allocator_free(allocator, state);
   }
   gaud_meta_destroy(meta);
@@ -318,6 +328,7 @@ void gaud_vorbis_close(const GAUD_Codec * codec, GAUD_Doc * doc) {
   if (!state) {
     return;
   }
+  gaud_vorbis_setup_free(&state->setup);
   gcu_allocator_free(state->allocator, state);
   gaud_doc_set_private(doc, NULL);
 }

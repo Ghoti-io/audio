@@ -56,9 +56,12 @@ This is what is implemented:
   twelve rows two standards also define. See \ref format_mpeg
   "formats/mpeg.md".
 
-- **Vorbis** - Vorbis I in Ogg. **Identified, not yet decoded.** The three
-  header packets, the channel count, the sample rate, the two block sizes,
-  the tags out of the comment header, and the length. The length is the
+- **Vorbis** - Vorbis I in Ogg. **Read and not yet decoded.** The three
+  header packets - including the whole setup header, which is the
+  codebooks, both floor types, all three residue types, the channel
+  coupling and the block modes, and which is most of the format - plus
+  the channel count, the sample rate, the two block sizes, the tags out
+  of the comment header, and the length. The length is the
   part worth naming: a Vorbis stream states it *nowhere* - not in a
   header, not in a trailer - so the only answer is the granule position
   on its last page, and reading it is what `make check-vorbis` scores
@@ -339,6 +342,7 @@ How it is judged:
 | `make check-outoftree` | A codec in another repository works |
 | `make fuzz` | Six harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, `coded`, which drives the block layer below any container because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does, and `mpeg`, where the opposite is true: MPEG audio has no container to synthesise, so nearly every input reaches the frame search. `coded` found a real defect in its first minute; `mpeg` found two in its first ten, and neither was a crash - a header struct whose padding made two parses of one header compare unequal, and a document whose audio began past the end of its own file. **It then found eight more on a corpus that had grown since**, all one defect: every addition in the Q28 pipeline was signed overflow on a frame that states a legal global_gain near the top of its eight-bit range. The corpus is tracked in the repository for exactly this - it is the population that walks the arithmetic, and a run against a bigger one is a different experiment |
 | `make mpeg-coverage` | The same instrument for MPEG audio, and the same reason: 63 of 72 named arms are reached by the corpus, and **no reachable arm is now unreached**. Two of the remaining nine are unreachable by construction (the standard marks those Huffman tables unused), five need an encoder nothing in the image is - LAME has never implemented intensity stereo, and nothing emits a mixed block - and two are covered by unit tests on hand-built frames instead. The last five Huffman tables fell to one change: giving the stereo noise and transient fixtures channels that actually differ |
+| `make vorbis-coverage` | Not pass/fail either: it counts which arms of the Vorbis *setup* parser the corpus reaches, and names the four it cannot reach at all. A Vorbis stream states its own codebooks, floor curves, residue layout, channel coupling and block modes - everything an MP3 decoder takes from a standard - so these branches are selected by the encoder that wrote each fixture, and a corpus samples encoders even more sharply than a corpus of MP3s does. It also carries the measurement that sized the fixed point: every codebook value in the corpus is an integer, the largest is 7,448, and the first draft of that constant saturated on two of the ten fixtures |
 | `make flac-coverage` | Not pass/fail: it counts which named arms of the FLAC frame decoder the corpus actually reaches. It exists because `check-corpus` agreed byte for byte with every reference on every fixture while a third of the subframe decoder had never run - a codec's branches are selected by the *encoder*, so a corpus samples encoders rather than the format |
 
 The corpus is generated **by** the references and never by this library: one

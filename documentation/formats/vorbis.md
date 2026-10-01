@@ -12,12 +12,42 @@ argues is a commit of its own and warns must not become a resting place.
 
 **The three header packets.** A Vorbis stream begins with exactly three:
 identification, comment and setup, in that order, with the first alone on
-the first page. All three are read; the first two are kept and the third
-is validated and discarded, because everything in it - the codebooks, the
-floor curves, the residue layout, the channel coupling and the block
-modes - is a property of how the audio is coded and not of what the track
-is. A stream missing any of them is refused at open rather than at the
-first read.
+the first page. All three are read and all three are kept. A stream
+missing any of them is refused at open rather than at the first read.
+
+**The whole setup header**, which is most of the format: the codebooks
+with their prefix codes and vector lookups, floor types 0 and 1, residue
+types 0, 1 and 2, the mappings with their channel coupling and submaps,
+and the modes. Everything an MP3 decoder would have taken from a standard,
+a Vorbis stream states here - so there are no tables in this codec to
+extract from a document the way the MPEG ones were.
+
+Two things about it are worth naming because they have no analogue in any
+other format here:
+
+- **A codebook states code lengths and not codewords.** The codewords
+  follow by a procedure: each entry in turn takes the numerically
+  smallest codeword of its own length that is neither a prefix of an
+  assigned one nor prefixed by one. *Entry* order, not length order,
+  which is what separates it from a canonical Huffman code - two
+  codebooks with the same multiset of lengths in different orders have
+  different codewords. There is no partial credit: a decoder that
+  assigned them differently reads every entry of every codebook wrong.
+  The unit test asserts the specification's own worked example, copied
+  from the document.
+- **Building the code is how a malformed one is found.** Lengths may
+  describe a tree with no room for an entry they name, which is refused;
+  or one with nodes left over, which is accepted, because real streams
+  contain them and the spare nodes simply match no codeword at decode
+  time.
+
+**Everything a later packet will index is range-checked at open.** A
+mapping names a floor by number, a residue names codebooks, a mode names a
+mapping, and all of those come out of a file. Checking them once here is
+what lets the audio path index those arrays with no bound check in its
+inner loops - and the fuzz harness asserts the same invariants, so a
+setup accepted with an index out of range fails there rather than becoming
+a memory error when a packet arrives.
 
 **Every field of the identification header, with every bound.** The
 version, which must be zero and is refused otherwise as a different
@@ -44,13 +74,48 @@ track. A caller can ask rather than read a paragraph.
 **Writing.** Phase 8 brings the perceptual encoders with the two-gate
 harness their output needs.
 
-**Floor type 0 and residue type 0** will be unexercised by any corpus
-this tree can build, and that is worth recording before the decoder
-arrives rather than after. Both are in the specification; neither is
-produced by libvorbis or by libavcodec at any setting, because both were
-superseded before Vorbis I was finished. Whatever this library does with
-them will be scored by reading the specification and by hand-built
-streams, not by a fixture.
+**Four arms of the format that no corpus here can reach.** `make
+vorbis-coverage` names them with the reason, which is the same reason for
+all four: nothing libvorbis or libavcodec produces at any setting uses
+them.
+
+| arm | why no encoder emits it |
+| --- | --- |
+| floor type 0 | Line spectral pairs. Superseded by floor 1 before Vorbis I was finished |
+| residue type 0 | The original layout, which interleaves a partition's values where types 1 and 2 keep them contiguous. Same history |
+| codebook lookup type 2 | States every entry's vector explicitly rather than as a lattice: entries times dimensions multiplicands where a lattice stores one per axis, so it is legal and enormous |
+| a sequential codebook | `sequence_p`, where a vector's values accumulate. Used by floor 0's codebooks and nothing else |
+
+Two of the four - lookup type 2 and `sequence_p` - already have
+hand-built streams in the unit tests, which is the only way to reach
+either. The other two arrive with the decoder.
+
+**Recording this before the decoder is written is the point.** Found
+afterwards, the same four are a coverage hole with an excuse attached.
+
+## What the corpus does cover, measured
+
+`make vorbis-coverage` over the ten fixtures, which is 363 codebooks from
+two encoders:
+
+- **lookup types**: 229 with none, 134 lattice, 0 explicit
+- **sparse codebooks**: 160 of 363 have an unused entry
+- **longest codeword** 22 bits; **widest vector** 8 values; **most
+  entries** 6,561, which is 3 to the 8th and so a lattice of three
+- **floors**: 19 of type 1, none of type 0; **multipliers** 2 and 4
+- **residues**: 6 of type 1, 13 of type 2, none of type 0; 3 or 4 passes
+- **mappings**: 16 with one submap, 2 with two; coupling steps 0, 1 and 4
+- **modes**: 10 short-block, 9 long-block
+- **block size pairs**: 256/2048, 512/512, 512/1024, 2048/2048
+
+And the measurement that sized the arithmetic: every codebook vector
+value in the corpus is an **integer**, the smallest nonzero magnitude
+anywhere is exactly 1.0, and the largest is 7,448. That is not a
+coincidence - a residue codebook quantises the spectrum to integers and
+the floor carries the scale, so both encoders choose a delta of one.
+`VORBIS_Q` is 16 on that evidence, with 4.4 times the measured extreme in
+reserve; the first draft was Q20 and saturated on two of the ten
+fixtures, which is how 7,448 came to be measured rather than assumed.
 
 ## The length is not in the file
 

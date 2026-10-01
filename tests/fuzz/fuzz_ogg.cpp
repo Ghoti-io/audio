@@ -47,6 +47,12 @@
  *   cannot be reached at all.
  * - **A scan is a function of its input.** The same offset searched
  *   twice gives the same page, so nothing is carried between calls.
+ * - **A setup header that was accepted has every index in range.** A
+ *   mapping names a floor by number, a residue names codebooks, a mode
+ *   names a mapping - all out of a file. The audio path has no bound
+ *   check in its inner loops because the parser established these, so a
+ *   setup accepted with one out of range is a memory error waiting for a
+ *   packet rather than a wrong answer.
  *
  * Build with: make fuzz-ogg
  * Run:        make fuzz-run-ogg FUZZ_TIME=300
@@ -226,6 +232,137 @@ void fuzz_identification(const uint8_t * data, size_t size) {
   }
 }
 
+/**
+ * One Vorbis setup header, read directly.
+ *
+ * **The arm with the most arithmetic in it and the least reachable from
+ * a file.** A setup header defines the codebooks, floors, residues,
+ * mappings and modes - every table an MP3 decoder would have got from a
+ * standard - so it is where a length, a count or an index out of a file
+ * becomes an array subscript. Reaching it through a loader means getting
+ * two valid header packets past first, which almost no mutation does.
+ */
+void fuzz_setup(const uint8_t * data, size_t size) {
+  if (size < 2) {
+    return;
+  }
+  /* One to eight channels, because the coupling fields' widths are
+   * ilog(channels - 1) and a mono stream reads them as zero bits. */
+  uint32_t channels = (uint32_t)(data[0] % 8u) + 1u;
+  ++data;
+  --size;
+
+  /* The signature the parser requires, in front of the fuzzer's bytes. */
+  size_t total = VORBIS_HEAD_SIZE + size;
+  uint8_t * packet = (uint8_t *)malloc(total);
+  if (!packet) {
+    return;
+  }
+  packet[0] = VORBIS_PACKET_SETUP;
+  memcpy(packet + 1, "vorbis", 6);
+  memcpy(packet + VORBIS_HEAD_SIZE, data, size);
+
+  GAUD_Limits limits;
+  gaud_limits_default(&limits);
+  VORBIS_Setup setup;
+  memset(&setup, 0, sizeof(setup));
+  setup.allocator = NULL;
+  if (gaud_vorbis_parse_setup(packet, total, channels, &limits, &setup)
+      == GAUD_OK) {
+    /*
+     * Everything a later packet will index, checked here - which is the
+     * property the parser exists to establish. The audio path has no
+     * bound check in its inner loops because of these, so a setup that
+     * was accepted with an index out of range is a memory error waiting
+     * for a packet rather than a wrong answer.
+     */
+    if (setup.mode_bits != gaud_vorbis_ilog(setup.mode_count - 1u)) {
+      abort();
+    }
+    for (uint32_t i = 0; i < setup.mode_count; ++i) {
+      if (setup.modes[i].mapping >= setup.mapping_count) {
+        abort();
+      }
+    }
+    for (uint32_t i = 0; i < setup.mapping_count; ++i) {
+      const VORBIS_Mapping * mapping = &setup.mappings[i];
+      if (mapping->submaps == 0 || mapping->submaps > VORBIS_MAX_SUBMAPS) {
+        abort();
+      }
+      for (uint32_t j = 0; j < mapping->submaps; ++j) {
+        if (mapping->floor[j] >= setup.floor_count
+            || mapping->residue[j] >= setup.residue_count) {
+          abort();
+        }
+      }
+      for (uint32_t j = 0; j < mapping->coupling_steps; ++j) {
+        if (mapping->magnitude[j] >= channels
+            || mapping->angle[j] >= channels
+            || mapping->magnitude[j] == mapping->angle[j]) {
+          abort();
+        }
+      }
+      for (uint32_t ch = 0; ch < channels; ++ch) {
+        if (mapping->mux[ch] >= mapping->submaps) {
+          abort();
+        }
+      }
+    }
+    for (uint32_t i = 0; i < setup.residue_count; ++i) {
+      const VORBIS_Residue * residue = &setup.residues[i];
+      if (residue->begin > residue->end
+          || residue->classifications > VORBIS_RESIDUE_CLASSES
+          || residue->classbook >= setup.codebook_count
+          || residue->passes > 8u) {
+        abort();
+      }
+      for (uint32_t c = 0; c < residue->classifications; ++c) {
+        for (unsigned pass = 0; pass < 8u; ++pass) {
+          int16_t book = residue->book[c][pass];
+          if (book >= 0 && (uint32_t)book >= setup.codebook_count) {
+            abort();
+          }
+        }
+      }
+    }
+    for (uint32_t i = 0; i < setup.floor_count; ++i) {
+      const VORBIS_Floor * one = &setup.floors[i];
+      if (one->type != 0 && one->type != 1u) {
+        abort();
+      }
+      if (one->type == 1u) {
+        if (one->u.one.values > VORBIS_FLOOR1_VALUES
+            || one->u.one.multiplier == 0 || one->u.one.multiplier > 4u) {
+          abort();
+        }
+        /* The sorted order is what rendering walks, and a repeated X
+         * position is refused at parse because a renderer handed one
+         * divides by a run of zero. */
+        for (uint32_t k = 1; k < one->u.one.values; ++k) {
+          if (one->u.one.x_list[one->u.one.sorted[k]]
+              <= one->u.one.x_list[one->u.one.sorted[k - 1u]]) {
+            abort();
+          }
+        }
+      }
+    }
+    for (uint32_t i = 0; i < setup.codebook_count; ++i) {
+      const VORBIS_Codebook * book = &setup.codebooks[i];
+      if (book->lookup_type > 2u) {
+        abort();
+      }
+      if (book->lookup_type && !book->values) {
+        abort();
+      }
+      if (book->used > book->entries) {
+        abort();
+      }
+    }
+  }
+  gaud_vorbis_setup_free(&setup);
+  free(packet);
+}
+
 /** Load a whole file, for whichever Ogg mapping claims it. */
 void fuzz_file(const uint8_t * data, size_t size) {
   GAUD_Stream * stream = NULL;
@@ -297,7 +434,7 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
    * files would never reach the seek layer: a loader reaches it only
    * after the mapping's signature has already been accepted, and almost
    * every mutation breaks that first. */
-  unsigned mode = data[0] % 4u;
+  unsigned mode = data[0] % 5u;
   const uint8_t * body = data + 1;
   size_t body_size = size - 1u;
   switch (mode) {
@@ -310,8 +447,11 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   case 2:
     fuzz_scan(body, body_size);
     break;
-  default:
+  case 3:
     fuzz_identification(body, body_size);
+    break;
+  default:
+    fuzz_setup(body, body_size);
     break;
   }
   return 0;

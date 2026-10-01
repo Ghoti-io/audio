@@ -506,6 +506,691 @@ TEST(VorbisLoad, AnUnseekableStreamIsRefusedWithAReason) {
   gaud_stream_destroy(file);
 }
 
+/* --------------------------------------------- the bit packing and ilog */
+
+namespace {
+
+/** A least-significant-bit-first writer, for building packets by hand. */
+class BitWriter {
+public:
+  void put(uint32_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i) {
+      if (at_ == 0) {
+        bytes_.push_back(0);
+      }
+      if ((value >> i) & 1u) {
+        bytes_.back() |= (unsigned char)(1u << at_);
+      }
+      at_ = (at_ + 1u) & 7u;
+    }
+  }
+  const std::vector<unsigned char> & bytes() const {
+    return bytes_;
+  }
+
+private:
+  std::vector<unsigned char> bytes_;
+  unsigned at_ = 0;
+};
+
+/** The 32-bit form of @p value as the specification's float32 packing. */
+uint32_t Float32(int mantissa, int exponent) {
+  uint32_t packed = (uint32_t)(mantissa < 0 ? -mantissa : mantissa);
+  packed |= (uint32_t)(exponent + 788) << 21;
+  if (mantissa < 0) {
+    packed |= 0x80000000u;
+  }
+  return packed;
+}
+
+} // namespace
+
+TEST(VorbisBits, TheFirstBitReadIsTheLeastSignificant) {
+  /*
+   * **The single most consequential difference between reading Vorbis and
+   * reading anything else here.** FLAC and MPEG take a field's first bit
+   * from the most significant end; Vorbis takes it from the least. A
+   * reader that got it backwards reads the identification header
+   * perfectly - it is byte-aligned apart from two nibbles sharing a byte
+   * - and reads every codebook as noise.
+   *
+   * The byte 0x4D is 0b01001101. Read as 8 one-bit fields the answers are
+   * 1,0,1,1,0,0,1,0 - the bits from the bottom up. Read as one 8-bit
+   * field the answer is 0x4D, which is the same either way and is why a
+   * test on whole bytes cannot see the difference. Read as 3 then 5 the
+   * answers are 5 and 9; the other order gives 2 and 13.
+   */
+  const unsigned char data[] = {0x4Du, 0xA2u};
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, data, sizeof(data));
+  const unsigned expected[] = {1u, 0u, 1u, 1u, 0u, 0u, 1u, 0u};
+  for (unsigned i = 0; i < 8u; ++i) {
+    EXPECT_EQ(gaud_vorbis_bits_read(&bits, 1), expected[i]) << i;
+  }
+
+  gaud_vorbis_bits_init(&bits, data, sizeof(data));
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 3), 5u);
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 5), 9u);
+
+  /* And across a byte boundary, where the field's low bits come from the
+   * first byte and its high bits from the second. */
+  gaud_vorbis_bits_init(&bits, data, sizeof(data));
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 4), 0xDu);
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 8), 0x24u);
+  EXPECT_FALSE(bits.past_end);
+}
+
+TEST(VorbisBits, ReadingPastTheEndYieldsZeroAndSaysSo) {
+  /* Not an error by itself: the specification makes a truncated packet at
+   * the end of a stream a legitimate end of decode. What must not happen
+   * is a read of memory past the packet, and what must happen is that the
+   * caller can tell. */
+  const unsigned char data[] = {0xFFu};
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, data, sizeof(data));
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 8), 0xFFu);
+  EXPECT_FALSE(bits.past_end);
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 4), 0u);
+  EXPECT_TRUE(bits.past_end);
+
+  /* A read that straddles the end returns the bits it had and zeros for
+   * the rest, which for an LSB-first field means the low bits are real. */
+  gaud_vorbis_bits_init(&bits, data, sizeof(data));
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 4), 0xFu);
+  EXPECT_EQ(gaud_vorbis_bits_read(&bits, 8), 0xFu);
+  EXPECT_TRUE(bits.past_end);
+}
+
+TEST(VorbisBits, IlogIsABitCountAndNotALogarithm) {
+  /*
+   * They differ by exactly one at every power of two, and a reader that
+   * used a logarithm reads a mode number or an ordered codebook's run
+   * length with the wrong field width - which misaligns everything after
+   * it. So the powers of two are the whole test, and the values between
+   * them are there to show the function is not simply off by one.
+   */
+  EXPECT_EQ(gaud_vorbis_ilog(0u), 0u);
+  EXPECT_EQ(gaud_vorbis_ilog(1u), 1u);
+  EXPECT_EQ(gaud_vorbis_ilog(2u), 2u);
+  EXPECT_EQ(gaud_vorbis_ilog(3u), 2u);
+  EXPECT_EQ(gaud_vorbis_ilog(4u), 3u);
+  EXPECT_EQ(gaud_vorbis_ilog(7u), 3u);
+  EXPECT_EQ(gaud_vorbis_ilog(8u), 4u);
+  EXPECT_EQ(gaud_vorbis_ilog(255u), 8u);
+  EXPECT_EQ(gaud_vorbis_ilog(256u), 9u);
+  EXPECT_EQ(gaud_vorbis_ilog(0xFFFFFFFFu), 32u);
+}
+
+TEST(VorbisBits, Lookup1ValuesIsComputedAndNotEstimated) {
+  /*
+   * How many multiplicands a lattice codebook stores: the greatest r with
+   * r to the dimensions not above the entries. **By search and not by
+   * `pow`**, because `floor(pow(entries, 1.0/dim))` is off by one at
+   * exact powers on some platforms - and that would make a codebook's
+   * multiplicand count differ by architecture, so every bit read after it
+   * would be misaligned on one machine and not another. Section 11.1
+   * promises the same bytes everywhere; this is one of the places that
+   * could quietly break it.
+   *
+   * The exact powers are therefore the test. 6,561 is 3 to the 8th and
+   * appears in this corpus; 6,560 must give 2.
+   */
+  EXPECT_EQ(gaud_vorbis_lookup1_values(6561u, 8u), 3u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(6560u, 8u), 2u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(6562u, 8u), 3u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(1u, 1u), 1u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(100u, 1u), 100u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(289u, 2u), 17u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(288u, 2u), 16u);
+  /* 2^31 is 2 to the 31st exactly, where a double has no room to be
+   * wrong but a float would. */
+  EXPECT_EQ(gaud_vorbis_lookup1_values(0x80000000u, 31u), 2u);
+  EXPECT_EQ(gaud_vorbis_lookup1_values(0x7FFFFFFFu, 31u), 1u);
+}
+
+/* ------------------------------------------------------------ codebooks */
+
+namespace {
+
+/** A codebook packet with the given lengths and no lookup. */
+std::vector<unsigned char> Codebook(const std::vector<unsigned> & lengths,
+    bool ordered = false, unsigned dimensions = 1u) {
+  BitWriter w;
+  w.put(0x564342u, 24);
+  w.put(dimensions, 16);
+  w.put((uint32_t)lengths.size(), 24);
+  w.put(ordered ? 1u : 0u, 1);
+  if (!ordered) {
+    bool sparse = false;
+    for (unsigned length : lengths) {
+      if (length == 0) {
+        sparse = true;
+      }
+    }
+    w.put(sparse ? 1u : 0u, 1);
+    for (unsigned length : lengths) {
+      if (sparse) {
+        w.put(length ? 1u : 0u, 1);
+        if (!length) {
+          continue;
+        }
+      }
+      w.put(length - 1u, 5);
+    }
+  }
+  else {
+    /* Runs: the first length, then how many entries share it, then how
+     * many share the next, and so on. The run width shrinks as entries
+     * are filled, which is what ilog is for. */
+    size_t filled = 0;
+    unsigned length = lengths[0];
+    while (filled < lengths.size()) {
+      size_t run = 0;
+      while (filled + run < lengths.size()
+          && lengths[filled + run] == length) {
+        ++run;
+      }
+      if (filled == 0) {
+        w.put(length - 1u, 5);
+      }
+      w.put((uint32_t)run,
+          gaud_vorbis_ilog((uint32_t)(lengths.size() - filled)));
+      filled += run;
+      ++length;
+    }
+  }
+  w.put(0, 4); /* lookup_type 0 */
+  return w.bytes();
+}
+
+} // namespace
+
+TEST(VorbisCodebook, TheSpecificationsWorkedExampleComesOutExactly) {
+  /*
+   * **A codebook states lengths and not codewords**, and this is the one
+   * test that can show the assignment is right rather than merely
+   * self-consistent: the eight lengths and the eight codewords below are
+   * the worked example in the Vorbis I specification's codebook section,
+   * copied from the document and not from this implementation.
+   *
+   * There is no partial credit here. A decoder that assigned codewords
+   * differently reads every entry of every codebook wrong, which looks
+   * like noise rather than like a parse failure - so a stream either
+   * decodes or does not, and nothing in between would point at this.
+   *
+   * Note that entry order and not length order is what drives it: entry 5
+   * has length 2 and comes after four entries of length 4, and its
+   * codeword is 10. A canonical Huffman code - lengths sorted first -
+   * would give a different answer for the same multiset of lengths.
+   */
+  const std::vector<unsigned> lengths = {2u, 4u, 4u, 4u, 4u, 2u, 3u, 3u};
+  const char * expected[] = {"00", "0100", "0101", "0110", "0111", "10",
+      "110", "111"};
+
+  std::vector<unsigned char> packet = Codebook(lengths);
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+  VORBIS_Codebook book;
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  ASSERT_EQ(book.entries, lengths.size());
+  ASSERT_EQ(book.used, lengths.size());
+
+  for (uint32_t k = 0; k < book.used; ++k) {
+    uint32_t entry = book.entry_of[k];
+    unsigned length = book.lengths[entry];
+    std::string written;
+    for (unsigned bit = 0; bit < length; ++bit) {
+      written += ((book.codewords[k] >> (length - 1u - bit)) & 1u) ? '1'
+                                                                   : '0';
+    }
+    EXPECT_EQ(written, std::string(expected[entry])) << "entry " << entry;
+  }
+
+  /* And the other direction: the codeword's bits, fed to the decoder,
+   * must come back as the entry. The codeword is read most significant
+   * bit first - the tree is walked from the root - which is the one place
+   * in this format where bits are *not* taken least significant first,
+   * and it falls out of the bit reader rather than being a special case:
+   * one bit at a time is the same in either order. */
+  for (size_t entry = 0; entry < lengths.size(); ++entry) {
+    BitWriter w;
+    const char * code = expected[entry];
+    for (const char * c = code; *c; ++c) {
+      w.put(*c == '1' ? 1u : 0u, 1);
+    }
+    /* A trailing one, so a decoder that read one bit too many lands
+     * somewhere rather than running off the packet and reporting the
+     * end. */
+    w.put(1u, 1);
+    std::vector<unsigned char> encoded = w.bytes();
+    VORBIS_Bits reading;
+    gaud_vorbis_bits_init(&reading, encoded.data(), encoded.size());
+    EXPECT_EQ(gaud_vorbis_codebook_decode(&book, &reading), entry)
+        << "codeword " << code;
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+}
+
+TEST(VorbisCodebook, AnOverpopulatedTreeIsRefusedAndAnUnderpopulatedOneIsNot) {
+  /*
+   * Two directions, and they are not symmetric.
+   *
+   * **Overpopulated is refused**: three codewords of length one cannot
+   * exist, because a one-bit code has two of them. Building the code is
+   * the only way to find that out, which is the argument for building it
+   * at open rather than decoding lazily.
+   *
+   * **Underpopulated is accepted**, because real streams contain them -
+   * an encoder that reserved code space it then did not use writes one -
+   * and the leftover nodes simply match no codeword. So the refusal has
+   * to be at decode time and per bit pattern, not at parse time for the
+   * whole book.
+   */
+  std::vector<unsigned char> over = Codebook({1u, 1u, 1u});
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, over.data(), over.size());
+  VORBIS_Codebook book;
+  EXPECT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book),
+      GAUD_ERR_CORRUPT);
+  gaud_vorbis_codebook_free(nullptr, &book);
+
+  /* Two codewords of length two leaves half the tree empty. */
+  std::vector<unsigned char> under = Codebook({2u, 2u});
+  gaud_vorbis_bits_init(&bits, under.data(), under.size());
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  EXPECT_EQ(book.used, 2u);
+
+  /* 00 and 01 are the two entries; 10 is a pattern no entry stands for. */
+  const struct {
+    const char * code;
+    uint32_t entry;
+  } cases[] = {{"00", 0u}, {"01", 1u}, {"10", UINT32_MAX},
+      {"11", UINT32_MAX}};
+  for (const auto & one : cases) {
+    BitWriter w;
+    for (const char * c = one.code; *c; ++c) {
+      w.put(*c == '1' ? 1u : 0u, 1);
+    }
+    w.put(0u, 6);
+    std::vector<unsigned char> encoded = w.bytes();
+    VORBIS_Bits reading;
+    gaud_vorbis_bits_init(&reading, encoded.data(), encoded.size());
+    EXPECT_EQ(gaud_vorbis_codebook_decode(&book, &reading), one.entry)
+        << one.code;
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+}
+
+TEST(VorbisCodebook, AnOrderedBookStatesRunsAndASparseOneStatesGaps) {
+  /*
+   * Two ways of spelling the same lengths, and both are in the corpus -
+   * 160 of its 363 codebooks are sparse. An ordered book's lengths are
+   * non-decreasing by construction and are stated as run lengths, each
+   * read with `ilog(entries remaining)` bits rather than a fixed width;
+   * a sparse book states a flag per entry and omits the length where the
+   * flag is clear.
+   */
+  const std::vector<unsigned> lengths = {2u, 2u, 3u, 3u, 3u, 3u};
+  std::vector<unsigned char> packet = Codebook(lengths, true);
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+  VORBIS_Codebook book;
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  ASSERT_EQ(book.entries, lengths.size());
+  for (size_t i = 0; i < lengths.size(); ++i) {
+    EXPECT_EQ(book.lengths[i], lengths[i]) << i;
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+
+  /* Sparse: entries 1 and 3 unused, so the code is over three entries
+   * and the unused ones have no codeword at all. */
+  std::vector<unsigned char> sparse = Codebook({2u, 0u, 2u, 0u, 1u});
+  gaud_vorbis_bits_init(&bits, sparse.data(), sparse.size());
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  EXPECT_EQ(book.entries, 5u);
+  EXPECT_EQ(book.used, 3u);
+  EXPECT_EQ(book.lengths[1], 0u);
+  EXPECT_EQ(book.lengths[3], 0u);
+  gaud_vorbis_codebook_free(nullptr, &book);
+}
+
+namespace {
+
+/** A lattice or explicit codebook with the given scalar parameters. */
+std::vector<unsigned char> LookupCodebook(unsigned lookup_type,
+    unsigned dimensions, uint32_t entries, int minimum_mantissa,
+    int minimum_exponent, int delta_mantissa, int delta_exponent,
+    unsigned value_bits, bool sequence_p,
+    const std::vector<uint32_t> & multiplicands) {
+  BitWriter w;
+  w.put(0x564342u, 24);
+  w.put(dimensions, 16);
+  w.put(entries, 24);
+  w.put(0, 1); /* not ordered */
+  w.put(0, 1); /* not sparse */
+  for (uint32_t i = 0; i < entries; ++i) {
+    /* Every entry the same length, which for a power-of-two entry count
+     * is a complete tree. The code is not what this test is about. */
+    w.put(gaud_vorbis_ilog(entries - 1u) - 1u, 5);
+  }
+  w.put(lookup_type, 4);
+  w.put(Float32(minimum_mantissa, minimum_exponent), 32);
+  w.put(Float32(delta_mantissa, delta_exponent), 32);
+  w.put(value_bits - 1u, 4);
+  w.put(sequence_p ? 1u : 0u, 1);
+  for (uint32_t one : multiplicands) {
+    w.put(one, value_bits);
+  }
+  return w.bytes();
+}
+
+} // namespace
+
+TEST(VorbisCodebook, ALatticeBookReadsTheEntryAsANumberInBaseR) {
+  /*
+   * A lattice codebook stores one multiplicand per axis and reads the
+   * entry number as a number in that base, lowest digit first - which is
+   * how a book of 6,561 entries fits in three multiplicands. Four
+   * entries, two dimensions, base two:
+   *
+   *   entry 0 -> digits (0, 0)   entry 2 -> digits (0, 1)
+   *   entry 1 -> digits (1, 0)   entry 3 -> digits (1, 1)
+   *
+   * **Lowest digit first, and that is the part a reader gets backwards.**
+   * Entry 1 is (1, 0) and not (0, 1), so its vector is the second
+   * multiplicand then the first. With a symmetric set of multiplicands
+   * the two readings agree, which is why the values below are not
+   * symmetric.
+   */
+  const std::vector<uint32_t> multiplicands = {1u, 5u};
+  /* minimum -1, delta 1: value = -1 + multiplicand. */
+  std::vector<unsigned char> packet = LookupCodebook(1u, 2u, 4u,
+      -(1 << 20), -20, 1 << 20, -20, 4u, false, multiplicands);
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+  VORBIS_Codebook book;
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  ASSERT_NE(book.values, nullptr);
+  EXPECT_EQ(book.lookup_type, 1u);
+
+  const int expected[4][2] = {{0, 0}, {4, 0}, {0, 4}, {4, 4}};
+  for (unsigned entry = 0; entry < 4u; ++entry) {
+    for (unsigned j = 0; j < 2u; ++j) {
+      EXPECT_EQ(book.values[entry * 2u + j], expected[entry][j] * VORBIS_ONE)
+          << "entry " << entry << " value " << j;
+    }
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+}
+
+TEST(VorbisCodebook, AnExplicitBookAndASequentialOneAreBuiltByHand) {
+  /*
+   * **Two of the four arms `make vorbis-coverage` reports as dark**, and
+   * the only way to reach either: no encoder in the oracle image emits a
+   * lookup type 2 codebook at any setting - it stores entries times
+   * dimensions multiplicands where a lattice stores one per axis, so it
+   * is legal and enormous - and none sets `sequence_p`, which floor type
+   * 0's codebooks use and which nothing else does.
+   *
+   * Both are in the format and both are therefore in this parser, so
+   * both get a stream built for them here rather than being left to a
+   * corpus that cannot produce one.
+   */
+  /* Explicit: three entries of two values, listed in order. */
+  const std::vector<uint32_t> listed = {1u, 2u, 3u, 4u, 5u, 6u};
+  std::vector<unsigned char> packet = LookupCodebook(2u, 2u, 3u, 0, 0,
+      1 << 20, -20, 4u, false, listed);
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+  VORBIS_Codebook book;
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  ASSERT_NE(book.values, nullptr);
+  EXPECT_EQ(book.lookup_type, 2u);
+  for (unsigned k = 0; k < 6u; ++k) {
+    EXPECT_EQ(book.values[k], (int32_t)(k + 1u) * VORBIS_ONE) << k;
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+
+  /* Sequential: the same book with `sequence_p`, where each value is
+   * added to the one before it *within an entry*. So entry 0 is 1 then
+   * 1+2=3, and entry 1 is 3 then 3+4=7 - the running sum restarting per
+   * entry, which is the part a reader that carried it across entries
+   * would get wrong on everything after the first. */
+  std::vector<unsigned char> sequential = LookupCodebook(2u, 2u, 3u, 0, 0,
+      1 << 20, -20, 4u, true, listed);
+  gaud_vorbis_bits_init(&bits, sequential.data(), sequential.size());
+  ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK);
+  EXPECT_TRUE(book.sequence_p);
+  const int expected[3][2] = {{1, 3}, {3, 7}, {5, 11}};
+  for (unsigned entry = 0; entry < 3u; ++entry) {
+    for (unsigned j = 0; j < 2u; ++j) {
+      EXPECT_EQ(book.values[entry * 2u + j], expected[entry][j] * VORBIS_ONE)
+          << "entry " << entry << " value " << j;
+    }
+  }
+  gaud_vorbis_codebook_free(nullptr, &book);
+}
+
+TEST(VorbisCodebook, Float32UnpackIsExactForThePowersOfTwoAroundOne) {
+  /*
+   * The specification's float32 is a 21-bit mantissa and a power of two
+   * biased by 788 - not an IEEE float, and a reader that treated the
+   * four bytes as one would get a plausible-looking wrong answer. The
+   * values below are exact in Q16, so the assertion is equality and not
+   * a tolerance.
+   *
+   * The exponents around one are the interesting range: 2^-20 times
+   * 2^20 is one, and the shift this library applies is
+   * `exponent - 788 + 16`, which is zero at exponent 772 and changes
+   * sign on either side - so these cases cover the left shift, the right
+   * shift and the boundary between them.
+   */
+  struct Case {
+    int mantissa;
+    int exponent;
+    int64_t expected_q16;
+  };
+  const Case cases[] = {
+      {1 << 20, -20, VORBIS_ONE},            /* 1.0 */
+      {1 << 20, -19, 2 * VORBIS_ONE},        /* 2.0 */
+      {1 << 20, -21, VORBIS_ONE / 2},        /* 0.5 */
+      {-(1 << 20), -20, -VORBIS_ONE},        /* -1.0 */
+      {3 << 19, -20, 3 * VORBIS_ONE / 2},    /* 1.5 */
+      /* 65,536.0, which Q16 cannot hold at all: the value saturates
+       * rather than wrapping, which is what section 11.1's promise
+       * requires - signed overflow is undefined, not modular, so a
+       * wrapped value could differ between compilers. */
+      {1 << 20, -4, INT32_MAX},
+      /* The bottom of the format's range, where rounding to nearest is
+       * what decides the answer. 2^-16 is exactly one in Q16; 2^-17 is
+       * a half and rounds up; 2^-18 is a quarter and rounds down. A
+       * truncating implementation answers 1, 0, 0 and differs from this
+       * on the middle one. */
+      {1, -16, 1},
+      {1, -17, 1},
+      {1, -18, 0},
+      {0, 0, 0},
+  };
+  for (const auto & one : cases) {
+    /* Read through a codebook, which is the only caller: a lattice of
+     * one entry and one dimension whose single multiplicand is zero, so
+     * the value is the minimum alone. */
+    std::vector<unsigned char> packet = LookupCodebook(1u, 1u, 2u,
+        one.mantissa, one.exponent, 0, 0, 4u, false, {0u, 0u});
+    VORBIS_Bits bits;
+    gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+    VORBIS_Codebook book;
+    ASSERT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book), GAUD_OK)
+        << one.mantissa << " x 2^" << one.exponent;
+    ASSERT_NE(book.values, nullptr);
+    EXPECT_EQ(book.values[0], (int32_t)one.expected_q16)
+        << one.mantissa << " x 2^" << one.exponent;
+    gaud_vorbis_codebook_free(nullptr, &book);
+  }
+}
+
+TEST(VorbisCodebook, AReservedLookupTypeIsRefusedRatherThanSkipped) {
+  /* The format reserves 3 to 15. There is nothing to guess past one: the
+   * fields that follow a lookup differ per type, so a reader that
+   * ignored an unknown type would read the next codebook's sync pattern
+   * out of the middle of this one's data. */
+  for (unsigned type = 3u; type < 16u; ++type) {
+    BitWriter w;
+    w.put(0x564342u, 24);
+    w.put(1u, 16);
+    w.put(2u, 24);
+    w.put(0, 1);
+    w.put(0, 1);
+    w.put(0u, 5);
+    w.put(0u, 5);
+    w.put(type, 4);
+    w.put(0u, 32);
+    std::vector<unsigned char> packet = w.bytes();
+    VORBIS_Bits bits;
+    gaud_vorbis_bits_init(&bits, packet.data(), packet.size());
+    VORBIS_Codebook book;
+    EXPECT_EQ(gaud_vorbis_parse_codebook(&bits, nullptr, &book),
+        GAUD_ERR_CORRUPT)
+        << "lookup type " << type;
+    gaud_vorbis_codebook_free(nullptr, &book);
+  }
+}
+
+/* --------------------------------------------------------- the setup header */
+
+TEST(VorbisSetup, EveryFixturesSetupHeaderParsesAndIsRangeChecked) {
+  /*
+   * The counts are the probe's, which is to say measured: `make
+   * vorbis-coverage` prints them and this asserts them, so a fixture
+   * replaced by a differently-encoded one fails here rather than quietly
+   * changing what the corpus covers.
+   *
+   * What is being checked beyond "it parses" is that every number a later
+   * packet will index is in range. A mapping names a floor by number, a
+   * residue names codebooks, a mode names a mapping; all of those come
+   * out of a file, and checking them once here is what lets the audio
+   * path index an array with no bound check in its inner loop.
+   */
+  struct Expected {
+    const char * name;
+    uint32_t codebooks;
+    uint32_t floors;
+    uint32_t residues;
+    uint32_t mappings;
+    uint32_t modes;
+  };
+  const Expected expected[] = {
+      {"vorbis_lib_stereo_44100.ogg", 42u, 2u, 2u, 2u, 2u},
+      {"vorbis_lib_mono_44100.ogg", 35u, 2u, 2u, 2u, 2u},
+      {"vorbis_lib_transient_44100.ogg", 44u, 2u, 2u, 2u, 2u},
+      {"vorbis_lib_noise_48000.ogg", 44u, 2u, 2u, 2u, 2u},
+      {"vorbis_lib_silence_44100.ogg", 34u, 2u, 2u, 2u, 2u},
+      /* One mode and one mapping: the 8 kHz stream has equal block sizes,
+       * so there is nothing for a second mode to select. */
+      {"vorbis_lib_mono_8000.ogg", 19u, 1u, 1u, 1u, 1u},
+      {"vorbis_lib_mono_22050.ogg", 35u, 2u, 2u, 2u, 2u},
+      /* Six channels: three floors and three residues, and two submaps
+       * per mapping - the only fixture that reaches the submap
+       * demultiplexer at all. */
+      {"vorbis_lib_5dot1_48000.ogg", 43u, 3u, 3u, 2u, 2u},
+      {"vorbis_ff_stereo_44100.ogg", 29u, 1u, 1u, 1u, 2u},
+      {"vorbis_tagged_stereo_44100.ogg", 38u, 2u, 2u, 2u, 2u},
+  };
+  static_assert(sizeof(expected) / sizeof(expected[0])
+          == sizeof(fixtures) / sizeof(fixtures[0]),
+      "a fixture was added: give it a row here too");
+
+  for (const auto & one : expected) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
+    VORBIS_File * state
+        = static_cast<VORBIS_File *>(gaud_doc_private(loaded.doc));
+    ASSERT_NE(state, nullptr) << one.name;
+    const VORBIS_Setup * setup = &state->setup;
+    EXPECT_EQ(setup->codebook_count, one.codebooks) << one.name;
+    EXPECT_EQ(setup->floor_count, one.floors) << one.name;
+    EXPECT_EQ(setup->residue_count, one.residues) << one.name;
+    EXPECT_EQ(setup->mapping_count, one.mappings) << one.name;
+    EXPECT_EQ(setup->mode_count, one.modes) << one.name;
+    EXPECT_EQ(setup->mode_bits, gaud_vorbis_ilog(one.modes - 1u))
+        << one.name;
+
+    for (uint32_t i = 0; i < setup->mode_count; ++i) {
+      EXPECT_LT(setup->modes[i].mapping, setup->mapping_count) << one.name;
+    }
+    for (uint32_t i = 0; i < setup->mapping_count; ++i) {
+      const VORBIS_Mapping * mapping = &setup->mappings[i];
+      for (uint32_t j = 0; j < mapping->submaps; ++j) {
+        EXPECT_LT(mapping->floor[j], setup->floor_count) << one.name;
+        EXPECT_LT(mapping->residue[j], setup->residue_count) << one.name;
+      }
+      for (uint32_t j = 0; j < mapping->coupling_steps; ++j) {
+        EXPECT_LT(mapping->magnitude[j], one.codebooks) << one.name;
+        EXPECT_NE(mapping->magnitude[j], mapping->angle[j]) << one.name;
+      }
+      for (uint32_t ch = 0; ch < state->info.channels; ++ch) {
+        EXPECT_LT(mapping->mux[ch], mapping->submaps) << one.name;
+      }
+    }
+  }
+}
+
+TEST(VorbisSetup, TheCodebookValuesStayWellInsideWhatQSixteenHolds) {
+  /*
+   * **The measurement that chose VORBIS_Q, as an assertion.** The first
+   * draft was Q20 and saturated on two of these ten fixtures, which is
+   * how the real extreme came to be measured rather than assumed: 7,448,
+   * needing 13 integer bits, with every value in the corpus an integer
+   * because a residue codebook quantises the spectrum and the floor
+   * carries the scale.
+   *
+   * The bound asserted is a quarter of what the word holds, which leaves
+   * the two-times margin a value from a differently-configured encoder
+   * would need. `make vorbis-coverage` prints the number; this is what
+   * fails if a fixture added later moves it.
+   */
+  int64_t extreme = 0;
+  int64_t smallest = 0;
+  size_t values = 0;
+  for (const auto & one : fixtures) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
+    VORBIS_File * state
+        = static_cast<VORBIS_File *>(gaud_doc_private(loaded.doc));
+    const VORBIS_Setup * setup = &state->setup;
+    for (uint32_t i = 0; i < setup->codebook_count; ++i) {
+      const VORBIS_Codebook * book = &setup->codebooks[i];
+      if (!book->values) {
+        continue;
+      }
+      size_t count = (size_t)book->entries * book->dimensions;
+      values += count;
+      for (size_t k = 0; k < count; ++k) {
+        int64_t magnitude = book->values[k] < 0 ? -(int64_t)book->values[k]
+                                                : book->values[k];
+        if (magnitude > extreme) {
+          extreme = magnitude;
+        }
+        if (magnitude && (smallest == 0 || magnitude < smallest)) {
+          smallest = magnitude;
+        }
+      }
+    }
+  }
+  EXPECT_GT(values, 100000u)
+      << "the corpus has almost no codebook vectors in it, so the bound "
+      << "below is not measuring anything";
+  EXPECT_EQ(extreme, 7448LL * VORBIS_ONE)
+      << "the largest codebook value is not the measured 7,448; "
+      << "VORBIS_Q and vorbis-coverage both need re-reading";
+  EXPECT_EQ(smallest, (int64_t)VORBIS_ONE)
+      << "the smallest nonzero codebook value is not one, so some "
+      << "encoder here no longer quantises to integers and the "
+      << "fractional half of Q16 is now load-bearing";
+  EXPECT_LT(extreme, (int64_t)INT32_MAX / 4)
+      << "a codebook value is within a factor of four of saturating";
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
