@@ -348,23 +348,30 @@ endif
 endif
 INCLUDE += $(CUTIL_CFLAGS)
 
-# ghoti.io-compress, for zlib. Two places need it and both are metadata rather
-# than audio: ID3v2.3/2.4 frames carry an optional compression flag, and
-# Matroska's ContentCompression can deflate a track's private data. No codec
-# needs it - FLAC is Rice coding and LPC and owes deflate nothing. A hard
-# dependency even so, because a tag this library cannot read is a tag it cannot
-# write back, and a round trip that silently drops a frame is worse than a
-# refusal. Same shape as cutil's above, including the absence of a
-# sibling-checkout fallback.
-COMPRESS_PC ?= ghoti.io-compress$(BRANCH)
-COMPRESS_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(COMPRESS_PC) 2>/dev/null)
-COMPRESS_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(COMPRESS_PC) 2>/dev/null)
-ifeq ($(strip $(COMPRESS_CFLAGS)),)
-ifndef SKIP_DEP_CHECK
-$(error ghoti.io-compress was not found by pkg-config. Run ./bootstrap.sh at the root of the workspace - two levels up, the directory holding libs/ - to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback, for the reason cutil's error above gives.)
-endif
-endif
-INCLUDE += $(COMPRESS_CFLAGS)
+# ghoti.io-compress is named as an OPTIONAL dependency - `?compress` in
+# suite/libraries.txt - and is deliberately not detected here, not linked, and
+# not named in Requires, because as of phase 4 nothing in this library uses it.
+#
+# It was a hard dependency from phase 0 for two cases that both turned out not
+# to need it yet. ID3v2.3/2.4 frames carry a compression flag and this library
+# *declines* those frames - it keeps them raw, with their flags, because a frame
+# it cannot read is still one it must not lose (src/meta/id3_read.c). Matroska's
+# ContentCompression is phase 9. No codec needs it either: FLAC is Rice coding
+# over fixed predictors and owes deflate nothing.
+#
+# What that cost is narrower than it looks, and worth stating exactly, because
+# the obvious complaint - "every consumer links a library for nothing" - was not
+# true. The archive referenced no symbol of it, so the linker's default
+# --as-needed had already kept it out of the shared object's DT_NEEDED. The real
+# cost was one line: `Requires: ghoti.io-compress` in the .pc, which makes it a
+# hard BUILD-time requirement for anything that so much as compiles against this
+# library. planning/audio.md 9 records the decision and that measurement.
+#
+# The commit that adds the first real caller adds the detection, the link, a
+# -DGAUD_HAVE_COMPRESS=1 and the capability accessor together, in the shape the
+# ghoti.io-image block below already has. Putting the plumbing in now instead
+# would leave a feature define nothing reads and an #ifdef arm nothing compiles,
+# which is the half that rots unnoticed.
 
 # ghoti.io-security, for MD5. FLAC's STREAMINFO carries an MD5 of the
 # unencoded audio, and that one field is the reason this dependency exists.
@@ -439,7 +446,7 @@ endif
 
 # One variable for "the libraries this links", so that a rule cannot pick up one
 # dependency and miss the other. Every link line below reads this.
-DEP_LIBS := $(CUTIL_LIBS) $(COMPRESS_LIBS) $(SECURITY_LIBS) $(IMAGE_LIBS)
+DEP_LIBS := $(CUTIL_LIBS) $(SECURITY_LIBS) $(IMAGE_LIBS)
 
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')
@@ -1511,7 +1518,7 @@ LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
 # What goes in the .pc Requires: field. Built from the same variables the
 # compile uses, so a dependency on another branch cannot be named one way for
 # the build and another way for consumers.
-PC_REQUIRES := $(CUTIL_PC) $(COMPRESS_PC) $(SECURITY_PC)$(if $(HAVE_IMAGE), $(IMAGE_PC),)
+PC_REQUIRES := $(CUTIL_PC) $(SECURITY_PC)$(if $(HAVE_IMAGE), $(IMAGE_PC),)
 
 # Where this project's own .pc file is installed.
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)

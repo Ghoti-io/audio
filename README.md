@@ -142,7 +142,7 @@ installs `ghoti.io-audio-dev` instead.
 ## Building the library
 
 [cutil](https://github.com/Ghoti-io/cutil) and
-[compress](https://github.com/Ghoti-io/compress) must already be installed
+[security](https://github.com/Ghoti-io/security) must already be installed
 where pkg-config can see them. A dependency it cannot find is a hard error
 naming the fix. Google Test builds the unit tests.
 
@@ -208,10 +208,17 @@ Found through pkg-config, and the installed `.pc` names them.
 
 - [ghoti.io-cutil](https://github.com/Ghoti-io/cutil) — the allocator and the
   overflow-checked size arithmetic.
-- [ghoti.io-compress](https://github.com/Ghoti-io/compress) — zlib, for ID3v2
-  compressed frames and Matroska header compression. No codec needs it.
+- [ghoti.io-security](https://github.com/Ghoti-io/security) — MD5, for the
+  digest of the unencoded audio that FLAC's `STREAMINFO` carries. One function,
+  and it is what lets a decode be checked against a number a different
+  implementation wrote.
 - [ghoti.io-image](https://github.com/Ghoti-io/image) — optional; see above.
   Named in the installed `.pc`'s `Requires:` only when built against.
+- [ghoti.io-compress](https://github.com/Ghoti-io/compress) — optional, and
+  **not used yet**, so it is neither linked nor named in `Requires:`. zlib is
+  wanted for two things this library does not do today: inflating ID3v2
+  compressed frames, which are currently declined and kept raw, and Matroska
+  header compression, which is phase 9.
 
 ## Status
 
