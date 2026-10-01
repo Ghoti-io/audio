@@ -551,6 +551,73 @@ TEST(FlacRoundTrip, OggIsLosslessForEveryShape) {
   }
 }
 
+/**
+ * @brief Walk the page chain and count pages that continue a packet.
+ *
+ * Every page is required to start with `OggS` as it goes, so a walk that
+ * lost the chain reports a failure rather than a count of zero.
+ */
+size_t pages_continuing_a_packet(const std::vector<unsigned char> & file) {
+  size_t count = 0;
+  size_t at = 0;
+  while (at + 27u <= file.size()) {
+    EXPECT_EQ(memcmp(file.data() + at, "OggS", 4), 0)
+        << "lost the page chain at offset " << at;
+    size_t segments = file[at + 26u];
+    if (at + 27u + segments > file.size()) {
+      break;
+    }
+    size_t body = 0;
+    for (size_t i = 0; i < segments; ++i) {
+      body += file[at + 27u + i];
+    }
+    if (file[at + 5u] & 0x01u) {
+      ++count;
+    }
+    at += 27u + segments + body;
+  }
+  return count;
+}
+
+TEST(FlacRoundTrip, AnOggPacketLargerThanOnePageIsReassembled) {
+  /* An Ogg page body is at most 255 lacing values of 255 bytes, so a
+   * packet over 65,025 bytes is split and the pages after the first carry
+   * the continuation flag. The reader then has to grow its packet buffer
+   * while that buffer already holds the first part, and `make coverage`
+   * showed that copy had never run: every packet every test and every
+   * fixture had produced fitted in the first 4,096-byte allocation, or
+   * arrived whole. An off-by-one in the length copied would have survived
+   * the differential gates as well, because they decode our Ogg files
+   * with libFLAC rather than with this reader.
+   *
+   * Eight channels of 32-bit noise is the shape that gets there: the
+   * encoder can do nothing with it, so one 4,096-frame block is 131,072
+   * bytes of subframe before any header. */
+  const size_t frames = 9001u;
+  const uint32_t channels = 8u;
+  std::vector<int32_t> samples(frames * channels);
+  uint32_t state = 0x9E3779B9u;
+  for (auto & sample : samples) {
+    state = state * 1664525u + 1013904223u;
+    sample = (int32_t)state;
+  }
+
+  std::vector<unsigned char> file = encode(
+      "ogg-flac", GAUD_SAMPLE_S32, channels, 48000u, samples, frames);
+  ASSERT_FALSE(file.empty());
+
+  /* Asserted rather than assumed. This test is about the carry, and a
+   * packet that happened to fit in one page would exercise none of it
+   * while still round-tripping perfectly - which is how a test quietly
+   * stops testing what it was written for. */
+  ASSERT_GT(pages_continuing_a_packet(file), 0u)
+      << "no page continued a packet, so the reader never carried one";
+
+  std::vector<int32_t> back = decode(file, channels, frames, "ogg-flac");
+  ASSERT_EQ(back.size(), samples.size());
+  EXPECT_EQ(back, samples);
+}
+
 TEST(FlacRoundTrip, ConstantAndVerbatimSubframesSurvive) {
   /* Silence picks CONSTANT for every subframe; white-ish noise with no
    * predictable structure pushes the planner towards VERBATIM or a
@@ -1064,6 +1131,128 @@ TEST(FlacFrame, ReadsTheHeaderSpellingsNoEncoderHereWrites) {
       for (uint32_t i = 0; i < one.how.block_size; ++i) {
         ASSERT_EQ(samples[i], one.how.value)
             << one.what << " channel " << ch << " sample " << i;
+      }
+    }
+  }
+  gaud_flac_frame_free(&frame);
+}
+
+/**
+ * @brief Build a two-channel frame whose channels are decorrelated.
+ *
+ * **Here because `make coverage` showed the inverse had never run.** The
+ * three stereo modes are what nearly every real FLAC file uses, and
+ * `check-corpus` reaches them on every fixture - but that gate needs the
+ * pinned oracle container, and the unit suite, which is what runs
+ * everywhere, decoded only independent-stereo and mono frames. The body
+ * of `if (channels == 2 && assignment >= 8)` was executed zero times in
+ * eighty-three frame decodes.
+ *
+ * One CONSTANT subframe per channel, so what is under test is entirely
+ * the undecorrelation: the two constants that go in are the decorrelated
+ * pair, and the two that come out must be the original left and right.
+ * The channel carrying the difference is a bit deeper, and which one it
+ * is depends on the assignment, so the width is computed here the same
+ * way the reader computes it rather than being passed in - a reader and
+ * a test that agreed on the wrong channel would still pass.
+ */
+std::vector<unsigned char> hand_built_stereo_frame(
+    uint32_t assignment, int32_t first, int32_t second, uint32_t depth) {
+  const uint32_t block_size = 64u;
+  FLAC_Bit_Writer bw;
+  gaud_flac_bitw_init(&bw, NULL);
+  gaud_flac_bitw_write(&bw, 0x3FFEu, 14u);
+  gaud_flac_bitw_write(&bw, 0, 1u);
+  gaud_flac_bitw_write(&bw, 0, 1u);    /* fixed blocksize */
+  gaud_flac_bitw_write(&bw, 7u, 4u);   /* block size in a 16-bit field */
+  gaud_flac_bitw_write(&bw, 0x9u, 4u); /* 44100 */
+  gaud_flac_bitw_write(&bw, assignment, 4u);
+  gaud_flac_bitw_write(&bw, 4u, 3u);   /* 16 bits */
+  gaud_flac_bitw_write(&bw, 0, 1u);
+  gaud_flac_bitw_write_coded_number(&bw, 0);
+  gaud_flac_bitw_write(&bw, block_size - 1u, 16u);
+  gaud_flac_bitw_write(&bw, gaud_flac_crc8(bw.data, bw.size), 8u);
+
+  const int32_t value[2] = {first, second};
+  for (uint32_t ch = 0; ch < 2u; ++ch) {
+    bool wider
+        = ((assignment == 8u || assignment == 0xAu) && ch == 1u)
+        || (assignment == 9u && ch == 0u);
+    gaud_flac_bitw_write(&bw, 0, 1u);  /* padding bit */
+    gaud_flac_bitw_write(&bw, 0, 6u);  /* CONSTANT */
+    gaud_flac_bitw_write(&bw, 0, 1u);  /* no wasted bits */
+    gaud_flac_bitw_write(&bw, (uint64_t)value[ch], depth + (wider ? 1u : 0u));
+  }
+  gaud_flac_bitw_align(&bw);
+  gaud_flac_bitw_write(&bw, gaud_flac_crc16(bw.data, bw.size), 16u);
+  std::vector<unsigned char> out(bw.data, bw.data + bw.size);
+  gaud_flac_bitw_free(&bw);
+  return out;
+}
+
+TEST(FlacFrame, TheThreeStereoDecorrelationsAreUndone) {
+  FLAC_Streaminfo info;
+  memset(&info, 0, sizeof(info));
+  info.min_block_size = 64u;
+  info.max_block_size = 64u;
+  info.sample_rate = 44100u;
+  info.channels = 2u;
+  info.bits_per_sample = 16u;
+
+  struct Case {
+    int32_t left;
+    int32_t right;
+    const char * what;
+  };
+  /* The second pair sums to an odd number, which is the whole reason mid
+   * and side is lossless: mid drops the sum's low bit and side carries it
+   * back. A decoder that reconstructed the average instead would differ
+   * by one here and agree on every even-summed pair, so a test with only
+   * the first pair would not see it. */
+  const Case pairs[] = {
+      {1000, -200, "an even sum"},
+      {1001, -200, "an odd sum, which is where the low bit matters"},
+      {-32768, 32767, "the extremes of the depth"},
+  };
+
+  FLAC_Frame frame;
+  memset(&frame, 0, sizeof(frame));
+  for (const Case & pair : pairs) {
+    const int32_t side = pair.left - pair.right;
+    const int32_t mid
+        = (int32_t)((((int64_t)pair.left + pair.right)) >> 1);
+    struct Shape {
+      uint32_t assignment;
+      int32_t first;
+      int32_t second;
+      const char * name;
+    };
+    const Shape shapes[] = {
+        /* Independent stereo, as a control: the same two values go in and
+         * must come out untouched. If undecorrelation were a no-op the
+         * three below would fail and this one would still pass, which is
+         * what tells the two apart. */
+        {1u, pair.left, pair.right, "independent stereo (control)"},
+        {8u, pair.left, side, "left and side"},
+        {9u, side, pair.right, "side and right"},
+        {0xAu, mid, side, "mid and side"},
+    };
+    for (const Shape & shape : shapes) {
+      std::vector<unsigned char> bytes = hand_built_stereo_frame(
+          shape.assignment, shape.first, shape.second, 16u);
+      size_t used = 0;
+      ASSERT_EQ(gaud_flac_frame_decode(
+                    bytes.data(), bytes.size(), &info, &frame, &used),
+          GAUD_OK)
+          << shape.name << ", " << pair.what;
+      EXPECT_EQ(frame.channels, 2u) << shape.name;
+      const int64_t * left = frame.samples;
+      const int64_t * right = frame.samples + frame.capacity_frames;
+      for (uint32_t i = 0; i < frame.block_size; ++i) {
+        ASSERT_EQ(left[i], pair.left)
+            << shape.name << ", " << pair.what << ", sample " << i;
+        ASSERT_EQ(right[i], pair.right)
+            << shape.name << ", " << pair.what << ", sample " << i;
       }
     }
   }

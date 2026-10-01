@@ -699,6 +699,109 @@ TEST(Meta, RebuildingWhatWeBuiltProducesTheSameBytes) {
   gcu_allocator_free(gaud_allocator_default(), second);
 }
 
+/* ------------------------------------------- buffers that have to grow */
+
+TEST(Meta, AVorbisCommentBlockOutgrowsTheBuildersFirstBuffer) {
+  /* The builder starts at 256 bytes and doubles, copying what it already
+   * holds into the new allocation. `make coverage` showed that copy had
+   * never executed: it grew twenty-three times across the whole suite and
+   * every one of those was the first allocation, where there is nothing
+   * to copy. A reallocation path no test reaches is untested, not
+   * working, and an off-by-one in the length copied would lose or
+   * duplicate bytes in the middle of a block that still parses.
+   *
+   * Forty comments is several doublings, so the copy runs more than once
+   * and at more than one size. */
+  GAUD_Meta * meta = nullptr;
+  ASSERT_EQ(gaud_meta_create(nullptr, &meta), GAUD_OK);
+  std::vector<std::string> expected;
+  for (int i = 0; i < 40; ++i) {
+    expected.push_back(
+        "comment number " + std::to_string(i) + ", long enough to matter");
+    ASSERT_EQ(gaud_meta_add(meta, GAUD_TAG_COMMENT, expected.back().c_str()),
+        GAUD_OK);
+  }
+
+  unsigned char * block = nullptr;
+  size_t size = 0;
+  ASSERT_EQ(gaud_vorbis_comment_build(
+                meta, "ghoti.io test", nullptr, &block, &size),
+      GAUD_OK);
+  ASSERT_NE(block, nullptr);
+  /* Asserted, because the point of the test is the growth: a builder
+   * whose first buffer happened to be large enough would pass every
+   * comparison below without ever copying anything. */
+  ASSERT_GT(size, 256u) << "the block never outgrew the first allocation";
+  gaud_meta_destroy(meta);
+
+  GAUD_Meta * back = nullptr;
+  ASSERT_EQ(gaud_meta_create(nullptr, &back), GAUD_OK);
+  GAUD_Limits limits;
+  gaud_limits_default(&limits);
+  ASSERT_EQ(
+      gaud_vorbis_comment_parse(block, size, &limits, back, nullptr), GAUD_OK);
+  ASSERT_EQ(gaud_meta_count(back, GAUD_TAG_COMMENT), expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_STREQ(gaud_meta_get(back, GAUD_TAG_COMMENT, i), expected[i].c_str())
+        << "comment " << i << " came back wrong, which is what a bad copy "
+        << "length looks like once the buffer has moved";
+  }
+  gaud_meta_destroy(back);
+  gcu_allocator_free(gaud_allocator_default(), block);
+}
+
+TEST(Meta, RiffInfoWritesACustomKeyOnlyWhenItIsAlreadyAFourCharacterId) {
+  /* INFO has no user-defined entry, so a custom key can only be written
+   * when it is already a four-character chunk id; anything longer has no
+   * spelling and truncating it would invent an id that means something
+   * else. Both arms are here because only the refusal had ever run - the
+   * branch that writes one had been reached once and taken never. */
+  GAUD_Meta * meta = nullptr;
+  ASSERT_EQ(gaud_meta_create(nullptr, &meta), GAUD_OK);
+  /* ITCH is a real INFO id - the technician - and deliberately one this
+   * library has no tag for, so it stays a custom entry on the way back
+   * instead of being mapped and proving nothing. */
+  ASSERT_EQ(gaud_meta_custom_add(meta, "ITCH", "the technician"), GAUD_OK);
+  ASSERT_EQ(gaud_meta_custom_add(meta, "ENGINEER", "no four-character id"),
+      GAUD_OK);
+
+  unsigned char * chunk = nullptr;
+  size_t size = 0;
+  ASSERT_EQ(gaud_riff_info_build(meta, nullptr, &chunk, &size), GAUD_OK);
+  ASSERT_NE(chunk, nullptr);
+  gaud_meta_destroy(meta);
+
+  GAUD_Meta * back = nullptr;
+  ASSERT_EQ(gaud_meta_create(nullptr, &back), GAUD_OK);
+  GAUD_Limits limits;
+  gaud_limits_default(&limits);
+  /* The chunk is "LIST", its length and "INFO" before the entries; the
+   * parser takes the body after that header. */
+  ASSERT_GT(size, 12u);
+  ASSERT_EQ(gaud_riff_info_parse(
+                chunk + 12u, size - 12u, &limits, back, nullptr),
+      GAUD_OK);
+
+  bool found_itch = false;
+  bool found_engineer = false;
+  for (size_t i = 0; i < gaud_meta_custom_count(back); ++i) {
+    const char * key = nullptr;
+    const char * value = nullptr;
+    ASSERT_EQ(gaud_meta_custom(back, i, &key, &value), GAUD_OK);
+    if (std::strcmp(key, "ITCH") == 0) {
+      found_itch = true;
+      EXPECT_STREQ(value, "the technician");
+    }
+    if (std::strcmp(key, "ENGINEER") == 0) {
+      found_engineer = true;
+    }
+  }
+  EXPECT_TRUE(found_itch) << "a four-character custom key was dropped";
+  EXPECT_FALSE(found_engineer) << "a key INFO cannot spell was written anyway";
+  gaud_meta_destroy(back);
+  gcu_allocator_free(gaud_allocator_default(), chunk);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   gaud_register_builtin_codecs();
