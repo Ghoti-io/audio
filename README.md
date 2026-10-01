@@ -2,10 +2,11 @@
 
 Sound in C, as a container of tracks with metadata, read and written.
 
-**Phase 1 of ten.** WAV and AIFF read and write, losslessly, with the base
-object, the pull decoder and the public codec SDK behind them. No lossy codec
-exists yet. [Status](#status) says precisely what that means, and
-`planning/audio.md` in the workspace is the design it is being built to.
+**Phases 1 through 4 of ten.** WAV, AIFF and FLAC read and write,
+losslessly, with tags and cover art, over the base object, the pull decoder
+and the public codec SDK. No lossy codec exists yet. [Status](#status) says
+precisely what that means, and `planning/audio.md` in the workspace is the
+design it is being built to.
 
 ## Formats
 
@@ -38,7 +39,7 @@ Each has a page saying what it covers and where it differs: \ref format_wav
 "formats/wav.md", \ref format_aiff "formats/aiff.md", \ref format_coding
 "formats/coding.md" and \ref format_flac "formats/flac.md".
 
-WAV and AIFF are in phase 1 together deliberately. **WAV is little-endian and
+WAV and AIFF were in phase 1 together deliberately. **WAV is little-endian and
 AIFF is big-endian**, and their 8-bit samples disagree about sign, so each
 codec exercises exactly the paths the other does not - and `make
 check-golden` runs the corpus on big-endian targets, where the two swap
@@ -222,7 +223,7 @@ Found through pkg-config, and the installed `.pc` names them.
 
 ## Status
 
-Phase 3 of ten, complete. What works:
+Phases 1 through 4 of ten, complete. What works:
 
 - **WAV and AIFF, read and written**, across every PCM width both can carry,
   including RF64/BW64 and `WAVE_FORMAT_EXTENSIBLE` with its channel mask.
@@ -230,13 +231,25 @@ Phase 3 of ten, complete. What works:
   `GAUD_Sample_Coding` reporting what the file used separately from what the
   buffer holds. Blocks are self-contained, so seeking into a coded track is
   still exact.
-- **Tags, raw carriage and cover art.** ID3v1 and ID3v2.2/2.3/2.4, RIFF
-  `LIST`/`INFO`, BWF `bext` and AIFF's four text chunks, over a common
-  multi-valued vocabulary with everything unmapped kept under its own
-  spelling. Every string crossing the API is UTF-8, including from a frame
+- **FLAC, read and written, in two containers.** RFC 9639 in its native
+  container and in Ogg, at 8, 16, 24 and 32 bits: every subframe type, both
+  Rice methods, escaped partitions, wasted bits and all four channel
+  assignments. A file this library writes carries a seek table and a
+  STREAMINFO MD5 that `flac -t` verifies against libFLAC's own decode, and
+  seeking uses the seek table and then decodes forward, so it lands on the
+  sample asked for. CUESHEET is checked and carried rather than modelled -
+  it is the first of four spellings of one idea, and a model waits for the
+  second caller. The Ogg page layer underneath it is its own module, for
+  Vorbis and Opus to reuse.
+- **Tags, raw carriage and cover art.** ID3v1 and ID3v2.2/2.3/2.4, Vorbis
+  comment, RIFF `LIST`/`INFO`, BWF `bext` and AIFF's four text chunks, over
+  a common multi-valued vocabulary with everything unmapped kept under its
+  own spelling. Every string crossing the API is UTF-8, including from a frame
   that claims UTF-8 and is not. A file this library writes carries its tags
   in both its container's native scheme and an ID3 chunk, so a reader that
-  knows only one still finds them.
+  knows only one still finds them. Cover art is reported additively, with
+  four states that keep "this build cannot verify" apart from
+  "verification failed" - see the `?image` note above.
 - The base object: `GAUD_Buffer` with interleaved and planar layouts, sample
   formats including the non-PCM cases DSD and opaque, and an explicit
   `GAUD_Channel_Layout` that keeps "the file did not say" distinct from mono.
@@ -256,33 +269,48 @@ How it is judged:
 
 | Gate | What it settles |
 | --- | --- |
-| `make check-corpus` | Four independent references - ffmpeg, sox, libsndfile and Python's `wave` - decode the corpus exactly as this does. PCM is lossless, so this is a byte comparison and not a tolerance |
-| `make check-writer` | Those references read what this library wrote, and the samples survived the round trip: 68 lossless round trips across both containers and both directions, plus 95 coded ones scored two ways - every reference must decode the file at all, and the SNR must clear a floor stated per coding |
-| `make check-tags` | Three questions: does the ID3v1 genre table match mutagen's row by row, can ffmpeg and mutagen read the tags this library writes, and can it read theirs. The third is the one a library whose reader and writer share a misunderstanding fails |
-| `make check-golden` | The corpus decodes to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs |
+| `make check-corpus` | Independent references decode the corpus exactly as this does: 57 fixtures, 163 fixture-reference comparisons. Lossless means a byte comparison and not a tolerance. The gate prints the count of *implementations* beside the count of references, because they are not the same number - of the 20 FLAC fixtures, 4 references read them and they are 2 implementations |
+| `make check-writer` | Those references read what this library wrote, and the samples survived: 217 lossless round trips and 109 coded ones, each read back by every reference that can. 106 of the FLAC files are additionally verified by `flac -t --warnings-as-errors` against the STREAMINFO MD5 we wrote - with a control that zeroes a digest and requires the refusal, because that tool exits zero on a file it has complained about |
+| `make check-tags` | 134 comparisons across four containers and two references. Does the ID3v1 genre table match mutagen's row by row, can ffmpeg and mutagen read the tags this library writes, and can it read theirs - the third is the one a library whose reader and writer share a misunderstanding fails. The two FLAC containers also go three generations through our own reader and writer, which is what caught a vendor string being collected as a tag |
+| `make check-golden` | 57 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only |
 | `make check-outoftree` | A codec in another repository works |
-| `make fuzz` | Per-container harnesses asserting the caller-facing invariants, not merely the absence of a crash - plus `coded`, which drives the block layer below any container, because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does. It found a real defect in its first minute |
+| `make fuzz` | Five harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, and `coded`, which drives the block layer below any container, because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does. It found a real defect in its first minute |
+| `make flac-coverage` | Not pass/fail: it counts which named arms of the FLAC frame decoder the corpus actually reaches. It exists because `check-corpus` agreed byte for byte with every reference on every fixture while a third of the subframe decoder had never run - a codec's branches are selected by the *encoder*, so a corpus samples encoders rather than the format |
 
 The corpus is generated **by** the references and never by this library: one
 grown from our own writer would agree with our own reader by construction.
-That argument has a second edge, which is why the image gained a fifth
-reference in phase 3 - ffmpeg *writes* the tag fixtures, so scoring them
-with ffmpeg alone would ask one implementation whether it agrees with
-itself. `mutagen` shares no code with it.
+That argument has a second edge, which is why the image holds `mutagen` as
+well - ffmpeg *writes* the tag fixtures, so scoring them with ffmpeg alone
+would ask one implementation whether it agrees with itself, and a
+misunderstanding held in both its writer and its reader would be invisible.
+`mutagen` shares no code with it. Six references are in the image as of
+phase 4 - ffmpeg, sox, libsndfile, Python's `wave`, mutagen and `flac` -
+and **for FLAC that is two implementations, not six**: sox, libsndfile and
+the `flac` tool all answer through libFLAC, and only ffmpeg is separate.
+The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
+its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-141 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+179 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
-`image` is linked for.
+`image` is linked for. 78.7% line coverage from the unit tests alone, which
+is the figure that matters for a contributor without the oracle container:
+the gates above cover a great deal that those tests do not.
 
-Two figures the gates print rather than assume: the corpus exercises **all 89
-IMA step-table entries with a nibble magnitude that makes a wrong value
+Three figures the gates print rather than assume. The corpus exercises **all
+89 IMA step-table entries with a nibble magnitude that makes a wrong value
 visible** - counting bare loads said 89 of 89 while a deliberately wrong
-entry still decoded identically, and the honest figure was 54 - and the MS
-ADPCM coefficient table this library writes is byte-identical to ffmpeg's,
-which is the only thing that can check it, since our decoder uses the table
-in the file and our encoder only ever names pair 0.
+entry still decoded identically, and the honest figure was 54. The MS ADPCM
+coefficient table this library writes is byte-identical to ffmpeg's, which
+is the only thing that can check it, since our decoder uses the table in the
+file and our encoder only ever names pair 0. And `make flac-coverage`
+reports **22 of 24 named arms** of the FLAC frame decoder reached, over two
+populations it keeps apart - the reference corpus reaches 19 and our own
+re-encoding of it reaches 17, and neither subsumes the other. The two left
+are a variable-blocksize stream and a frame that defers its bit depth to
+STREAMINFO: legal spellings no encoder in the image will produce an input
+for, so the unit tests build those frames by hand instead.
 
 What is deliberately absent:
 
