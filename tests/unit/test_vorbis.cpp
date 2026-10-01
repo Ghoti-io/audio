@@ -48,6 +48,7 @@
 #include <ghoti.io/audio/codecs.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -297,28 +298,257 @@ TEST(VorbisLoad, TheTagsComeOutOfTheCommentHeader) {
   EXPECT_STREQ(gaud_meta_get(bare, GAUD_TAG_ENCODER, 0), "Lavc libvorbis");
 }
 
-TEST(VorbisLoad, AskingForADecoderIsRefusedAndTheCapabilityBitSaysWhy) {
+TEST(VorbisDecode, EveryFixtureDecodesToTheLengthItStated) {
   /*
-   * planning/audio.md section 11.18's argument, as an assertion. The
-   * identification half shipping on its own is only honest if a program
-   * can find out: a caller asks the codec what it can do, and asks the
-   * track for a decoder, and both answers agree.
+   * **The frame count asserted exactly, before anything else is
+   * compared**, which planning/audio.md section 12 puts first in its
+   * list for a reason: a decoder one block short passes any comparison
+   * that aligns the two signals before measuring, and that is what
+   * every convenient comparison does.
    *
-   * **This test is expected to be deleted.** When the decoder lands,
-   * GAUD_CAP_DECODE is declared and gaud_decoder_create() succeeds, and
-   * this becomes the test that must be removed rather than relaxed.
+   * For Vorbis the count is also the one thing the file states about
+   * itself, so this is the loop closing: the length read from the last
+   * page's granule position, and the length the packets actually decode
+   * to, have to be the same number.
    */
-  const GAUD_Codec * codec = gaud_registry_find(NULL, "vorbis");
-  ASSERT_NE(codec, nullptr);
-  EXPECT_TRUE((codec->capabilities & GAUD_CAP_METADATA_READ) != 0);
-  EXPECT_FALSE((codec->capabilities & GAUD_CAP_DECODE) != 0);
+  for (const auto & one : fixtures) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
+    GAUD_Track * track = loaded.track();
+    GAUD_Decoder * decoder = nullptr;
+    ASSERT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK) << one.name;
+    GAUD_Buffer * buffer = nullptr;
+    ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 317u, &buffer),
+        GAUD_OK)
+        << one.name;
+    uint64_t total = 0;
+    int64_t peak = 0;
+    for (;;) {
+      ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK) << one.name;
+      size_t frames = gaud_buffer_frames(buffer);
+      if (frames == 0) {
+        break;
+      }
+      const int16_t * data
+          = (const int16_t *)gaud_buffer_data_const(buffer);
+      for (size_t i = 0; i < frames * one.channels; ++i) {
+        int64_t magnitude = data[i] < 0 ? -(int64_t)data[i] : data[i];
+        peak = std::max(peak, magnitude);
+      }
+      total += frames;
+    }
+    EXPECT_EQ(total, one.frames) << one.name;
+    /* And it is not silence, which is the decoder failure that produces
+     * the right number of bytes and sounds like a quiet passage. The
+     * silence fixture is silence by construction and is the control for
+     * this check rather than an exception to it. */
+    if (std::string(one.name).find("silence") == std::string::npos) {
+      EXPECT_GT(peak, 1000) << one.name << " decoded to near silence";
+    }
+    else {
+      EXPECT_EQ(peak, 0) << one.name << " is silence and did not decode "
+                         << "to silence";
+    }
+    gaud_buffer_destroy(buffer);
+    gaud_decoder_destroy(decoder);
+  }
+}
+
+TEST(VorbisDecode, TheBufferSizeDoesNotChangeTheSamples) {
+  /*
+   * A decode is a function of its input. The block size a caller asks
+   * for is its own business, and a decoder whose output depended on it
+   * would have state leaking across a read boundary - which for this
+   * codec would be the lap, the one piece of state that spans packets.
+   *
+   * The sizes are chosen to be awkward: one far smaller than a block,
+   * one a prime, one larger than the longest block.
+   */
+  for (const char * name : {"vorbis_lib_stereo_44100.ogg",
+           "vorbis_lib_transient_44100.ogg", "vorbis_lib_5dot1_48000.ogg"}) {
+    std::vector<int16_t> reference;
+    for (size_t size : {4096u, 7u, 317u, 65536u}) {
+      Loaded loaded;
+      ASSERT_EQ(OpenFile(loaded, name), GAUD_OK) << name;
+      GAUD_Decoder * decoder = nullptr;
+      ASSERT_EQ(gaud_decoder_create(loaded.track(), &decoder), GAUD_OK);
+      GAUD_Buffer * buffer = nullptr;
+      ASSERT_EQ(
+          gaud_decoder_buffer_create(decoder, nullptr, size, &buffer),
+          GAUD_OK);
+      unsigned channels = gaud_track_layout(loaded.track()).channels;
+      std::vector<int16_t> got;
+      for (;;) {
+        ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+        size_t frames = gaud_buffer_frames(buffer);
+        if (frames == 0) {
+          break;
+        }
+        const int16_t * data
+            = (const int16_t *)gaud_buffer_data_const(buffer);
+        got.insert(got.end(), data, data + frames * channels);
+      }
+      gaud_buffer_destroy(buffer);
+      gaud_decoder_destroy(decoder);
+      if (reference.empty()) {
+        reference = got;
+        ASSERT_GT(reference.size(), 0u) << name;
+      }
+      else {
+        EXPECT_EQ(got, reference) << name << " with a buffer of " << size;
+      }
+    }
+  }
+}
+
+TEST(VorbisDecode, TheChannelOrderIsTheOneBufferHPromises) {
+  /*
+   * **`buffer.h` says the order is WAV's `dwChannelMask`** and that
+   * every other container's is mapped onto it on the way in. Vorbis's
+   * own order is not that one: from three channels up it puts the
+   * centre second and the low-frequency channel last, where WAV puts
+   * the centre third and the low-frequency fourth.
+   *
+   * One and two channels are the identity, so this is invisible until a
+   * file has three - and the corpus has exactly one such file, with six.
+   * It was found by that file disagreeing with ffmpeg, which reorders
+   * to WAV, while agreeing with libsndfile, which hands back the
+   * stream's own order.
+   *
+   * What is asserted here is the table rather than a decode, because a
+   * decode can only check the counts the corpus happens to have. The
+   * specification's order for each count is written out, the table is
+   * applied to it, and the result must be the mask's own bits in
+   * increasing order - which is what "WAV order" means. Three, five and
+   * seven channels have no fixture and are checked here and nowhere
+   * else.
+   */
+  struct Count {
+    unsigned channels;
+    uint32_t vorbis_order[8]; /* The specification's, section 4.3.9. */
+  };
+  const Count counts[] = {
+      {1, {GAUD_CH_FRONT_CENTER}},
+      {2, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_RIGHT}},
+      {3, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_CENTER, GAUD_CH_FRONT_RIGHT}},
+      {4, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_RIGHT, GAUD_CH_BACK_LEFT,
+              GAUD_CH_BACK_RIGHT}},
+      {5, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_CENTER, GAUD_CH_FRONT_RIGHT,
+              GAUD_CH_BACK_LEFT, GAUD_CH_BACK_RIGHT}},
+      {6, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_CENTER, GAUD_CH_FRONT_RIGHT,
+              GAUD_CH_BACK_LEFT, GAUD_CH_BACK_RIGHT,
+              GAUD_CH_LOW_FREQUENCY}},
+      {7, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_CENTER, GAUD_CH_FRONT_RIGHT,
+              GAUD_CH_SIDE_LEFT, GAUD_CH_SIDE_RIGHT, GAUD_CH_BACK_CENTER,
+              GAUD_CH_LOW_FREQUENCY}},
+      {8, {GAUD_CH_FRONT_LEFT, GAUD_CH_FRONT_CENTER, GAUD_CH_FRONT_RIGHT,
+              GAUD_CH_SIDE_LEFT, GAUD_CH_SIDE_RIGHT, GAUD_CH_BACK_LEFT,
+              GAUD_CH_BACK_RIGHT, GAUD_CH_LOW_FREQUENCY}},
+  };
+  for (const auto & one : counts) {
+    GAUD_Channel_Layout layout = gaud_channel_layout_default(one.channels);
+    ASSERT_EQ(layout.channels, one.channels);
+    /* The mask's bits in increasing order: this library's slot order. */
+    std::vector<uint32_t> wanted;
+    for (unsigned bit = 0; bit < 32u; ++bit) {
+      if (layout.mask & (1u << bit)) {
+        wanted.push_back(1u << bit);
+      }
+    }
+    ASSERT_EQ(wanted.size(), one.channels) << one.channels;
+    std::vector<uint32_t> got;
+    for (unsigned slot = 0; slot < one.channels; ++slot) {
+      got.push_back(one.vorbis_order[gaud_vorbis_channel_slot(
+          one.channels, slot)]);
+    }
+    EXPECT_EQ(got, wanted) << one.channels << " channels: the permutation "
+                           << "does not put the stream's channels into the "
+                           << "slots the mask names";
+    /* And it is a permutation, not merely a mapping. */
+    std::vector<unsigned> seen;
+    for (unsigned slot = 0; slot < one.channels; ++slot) {
+      unsigned which = gaud_vorbis_channel_slot(one.channels, slot);
+      EXPECT_LT(which, one.channels) << one.channels;
+      EXPECT_EQ(std::find(seen.begin(), seen.end(), which), seen.end())
+          << one.channels << ": channel " << which << " twice";
+      seen.push_back(which);
+    }
+  }
+}
+
+TEST(VorbisDecode, ASeekLandsOnTheFrameAskedFor) {
+  /*
+   * Seeking is linear here - the bisection exists and Vorbis does not
+   * use it yet, for the reason vorbis_decode.c gives - so what this
+   * checks is the arithmetic rather than the search: that the position
+   * reported is the one asked for, and that the samples from there are
+   * the ones a straight decode produces at that offset.
+   *
+   * The second half is what makes it a test. A seek that reset the lap
+   * and decoded forward would land on the right *frame* and produce
+   * different *samples* for the first block after it, because a Vorbis
+   * block's output depends on the one before it.
+   */
+  const char * name = "vorbis_lib_stereo_44100.ogg";
+  Loaded whole;
+  ASSERT_EQ(OpenFile(whole, name), GAUD_OK);
+  unsigned channels = gaud_track_layout(whole.track()).channels;
+  std::vector<int16_t> all;
+  {
+    GAUD_Decoder * decoder = nullptr;
+    ASSERT_EQ(gaud_decoder_create(whole.track(), &decoder), GAUD_OK);
+    GAUD_Buffer * buffer = nullptr;
+    ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 1024u, &buffer),
+        GAUD_OK);
+    for (;;) {
+      ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+      size_t frames = gaud_buffer_frames(buffer);
+      if (frames == 0) {
+        break;
+      }
+      const int16_t * data
+          = (const int16_t *)gaud_buffer_data_const(buffer);
+      all.insert(all.end(), data, data + frames * channels);
+    }
+    gaud_buffer_destroy(buffer);
+    gaud_decoder_destroy(decoder);
+  }
+  ASSERT_EQ(all.size(), 4409u * channels);
 
   Loaded loaded;
-  ASSERT_EQ(OpenFile(loaded, "vorbis_lib_stereo_44100.ogg"), GAUD_OK);
+  ASSERT_EQ(OpenFile(loaded, name), GAUD_OK);
   GAUD_Decoder * decoder = nullptr;
-  EXPECT_EQ(gaud_decoder_create(loaded.track(), &decoder),
-      GAUD_ERR_UNSUPPORTED);
-  EXPECT_EQ(decoder, nullptr);
+  ASSERT_EQ(gaud_decoder_create(loaded.track(), &decoder), GAUD_OK);
+  GAUD_Buffer * buffer = nullptr;
+  ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 64u, &buffer),
+      GAUD_OK);
+  for (uint64_t target : {0u, 1u, 1023u, 1024u, 1025u, 3000u, 100u, 4408u}) {
+    uint64_t landed = UINT64_MAX;
+    ASSERT_EQ(gaud_decoder_seek(decoder, target, &landed), GAUD_OK)
+        << target;
+    EXPECT_EQ(landed, target) << target;
+    ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK) << target;
+    size_t frames = gaud_buffer_frames(buffer);
+    ASSERT_GT(frames, 0u) << target;
+    const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+    size_t compare = std::min(frames, (size_t)(4409u - target));
+    for (size_t i = 0; i < compare * channels; ++i) {
+      ASSERT_EQ(data[i], all[target * channels + i])
+          << "seek to " << target << ", sample " << i;
+    }
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+}
+
+TEST(VorbisDecode, TheCapabilityBitAndTheDecoderAgree) {
+  const GAUD_Codec * codec = gaud_registry_find(NULL, "vorbis");
+  ASSERT_NE(codec, nullptr);
+  EXPECT_TRUE((codec->capabilities & GAUD_CAP_DECODE) != 0);
+  EXPECT_TRUE((codec->capabilities & GAUD_CAP_METADATA_READ) != 0);
+  /* No encoder yet, and the tier says so rather than a README. */
+  EXPECT_EQ(codec->encoder_tier, GAUD_ENCODER_NONE);
+  EXPECT_EQ(codec->encoder_open, nullptr);
 }
 
 /* ------------------------------------------- the identification header */
@@ -1189,6 +1419,134 @@ TEST(VorbisSetup, TheCodebookValuesStayWellInsideWhatQSixteenHolds) {
       << "fractional half of Q16 is now load-bearing";
   EXPECT_LT(extreme, (int64_t)INT32_MAX / 4)
       << "a codebook value is within a factor of four of saturating";
+}
+
+/* ------------------------------------------------ the inverse transform */
+
+namespace {
+
+/** The specification's own inverse transform, O(n^2), in double. */
+std::vector<double> ImdctDirect(const std::vector<double> & spectrum,
+    unsigned n) {
+  const unsigned m = n / 2u;
+  std::vector<double> out(n);
+  for (unsigned i = 0; i < n; ++i) {
+    double sum = 0.0;
+    for (unsigned k = 0; k < m; ++k) {
+      sum += spectrum[k]
+          * std::cos(M_PI / m * ((double)i + 0.5 + (double)n / 4.0)
+              * ((double)k + 0.5));
+    }
+    out[i] = sum;
+  }
+  return out;
+}
+
+} // namespace
+
+TEST(VorbisTransform, TheIntegerTransformIsTheSpecificationsFormula) {
+  /*
+   * **The one part of this decoder whose answer is not exactly the
+   * specification's**, so it is the one that needs a tolerance rather
+   * than an equality - and the reference it is compared against is the
+   * specification's own formula, evaluated in double here, rather than
+   * another decoder. A disagreement is then this library's arithmetic
+   * and not a question about whose rounding is right.
+   *
+   * Two spectra per block size, and they test different things:
+   *
+   *   - **a single coefficient**, which the transform returns at its own
+   *     amplitude and whose output is a pure cosine. This is the case
+   *     that catches the rotation's offset: 1/4 instead of 1/8 gives a
+   *     cosine of very slightly the wrong frequency, which is a few
+   *     percent of error spread over the block rather than a visible
+   *     break.
+   *   - **a full spectrum**, which is where the transform's gain is
+   *     about the square root of the coefficient count and where the
+   *     halving every second stage has to track it. A version that
+   *     halved every stage passes the single-coefficient case and comes
+   *     out quiet here.
+   *
+   * **The tolerance is in units of the output's own least significant
+   * bit, not of the block's peak**, and the first draft had it the other
+   * way - which penalised a quiet block for being quiet. What matters is
+   * whether the error can move a 16-bit sample, so the error is measured
+   * against full scale and the bound is two of the 32,768ths that a
+   * 16-bit sample is quantised to.
+   *
+   * Measured, worst case over every block size and both spectra: **0.55
+   * of a least significant bit**, at n = 8,192 with a full spectrum -
+   * which is where eleven transform stages and two rotations have each
+   * contributed their rounding. The bound of two leaves room for a
+   * compiler to order a sum differently without leaving room for a
+   * defect: the factor-of-two error the halving count had was 100% of
+   * peak, and the rotation's wrong offset is a few percent.
+   */
+  double observed = 0.0;
+  for (unsigned n : {64u, 128u, 256u, 512u, 1024u, 2048u, 4096u, 8192u}) {
+    const unsigned m = n / 2u;
+    for (int which = 0; which < 2; ++which) {
+      std::vector<double> wanted(m, 0.0);
+      std::vector<int32_t> spectrum(m, 0);
+      if (which == 0) {
+        /* One coefficient, a quarter of the way up, at 0.5. */
+        wanted[m / 4u] = 0.5;
+      }
+      else {
+        /* A deterministic pseudo-random spectrum, scaled so the output
+         * stays inside what the time-domain word holds: the transform's
+         * gain here is about sqrt(m), so 1/sqrt(m) of full scale in is
+         * about full scale out. */
+        double scale = 1.0 / std::sqrt((double)m);
+        uint32_t state = 12345u + n;
+        for (unsigned k = 0; k < m; ++k) {
+          state = state * 1103515245u + 12345u;
+          double value = (double)(int32_t)(state >> 8) / 2147483648.0;
+          wanted[k] = value * scale;
+        }
+      }
+      for (unsigned k = 0; k < m; ++k) {
+        spectrum[k] = (int32_t)std::llround(wanted[k] * (1 << VORBIS_SPECTRUM_Q));
+      }
+
+      std::vector<int32_t> scratch(n);
+      std::vector<int32_t> got(n);
+      gaud_vorbis_imdct(spectrum.data(), n, scratch.data(), got.data());
+      unsigned shift = gaud_vorbis_imdct_shift(n);
+      double unit = (double)(1u << (VORBIS_SPECTRUM_Q - shift));
+
+      std::vector<double> expected = ImdctDirect(wanted, n);
+      double peak = 0.0;
+      for (double value : expected) {
+        peak = std::max(peak, std::abs(value));
+      }
+      ASSERT_GT(peak, 1e-6) << "n=" << n << " case " << which
+                            << ": the reference output is silence, so this "
+                               "compares nothing";
+      double worst = 0.0;
+      for (unsigned i = 0; i < n; ++i) {
+        worst = std::max(worst, std::abs((double)got[i] / unit
+            - expected[i]));
+      }
+      /* One 16-bit least significant bit, as a fraction of full scale. */
+      const double lsb = 1.0 / 32768.0;
+      EXPECT_LT(worst / lsb, 2.0)
+          << "n=" << n << " case " << which << ": worst " << worst
+          << " is " << (worst / lsb) << " least significant bits of 16, "
+          << "against a block peak of " << peak;
+      if (worst / lsb > observed) {
+        observed = worst / lsb;
+      }
+    }
+  }
+  /* **And the other direction**: an error of zero would mean the
+   * comparison is against this library's own answer rather than against
+   * the formula, which is what a test that accidentally called the same
+   * code twice would report. A fixed-point transform cannot be exact. */
+  EXPECT_GT(observed, 1e-3)
+      << "the integer transform agrees with a double-precision formula to "
+      << "better than a thousandth of a least significant bit, which it "
+      << "cannot: the two sides are probably the same code";
 }
 
 int main(int argc, char ** argv) {

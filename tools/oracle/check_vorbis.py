@@ -8,23 +8,21 @@
 # Ghoti.io Audio is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""Score what this library says a Vorbis stream *is*, against two readers.
+"""Score this library's Vorbis decode against the reference decoders.
 
     make check-vorbis
 
-**There is no decode here yet, and this gate is the reason that is an
-honest place to stop.** planning/audio.md section 11.18 argues that
-identification lands before decoding as a commit of its own, and the
-second half of that argument is that the identification can be *gated* on
-its own. For Vorbis there is more to gate than there was for MPEG,
-because Vorbis states its length nowhere in the file: the only statement
-of it is the granule position on the last page, and reading that wrong is
-a whole-file error that no amount of correct decoding would fix.
+Two halves, and they are scored against different readers for reasons
+that took measuring to establish.
 
-So this compares, per fixture: the sample rate, the channel count, and
-the length. Against two readers, and **the two disagree about the length
-of every file in the corpus** - which is the finding this gate exists to
-hold still rather than a problem with it.
+**What a stream is** - its sample rate, channel count and length - is
+compared against `ffprobe`'s reading of the granule positions and against
+libsndfile's decode. Vorbis states its length nowhere in the file: the
+only statement of it is the granule position on the last page, so reading
+that wrong is a whole-file error no amount of correct decoding would fix.
+
+**What it decodes to** is compared against ffmpeg's native Vorbis
+decoder, sample for sample, with the frame count asserted first.
 
 ## The two readers are not the two you would pick
 
@@ -39,6 +37,29 @@ about a length is asking it once.
 The second independent reading of a length is libsndfile, which reaches
 Vorbis through libvorbis's own `vorbisfile` layer - the code whose job is
 exactly this arithmetic.
+
+## Why the samples are scored against ffmpeg and not libsndfile
+
+Because **libsndfile wraps on overflow where ffmpeg clips**, and a
+decoded Vorbis stream can exceed full scale. That is not a defect in
+either of them and it is not a defect here: a lossy encoder reconstructs
+a signal that was near full scale as one slightly over it, and what a
+decoder does about that is a choice its output format forces. ffmpeg
+clips to +32,767; python-soundfile's `dtype='int16'` conversion wraps,
+so +1.0914 comes back as -29,775 rather than as +32,767.
+
+Measured: `vorbis_lib_mono_8000.ogg` has **60 samples of 1,601 beyond
+full scale**, and ffmpeg's own float output at the first of them is
++1.091385 where this library computes +1.09135 - agreement to five
+decimal places, and the same +32,767 after clipping.
+`vorbis_ff_stereo_44100.ogg` has 16 such samples, all in its first block.
+Against libsndfile those 76 samples read as a decoder that is wrong by
+two full scales; against ffmpeg they read as what they are.
+
+This is section 12's point about a reference's *channel* rather than the
+reference itself, and it is why the length is still scored against
+libsndfile - the two questions have different right answers from the
+same two tools.
 
 ## What they disagree about, measured
 
@@ -79,7 +100,9 @@ every one of those must be rejected. The denominators are printed.
 """
 
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 
@@ -91,6 +114,23 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 DATA = os.path.join(ROOT, "tests", "data")
 PROBE = os.path.join(ROOT, "build", "linux", "release", "apps", "oracle",
     "dump_probe")
+
+#: The most a sample may differ from ffmpeg's, in units of the 16-bit
+#: output. One is what is measured on every fixture; two is the gate, the
+#: same margin check_mpeg.py allows and for the same reason - it leaves
+#: room for a reference upgrade to move the last bit and no room for a
+#: defect.
+MAX_SAMPLE = 2
+
+#: The most the difference's root-mean-square may be, relative to the
+#: signal's. Measured worst case is 1.4e-05 (-97 dB); this is 1e-04.
+MAX_RELATIVE_RMS = 1.0e-4
+
+#: How far our own absolute level may differ from the reference's,
+#: relative. **Checked as well as the difference**, because a decoder six
+#: decibels down passes any threshold scaled to the signal
+#: (planning/audio.md section 12).
+MAX_LEVEL = 1.0e-3
 
 #: How many frames each fixture's encoder was given.
 #:
@@ -134,6 +174,19 @@ PADDED = {
 #: to ask, and a score whose denominator shrank without saying so is
 #: inflated.
 EXCLUSIONS = {
+    ("libsndfile-samples", "*"): (
+        "libsndfile wraps on overflow where ffmpeg clips, and a decoded "
+        "Vorbis stream can exceed full scale: a lossy encoder "
+        "reconstructs a signal that was near full scale as one slightly "
+        "over it. python-soundfile's int16 conversion turns +1.0914 into "
+        "-29,775 rather than into +32,767. Measured, 60 samples of "
+        "vorbis_lib_mono_8000.ogg's 1,601 and 16 of "
+        "vorbis_ff_stereo_44100.ogg's 8,832 are beyond full scale; "
+        "ffmpeg's float output at the first of them is +1.091385 against "
+        "this library's +1.09135. So the samples are scored against "
+        "ffmpeg, which clips, and the *length* is still scored against "
+        "libsndfile, which is right about that and which ffmpeg is "
+        "wrong about. Two questions, two answers, same two tools."),
     ("ffmpeg-decoded", "*"): (
         "ffmpeg's Ogg demuxer computes a start skip from the first "
         "packet's duration rather than from the first page's granule "
@@ -202,6 +255,55 @@ def ffprobe_stream(path):
         "channels": int(one["channels"]),
         "frames": int(one["duration_ts"]),
     }
+
+
+def ffmpeg_pcm(path):
+    """Every sample ffmpeg decodes, as 16-bit little-endian."""
+    finished = run(oracle.command("ffmpeg", [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+        "-f", "s16le", "-"], scratch=DATA))
+    if finished.returncode != 0:
+        return None
+    return list(struct.unpack(
+        "<%dh" % (len(finished.stdout) // 2), finished.stdout))
+
+
+def ours_pcm(path):
+    """Every sample this library decodes, the same way."""
+    finished = run([PROBE, path, "--pcm"])
+    if finished.returncode != 0:
+        raise SystemExit("dump_probe --pcm failed on %s:\n%s"
+                         % (path, finished.stderr[-800:].decode(
+                             "utf-8", "replace")))
+    return list(struct.unpack(
+        "<%dh" % (len(finished.stdout) // 2), finished.stdout))
+
+
+def measure(ours, theirs, channels):
+    """The worst and the root-mean-square difference, over the overlap.
+
+    **The overlap and not the whole**, because ffmpeg's Ogg demuxer hands
+    out a different number of samples from the length the stream states -
+    see the exclusion below - so the two sequences start together and one
+    runs on. What is compared is every sample both produced; the *length*
+    is checked separately and against a reader that gets it right.
+    """
+    count = min(len(ours), len(theirs))
+    if count == 0:
+        return None
+    worst = 0
+    total = 0.0
+    signal = 0.0
+    for i in range(count):
+        difference = ours[i] - theirs[i]
+        if abs(difference) > worst:
+            worst = abs(difference)
+        total += float(difference) * difference
+        signal += float(theirs[i]) * theirs[i]
+    rms = math.sqrt(total / count)
+    level = math.sqrt(signal / count)
+    return {"count": count, "worst": worst, "rms": rms, "level": level,
+            "channels": channels}
 
 
 def libsndfile_stream(path):
@@ -275,6 +377,9 @@ def main():
     bad = []
     comparisons = 0
     generator_checks = 0
+    samples = 0
+    worst_sample = 0
+    worst_relative = 0.0
     first = None
     for name in files:
         path = os.path.join(DATA, name)
@@ -299,14 +404,41 @@ def main():
                 "libsndfile": libsndfile_stream(path)}
         bad += compare(name, mine, refs)
         comparisons += comparison_count(refs)
-        row = " | ".join("%s %dHz %dch %d" % (ref, t["rate"], t["channels"],
-                                              t["frames"])
-                         for ref, t in sorted(refs.items())
-                         if t is not None)
-        print("  %-32s %5dHz %dch %6d frames   %s"
-              % (name, mine["rate"], mine["channels"], mine["frames"], row))
         if first is None:
             first = (name, mine, refs)
+
+        # The samples, against ffmpeg.
+        theirs = ffmpeg_pcm(path)
+        if theirs is None:
+            bad.append("%s: ffmpeg decoded nothing, which is not an "
+                       "exclusion this gate knows about" % name)
+            continue
+        measured = measure(ours_pcm(path), theirs, mine["channels"])
+        if measured is None:
+            bad.append("%s: nothing to compare" % name)
+            continue
+        samples += measured["count"]
+        relative = (measured["rms"] / measured["level"]
+                    if measured["level"] else 0.0)
+        decibels = (20.0 * math.log10(relative) if relative > 0
+                    else float("-inf"))
+        if measured["worst"] > MAX_SAMPLE:
+            bad.append("%s: a sample differs from ffmpeg by %d, and the "
+                       "bound is %d"
+                       % (name, measured["worst"], MAX_SAMPLE))
+        if relative > MAX_RELATIVE_RMS:
+            bad.append("%s: the difference is %.2e of the signal, and the "
+                       "bound is %.0e" % (name, relative, MAX_RELATIVE_RMS))
+        if measured["worst"] > worst_sample:
+            worst_sample = measured["worst"]
+        if relative > worst_relative:
+            worst_relative = relative
+        print("  %-32s %5dHz %dch %6d frames  %6d samples  worst %d  "
+              "%s"
+              % (name, mine["rate"], mine["channels"], mine["frames"],
+                 measured["count"], measured["worst"],
+                 "silence" if decibels == float("-inf")
+                 else "%.1f dB" % decibels))
 
     # The controls, and they run compare() rather than re-deriving its
     # answer: each is *our* reading perturbed the way a real defect would
@@ -323,6 +455,32 @@ def main():
     if not any(t is not None for t in refs.values()):
         raise SystemExit("every reference declined %s, so the controls "
                          "cannot run" % name)
+    # A sample control, run through the same measure(): a decode that is
+    # six decibels down passes any threshold scaled to the signal, and a
+    # decode that is silence produces the right number of bytes. Both are
+    # built from the *reference's* own samples, so what is being checked
+    # is the comparison and not this library.
+    reference_pcm = ffmpeg_pcm(os.path.join(DATA, name))
+    if reference_pcm:
+        for what, wrong_pcm in (
+                ("a decode six decibels down",
+                 [v // 2 for v in reference_pcm]),
+                ("a decode that is silence", [0] * len(reference_pcm)),
+                ("a decode with one sample three out",
+                 [v + 3 if i == len(reference_pcm) // 2 else v
+                  for i, v in enumerate(reference_pcm)]),
+                ("a decode with its channels swapped",
+                 ([reference_pcm[i ^ 1] for i in range(len(reference_pcm))]
+                  if mine["channels"] == 2 else None)),
+        ):
+            if wrong_pcm is None:
+                continue
+            controls += 1
+            got = measure(wrong_pcm, reference_pcm, mine["channels"])
+            relative = (got["rms"] / got["level"] if got["level"] else 0.0)
+            if got["worst"] <= MAX_SAMPLE and relative <= MAX_RELATIVE_RMS:
+                unseen.append(what)
+
     for what, wrong in (
             ("a length one frame over",
              dict(mine, frames=mine["frames"] + 1)),
@@ -356,10 +514,16 @@ def main():
         raise SystemExit("check-vorbis: %d disagreement(s)" % len(bad))
 
     print()
-    print("%d fixtures, %d comparisons against two independent readings of "
+    print("%d fixtures. %d comparisons against two independent readings of "
           "the length, and %d checked against the frame count the encoder "
           "was given - which involves no decoder at all."
           % (len(files), comparisons, generator_checks))
+    print("%d samples compared against ffmpeg's native Vorbis decoder: "
+          "worst difference %d of 32,768, worst relative error %.2e "
+          "(%.1f dB)."
+          % (samples, worst_sample, worst_relative,
+             20.0 * math.log10(worst_relative) if worst_relative > 0
+             else float("-inf")))
     print("%d controls run through the same comparison and rejected."
           % controls)
     if EXCLUSIONS:
@@ -370,11 +534,11 @@ def main():
             for line in _wrap(why, 70):
                 print("      %s" % line)
     print()
-    print("**No sample values are compared, because there is no decoder "
-          "yet.** This gate scores identification: the rate, the channel "
-          "count and the length. A decoder that produced silence would "
-          "pass every check above, and that is the hole phase 6's next "
-          "commit closes rather than a weakness in these numbers.")
+    print("The frame count is asserted before any sample is compared, "
+          "the absolute level is checked and not only the difference, "
+          "and the controls below are run through the same comparison - "
+          "which is planning/audio.md section 12's list for a decoder "
+          "whose output is a tolerance rather than an identity.")
 
 
 def _wrap(text, width):

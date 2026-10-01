@@ -129,6 +129,65 @@ enum {
 /** One in Q#VORBIS_Q. */
 #define VORBIS_ONE (1 << VORBIS_Q)
 
+/**
+ * Fractional bits in a spectral line, after the floor has been applied.
+ *
+ * **Twelve more than the residue's, and the reason is the floor.** A
+ * residue value is an integer up to a few thousand; the floor it is
+ * multiplied by is an attenuation down to 1e-07. So a typical spectral
+ * line is around 1e-05, which in the residue's own Q16 would be the
+ * number 0.65 - rounding to one or to zero, a hundred per cent either
+ * way. Q28 holds it to 3.7e-09, which is four orders of magnitude below
+ * the 16-bit output's least significant bit.
+ *
+ * What Q28 gives up is range: ±8. A line cannot exceed the signal's own
+ * amplitude by much, so that is ample, and the product saturates rather
+ * than wrapping for the arithmetically possible but physically absurd
+ * case of a full-scale floor under a residue of several thousand.
+ */
+#define VORBIS_SPECTRUM_Q 28
+
+/**
+ * Fractional bits in a time-domain sample, before it becomes 16-bit PCM.
+ *
+ * The inverse transform's own output scale depends on the block size -
+ * it halves its state every second stage, so a bigger block loses more -
+ * and the overlap-add adds the right half of one block to the left half
+ * of the next, which may be a different size. So the transform's output
+ * is normalised to this one scale before anything is added to anything,
+ * and 24 is chosen so that the normalisation is a right shift for the
+ * largest block size and a left shift of at most two for the smallest.
+ */
+#define VORBIS_TIME_Q 24
+
+/**
+ * The factor the inverse transform's own definition leaves out, in bits.
+ *
+ * **One bit, which is to say two, and it is measured rather than
+ * derived.** The specification defines the inverse transform and says
+ * that windowing its output and overlapping it with the next block
+ * reconstructs the signal - but it never gives the forward transform, so
+ * the scale between the two is fixed by what encoders do rather than by
+ * the document. Decoded without it, every fixture comes out at exactly
+ * half amplitude: sample for sample, against libsndfile, the ratio is
+ * 0.500015 over 8,818 samples, which is a clean factor of two and a
+ * little rounding rather than a window applied wrongly - that would vary
+ * across a block instead of scaling it.
+ *
+ * It is a constant and not a function of the block size, because the
+ * block size's own contribution is already in
+ * gaud_vorbis_imdct_shift(), which was checked against the
+ * specification's formula at all eight sizes.
+ *
+ * **Zero, as it turns out.** The factor of two the first measurement
+ * showed was this library's own: `to_s16()` had an extra halving in it.
+ * The constant stays, with the measurement that settled it, because
+ * "the inverse transform's scale is fixed by the encoder rather than by
+ * the document" is still true and the next person to change
+ * ::VORBIS_TIME_Q will want to know where to look.
+ */
+#define VORBIS_TDAC_GAIN_BITS 0
+
 /* ------------------------------------------------------------ bit reader */
 
 /**
@@ -391,6 +450,76 @@ typedef struct {
   unsigned mode_bits;
 } VORBIS_Setup;
 
+/* --------------------------------------------------------- the audio path */
+
+/** @brief What one channel's floor came out as for one packet. */
+typedef struct {
+  bool used; ///< Whether this channel carries anything in this packet.
+  /**
+   * The rendered curve, one entry per spectral line, as an index into
+   * ::gaud_vorbis_floor_db.
+   *
+   * **An index and not a value.** Floor 1's whole output is one of 256
+   * numbers, so carrying the index costs a byte per line where a
+   * fixed-point value costs four and loses precision at the quiet end -
+   * the table spans seven decades and no single scale holds both ends.
+   * The multiply that applies it reads the table's mantissa and shift.
+   */
+  unsigned char * curve; ///< Owned by the decoder, n/2 entries.
+} VORBIS_Channel_Floor;
+
+/**
+ * @brief Decode one channel's floor from @p bits.
+ *
+ * @return ::GAUD_OK with @p out_used saying whether the channel carries
+ *   anything; ::GAUD_ERR_CORRUPT for a packet that does not describe a
+ *   curve.
+ */
+GAUD_Result gaud_vorbis_floor_decode(const VORBIS_Floor * floor,
+    const VORBIS_Setup * setup, VORBIS_Bits * bits, uint32_t lines,
+    unsigned char * out_curve, bool * out_used);
+
+/**
+ * @brief Decode one residue into @p vectors, for the channels wanted.
+ *
+ * @param residue Which residue configuration.
+ * @param setup For the codebooks it names.
+ * @param bits The packet.
+ * @param channels How many vectors @p vectors holds.
+ * @param lines How many spectral lines each one has, which is n/2.
+ * @param wanted One flag per channel: false leaves that vector alone.
+ * @param vectors The vectors, @p channels by @p lines, in Q#VORBIS_Q.
+ */
+GAUD_Result gaud_vorbis_residue_decode(const VORBIS_Residue * residue,
+    const VORBIS_Setup * setup, VORBIS_Bits * bits, uint32_t channels,
+    uint32_t lines, const bool * wanted, int32_t * vectors);
+
+/**
+ * @brief The inverse modified discrete cosine transform of @p n points.
+ *
+ * @param spectrum @p n / 2 lines in Q#VORBIS_SPECTRUM_Q. Consumed: the
+ *   transform works in place in @p scratch and does not alter this.
+ * @param n The block size, a power of two from 64 to 8192.
+ * @param scratch At least @p n / 2 complex values, which is @p n int32.
+ * @param out @p n samples in Q#VORBIS_TIME_Q.
+ */
+void gaud_vorbis_imdct(const int32_t * spectrum, uint32_t n,
+    int32_t * scratch, int32_t * out);
+
+/**
+ * @brief How many bits the transform of @p n points scales its output
+ *   down by.
+ *
+ * The transform halves its state after every second stage, because its
+ * gain on real audio is about the square root of the number of
+ * coefficients and one bit per two stages is what tracks that. So the
+ * output's scale depends on the block size, and the caller normalises it
+ * to ::VORBIS_TIME_Q - which the overlap-add needs, because it adds the
+ * right half of one block to the left half of the next and the two may
+ * be different sizes.
+ */
+unsigned gaud_vorbis_imdct_shift(uint32_t n);
+
 /** @brief Read a setup header, which is the third header packet. */
 GAUD_Result gaud_vorbis_parse_setup(const unsigned char * data, size_t size,
     uint32_t channels, const GAUD_Limits * limits, VORBIS_Setup * out);
@@ -466,6 +595,20 @@ GAUD_Result gaud_vorbis_open(const GAUD_Codec * codec, GAUD_Stream * stream,
 
 /** @brief ::GAUD_Codec::close. */
 void gaud_vorbis_close(const GAUD_Codec * codec, GAUD_Doc * doc);
+
+/** @brief ::GAUD_Codec::decoder_open. */
+GAUD_Result gaud_vorbis_decoder_open(
+    const GAUD_Codec * codec, GAUD_Track * track, GAUD_Decoder ** out);
+
+/**
+ * @brief Which decoded channel belongs in output slot @p slot.
+ *
+ * Vorbis's channel order is not this library's. See the table in
+ * src/codec/vorbis/vorbis_decode.c; exposed so that a test can check the
+ * channel counts the corpus has no fixture for, which is three, five and
+ * seven of the eight the specification defines an order for.
+ */
+unsigned gaud_vorbis_channel_slot(uint32_t channels, unsigned slot);
 
 #ifdef __cplusplus
 }

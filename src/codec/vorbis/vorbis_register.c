@@ -78,28 +78,31 @@ static const GAUD_Codec_Magic ogg_magics[] = {
 /**
  * The codec itself.
  *
- * **`GAUD_CAP_DECODE` is not declared, and that is the state this commit
- * records rather than an omission.** The headers are read, the tags come
- * out, and the length - which Vorbis states nowhere but in its last page's
- * granule position - is established. What is not here is the audio, so
- * gaud_decoder_create() answers ::GAUD_ERR_UNSUPPORTED and a caller can
- * *ask* rather than read a sentence in a README. planning/audio.md
- * section 11.18 is the argument for shipping that half on its own; its
- * last paragraph is the warning that it must not become a resting place.
+ * `GAUD_CAP_DECODE` holds for every floor type 1 stream, which is every
+ * stream any encoder writes. **Floor type 0 is identified and refused**,
+ * per track rather than by a capability bit: it is a line spectral pair
+ * curve needing a cosine and a square root per spectral line in a
+ * decoder this library promises to keep integer and byte-identical
+ * everywhere, and - the deciding reason - nothing in the oracle image
+ * produces one, so a fixed-point approximation of it could not be
+ * scored. src/codec/vorbis/vorbis_floor.c says it at length.
+ *
+ * No encoder: phase 8 brings the perceptual ones, with the two-gate
+ * harness their output needs.
  */
 static const GAUD_Codec vorbis_codec = {
     .abi_version = GAUD_CODEC_ABI_VERSION,
     .size = sizeof(GAUD_Codec),
     .name = "vorbis",
     .ctx = NULL,
-    .capabilities = GAUD_CAP_METADATA_READ,
+    .capabilities = GAUD_CAP_DECODE | GAUD_CAP_METADATA_READ,
     .encoder_tier = GAUD_ENCODER_NONE,
     .magics = ogg_magics,
     .magic_count = sizeof(ogg_magics) / sizeof(ogg_magics[0]),
     .probe = vorbis_probe,
     .open = gaud_vorbis_open,
     .close = gaud_vorbis_close,
-    .decoder_open = NULL,
+    .decoder_open = gaud_vorbis_decoder_open,
     .encoder_open = NULL,
 };
 

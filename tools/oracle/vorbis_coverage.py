@@ -59,18 +59,35 @@ UNREACHABLE = {
     "floor type 0": (
         "Line spectral pair floors. In the specification and produced by "
         "neither libvorbis nor libavcodec, because floor 1 superseded it "
-        "before Vorbis I was finished. A hand-built stream is the only "
-        "way to reach it."),
+        "before Vorbis I was finished. **Identified and refused**, per "
+        "track rather than by a capability bit: it needs a cosine and a "
+        "square root per spectral line in a decoder that must stay "
+        "integer and byte-identical, and - the deciding reason - nothing "
+        "here could score the approximation. A refusal that says so "
+        "beats an approximation nobody can check."),
     "residue type 0": (
         "The original residue layout, which interleaves a partition's "
         "values across the vector where types 1 and 2 keep them "
         "contiguous. Same history as floor 0: specified, then "
-        "superseded, and no encoder emits it."),
+        "superseded, and no encoder emits it. **Implemented** - it is "
+        "one line's difference from type 1 - and reached by nothing, "
+        "which is a different state from floor 0's and is why the two "
+        "are listed separately."),
     "codebook lookup type 2": (
         "A codebook that states every entry's vector explicitly rather "
         "than as a lattice. Legal and enormous - entries times "
         "dimensions multiplicands rather than the lattice's one per axis "
         "- so no encoder chooses it. Reachable only by hand."),
+    "one side of a coupled pair silent": (
+        "A coupling step reads both of its channels, so if either "
+        "carries something both must have their residue decoded - and a "
+        "decoder that skipped the silent one would read the pair's "
+        "residue out of step. The propagation is implemented and **no "
+        "fixture reaches it**: disabling it outright changes no sample "
+        "of any file here, which is how that was established rather "
+        "than assumed. It needs an encoder that leaves one channel of a "
+        "coupled pair empty while the other is not, and none of the "
+        "signals in this corpus produces one."),
     "a sequential codebook": (
         "`sequence_p` set, where a vector's values accumulate rather "
         "than standing alone. Used by floor 0's codebooks, which is why "
@@ -205,11 +222,13 @@ def main():
         for line in _wrap(UNREACHABLE[arm], 68):
             print("      %s" % line)
     print()
-    print("**None of the four is reachable from an encoder.** A corpus "
-          "cannot close them; a hand-built stream can, and that is what "
-          "the decoder's unit tests will have to do. Recording it here "
-          "before the decoder is written is the point - found afterwards, "
-          "the same four are a coverage hole with an excuse.")
+    print("**None of the five is reachable from an encoder.** A corpus "
+          "cannot close them; a hand-built stream can, and two of the "
+          "five have one in tests/unit/test_vorbis.cpp. Of the other "
+          "three, floor 0 is refused rather than implemented, and "
+          "residue 0 and the coupled-pair propagation are implemented "
+          "and unreached - the last of those established by disabling "
+          "it and finding no fixture changed.")
 
     # The one assertion this instrument makes. Everything above is a
     # count; this is a bound, because VORBIS_Q depends on it and a

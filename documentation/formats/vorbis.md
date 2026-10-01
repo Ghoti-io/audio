@@ -1,12 +1,15 @@
 # Vorbis {#format_vorbis}
 
-Vorbis I in Ogg, as the Xiph specification defines it. **Identified, not
-yet decoded.** The codec is registered as `vorbis`, and
-::GAUD_Sample_Coding spells it `GAUD_CODING_VORBIS`.
+Vorbis I in Ogg, as the Xiph specification defines it. **Read and
+decoded.** The codec is registered as `vorbis`, and
+::GAUD_Sample_Coding spells it `GAUD_CODING_VORBIS`. There is no encoder;
+phase 8 brings those.
 
-This page is written to be rewritten. What is here is the half of the
-format with no decoder in it, which planning/audio.md section 11.18
-argues is a commit of its own and warns must not become a resting place.
+The decoder is integer throughout and produces **the same bytes on every
+architecture**, which `make check-golden` checks on two big-endian
+targets - and it agrees with ffmpeg's native Vorbis decoder to **one
+least significant bit of sixteen** over 66,321 samples, which is what
+`make check-vorbis` measures.
 
 ## What is implemented
 
@@ -67,9 +70,23 @@ the writer overwrites must not be a field the reader collects.
 
 ## What is not
 
-**The decoder.** `GAUD_CAP_DECODE` is not declared, so
-`gaud_decoder_create()` answers ::GAUD_ERR_UNSUPPORTED for a Vorbis
-track. A caller can ask rather than read a paragraph.
+**Floor type 0.** A stream using it opens and reports its length, and
+asking it for a decoder answers ::GAUD_ERR_UNSUPPORTED - a per-track
+answer a capability bit cannot give. It is a line spectral pair curve
+needing a cosine and a square root per spectral line in a decoder that
+must stay integer and byte-identical everywhere, which is doable and is
+not the reason it is absent. The reason is that **nothing can score it**:
+no encoder in the oracle image emits one at any setting, and a
+fixed-point approximation of a transcendental curve is exactly the kind
+of code whose error nobody notices without a reference. A refusal that
+says so is better than an approximation nobody can check.
+
+**Seeking is linear.** The bisection exists in
+src/container/ogg/ogg_seek.c and Ogg FLAC uses it; Vorbis does not yet,
+because a Vorbis block's output depends on the block before it, so
+landing on a page means decoding a packet whose output is wrong and
+reconciling the position against the page's granule rather than counting
+samples. Correct and slow first.
 
 **Writing.** Phase 8 brings the perceptual encoders with the two-gate
 harness their output needs.
@@ -86,9 +103,12 @@ them.
 | codebook lookup type 2 | States every entry's vector explicitly rather than as a lattice: entries times dimensions multiplicands where a lattice stores one per axis, so it is legal and enormous |
 | a sequential codebook | `sequence_p`, where a vector's values accumulate. Used by floor 0's codebooks and nothing else |
 
-Two of the four - lookup type 2 and `sequence_p` - already have
-hand-built streams in the unit tests, which is the only way to reach
-either. The other two arrive with the decoder.
+Two of the four - lookup type 2 and `sequence_p` - have hand-built
+streams in the unit tests, which is the only way to reach either. Floor
+type 0 is refused rather than implemented, above. Residue type 0 *is*
+implemented - it differs from type 1 only in where a partition's values
+land, which is one line - and is reached by nothing, which the coverage
+instrument says rather than leaving it to be assumed.
 
 **Recording this before the decoder is written is the point.** Found
 afterwards, the same four are a coverage hole with an excuse attached.
@@ -144,6 +164,30 @@ Two consequences:
   unknown**, reported as `UINT64_MAX` with a diagnostic, rather than as
   zero. A caller cannot tell a length of zero from a length nobody knows.
 
+## The decoder's arithmetic
+
+Integer throughout, and three numbers decide it. A codebook's vector
+values are Q16, sized on the measurement above. A spectral line - a
+residue value multiplied by the floor - is **Q28**, because the floor is
+an attenuation down to 1e-07 and a typical line is around 1e-05, which
+in Q16 would be the number 0.65. A time-domain sample is Q24.
+
+The inverse transform is the one part whose answer is not exactly the
+specification's, and it is factored rather than evaluated: an inverse
+MDCT of n points is a DCT-IV of n/2 with a time-domain aliasing
+symmetry, and a DCT-IV of M points is a complex transform of M/2 with
+one rotation applied on both sides. Both steps were checked against the
+specification's own O(n^2) formula before anything was written, and the
+unit test keeps that check at all eight block sizes - where the measured
+error is **0.55 of a 16-bit least significant bit**, worst case.
+
+The transform halves its state after every second stage, because its
+gain on real audio is about the square root of the coefficient count.
+That makes the output's scale depend on the block size, which the caller
+normalises; a first draft held the normalisation in an `unsigned` and
+every block of 1,024 samples or more shifted right by 31 instead of left
+by one or two.
+
 ## Two references, and they are not the two you would pick
 
 ffmpeg has two Vorbis decoders - libavcodec's own and a wrapper around
@@ -167,6 +211,32 @@ against ffprobe and libsndfile, names ffmpeg's decoded sample count as an
 exclusion with the numbers above, and checks all of it a third way that
 involves no decoder at all - against the frame count the generator fed
 each encoder.
+
+**And for the samples the two swap round.** libsndfile *wraps* on
+overflow where ffmpeg clips, and a decoded Vorbis stream can exceed full
+scale - a lossy encoder reconstructs a signal that was near full scale as
+one slightly over it. python-soundfile's int16 conversion turns +1.0914
+into -29,775 rather than into +32,767. Sixty samples of
+`vorbis_lib_mono_8000.ogg`'s 1,601 are beyond full scale, and ffmpeg's
+float output at the first of them is +1.091385 against this library's
++1.09135. So the samples are scored against ffmpeg and the length
+against libsndfile: two questions, two answers, the same two tools.
+
+## The channel order is not the stream's
+
+`buffer.h` says the order is WAV's `dwChannelMask` and that every other
+container's is mapped onto it on the way in. Vorbis's own order is not
+that one: from three channels up it puts the centre channel second and
+the low-frequency channel last, where WAV puts the centre third and the
+low-frequency fourth. So the decoder permutes.
+
+One and two channels are the identity, which is why this is invisible
+until a file has three - and the corpus has exactly one such file, with
+six. It was found by that file disagreeing with ffmpeg, which reorders to
+WAV, while agreeing with libsndfile, which hands back the stream's own
+order. Three, five and seven channels have no fixture; the permutation
+table is asserted for all eight counts in the unit tests, against the
+specification's order written out and the mask's own bit order.
 
 ## Two writers in the corpus
 

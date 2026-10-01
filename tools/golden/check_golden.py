@@ -88,34 +88,26 @@ TARGETS = {
 #: decode to hash. **Named rather than filtered by extension**: an
 #: exclusion that is a missing glob is the most invisible kind there is.
 #:
-#: It was empty between phase 5 and phase 6, and emptying it is what the
-#: MPEG-2.5 work recorded: the denominator went up rather than the
-#: numerator, which is the only direction that means anything. These ten
-#: entries are the other direction, and they are here rather than being a
-#: `.ogg` left out of the glob below for exactly the reason the paragraph
-#: above gives - a format whose fixtures are in the corpus and not in this
-#: gate's denominator is a hole, and a hole that is a missing extension is
-#: a hole nobody can see.
-#:
-#: **Every one of them goes when the Vorbis decoder lands**, and the count
-#: below is asserted so that a fixture added to the corpus and forgotten
-#: here fails rather than vanishing.
-UNDECODABLE = {
-    "vorbis_ff_stereo_44100.ogg",
-    "vorbis_lib_5dot1_48000.ogg",
-    "vorbis_lib_mono_22050.ogg",
-    "vorbis_lib_mono_44100.ogg",
-    "vorbis_lib_mono_8000.ogg",
-    "vorbis_lib_noise_48000.ogg",
-    "vorbis_lib_silence_44100.ogg",
-    "vorbis_lib_stereo_44100.ogg",
-    "vorbis_lib_transient_44100.ogg",
-    "vorbis_tagged_stereo_44100.ogg",
-}
+#: **Empty again, and that is the whole of what two phases have recorded
+#: here.** It held one entry in phase 5 - MPEG-2.5 Layer III, refused
+#: because its scalefactor band tables are in no standard - and ten in
+#: phase 6, the Vorbis fixtures, between identification landing and the
+#: decoder landing. Emptying it both times is the direction that means
+#: anything: the denominator went up rather than the numerator. The set
+#: stays because the next refusal wants naming here rather than
+#: filtering silently.
+UNDECODABLE = set()
 
 #: Every extension the corpus holds that this gate reasons about. A file
 #: with an extension not in here is not excluded - it is invisible, which
 #: is why the two sets are checked against each other below.
+#:
+#: **Read twice: once to decide what to hash here, and once to build the
+#: glob the cross-architecture script walks.** Those were two lists until
+#: the Vorbis fixtures arrived, and the second one did not have `.ogg` in
+#: it - so ten fixtures were expected on the target, never decoded there,
+#: and reported as "did not happen there". A missing glob again, ten
+#: lines below the comment saying so.
 EXTENSIONS = (".wav", ".aiff", ".aifc", ".flac", ".oga", ".ogg", ".mp3",
               ".mp2", ".mp1")
 
@@ -211,9 +203,7 @@ SRC="$(find src -name '*.c') %(md5)s %(shim)s"
     -I include -I src -I build/linux/release/generated -I %(cutil)s \
     -I %(security)s \
     -o %(out)s/write_probe $SRC tools/oracle/write_probe.c -lm
-for f in tests/data/*.wav tests/data/*.aiff tests/data/*.aifc \
-         tests/data/*.flac tests/data/*.oga tests/data/*.mp3 \
-         tests/data/*.mp2 tests/data/*.mp1; do
+for f in %(globs)s; do
     case " %(skip)s " in *" $(basename "$f") "*) continue;; esac
     printf 'decode %%s ' "$(basename "$f")"
     %(qemu)s -L /usr/%(triple)s %(out)s/dump_probe "$f" --pcm-le | sha256sum \
@@ -228,6 +218,7 @@ done
 """ % {"out": out, "root": ROOT, "cc": compiler, "qemu": qemu,
        "triple": triple, "shim": SHIM,
        "encode": " ".join(ENCODE_FIXTURES),
+       "globs": " ".join("tests/data/*" + one for one in EXTENSIONS),
        "skip": " ".join(sorted(UNDECODABLE)),
        "md5": os.path.join(WORKSPACE, "libs", "security", "src", "md5",
                            "md5.c"),
@@ -301,10 +292,6 @@ def main():
               "not in that number:" % len(UNDECODABLE))
         for name in sorted(UNDECODABLE):
             print("  %s" % name)
-        print("  All of them are Vorbis, which phase 6 reads and does not "
-              "yet decode. They are named rather than left out of the "
-              "extension list, because a hole that is a missing glob is "
-              "one nobody can see.")
     return 0
 
 
