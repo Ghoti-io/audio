@@ -8,7 +8,7 @@
 # Ghoti.io Audio is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""Generate src/codec/mp3/mp3_tables.c from ISO/IEC 11172-3 Annex B.
+"""Generate src/codec/mp3/mp3_tables.c from the MPEG audio standards.
 
     tools/tables/gen_mp3_tables.py [--pdf PATH] [--url URL] [--check]
 
@@ -29,6 +29,16 @@ generated C file *is* committed, so a build needs neither the network nor
 the PDF - this runs when a table changes, which is to say almost never.
 
 What is extracted, and what is computed from what was extracted:
+
+Three documents are read: ISO/IEC 11172-3 Annex B for MPEG-1, ISO/IEC
+13818-3 Annex B for the low sampling frequency extension, and - for
+MPEG-2.5, which **no standard describes** - minimp3, whose CC0 dedication
+puts its tables in the public domain. The third source is the one that
+needs justifying, and the justification is arithmetic rather than
+editorial: it carries all nine sampling rates, six of them are in the two
+standards, and all twelve of those long and short rows are compared
+against what was extracted from the documents before any of the remaining
+rows is used. See parse_minimp3_sfbands and check_minimp3_calibration.
 
   extracted   3-B.1 Layer I/II scalefactors; 3-B.2a..d Layer II bit
               allocation; 3-B.3 the synthesis window; 3-B.4 Layer II
@@ -58,6 +68,8 @@ mis-extraction is the failure this script exists to prevent:
     would be;
   - the scalefactor bands partition their spectrum with no gap and no
     overlap, and end where the standard says;
+  - every band row minimp3 shares with a standard is identical to it,
+    all twelve of them, or nothing from minimp3 is used;
   - the Layer I/II scalefactors are a geometric sequence in 2^(-1/3).
 
 Run with --check to validate and print a summary without writing.
@@ -89,13 +101,33 @@ KNOWN_SHA256 = {
 }
 
 
+# **MPEG-2.5 is in neither standard**, so its scalefactor band tables come
+# from a third document: minimp3, which is CC0-1.0 - a public domain
+# dedication, so the extracted values carry no licence obligation into a
+# LGPL library. Pinned to a commit rather than a branch, because a table
+# that changes under this script must be a fetch failure and not a silent
+# difference. See parse_minimp3_sfbands for what makes the extraction
+# checkable.
+MINIMP3_COMMIT = "ea99364f61c14656440e8d77e9c233ccf3124633"
+MINIMP3_URL = ("https://raw.githubusercontent.com/lieff/minimp3/%s/minimp3.h"
+               % MINIMP3_COMMIT)
+
+
 class Fail(Exception):
     """A validation failed. Never caught into a warning."""
 
 
-def fetch(url, into):
-    """Fetch the document into a temporary directory, never the repository."""
-    path = os.path.join(into, "iso11172-3.pdf")
+def fetch(url, into, name):
+    """Fetch one document into a temporary directory, never the repository.
+
+    @p name is the basename to write, and it is a parameter rather than a
+    constant because this script reads three documents. With one constant
+    filename the second fetch overwrote the first, both handles named the
+    same bytes, and the 11172-3 parsers were handed 13818-3 - which failed
+    to find Table 3-B.8a and so was loud rather than silent, but only when
+    someone actually regenerated.
+    """
+    path = os.path.join(into, name)
     if shutil.which("curl") is None:
         raise Fail("curl is not on PATH, and the document has to be fetched")
     finished = subprocess.run(
@@ -676,6 +708,145 @@ def parse_lsf_sfbands(text):
     return out
 
 
+# ------------------------------------- minimp3, the rates nobody defined
+
+#: minimp3 keeps eight rows for nine sampling frequencies, indexed by
+#: `HDR_GET_MY_SAMPLE_RATE` less one when nonzero - which collapses 11.025
+#: and 12 kHz onto a single row because their tables are identical. The
+#: mapping is transcribed from that expression and then *checked*: six of
+#: these rates are in the two standards, and if the mapping were off by
+#: one those six rows would not match what was extracted from them.
+MINIMP3_ROW = {11025: 0, 12000: 0, 8000: 1, 22050: 2, 24000: 3, 16000: 4,
+               44100: 5, 48000: 6, 32000: 7}
+
+
+def parse_minimp3_sfbands(text):
+    """minimp3's scalefactor band widths, for all nine sampling rates.
+
+    **Why a third source at all.** MPEG-2.5 is an extension by the
+    format's authors that neither ISO/IEC 11172-3 nor ISO/IEC 13818-3
+    describes: there is no document to extract its band tables from, and
+    for a format with no standard the correctness criterion is agreement
+    with the encoders that write the files rather than conformance to a
+    text. So the values come from an implementation, and what makes that
+    sound is not the implementation's reputation but the overlap.
+
+    **The extraction is calibrated on the rows that are also in the
+    standards.** minimp3 carries all nine rates. Six of them - every
+    MPEG-1 and MPEG-2 rate - this script already extracts from the two
+    documents independently, so twelve of the sixteen long and short rows
+    can be compared before any of the remaining ones is believed. See
+    check_minimp3_calibration, which is a hard failure and not a warning.
+    That comparison validates the whole chain at once: the row mapping,
+    the widths-versus-boundaries convention, and the padding band this
+    script computes rather than reads.
+
+    Returns {rate: {'long': [widths], 'short': [widths]}}.
+
+    The structural checks here are the ones available without a second
+    column to check against, since minimp3 prints the width alone where
+    both standards print the width, the first line and the last:
+
+      - a long row is 22 widths summing to 576 and a short row 13 summing
+        to 192, which is what makes it a partition of the spectrum;
+      - the short widths arrive as three identical copies, one per window,
+        and all three are read and compared rather than one being taken -
+        a row whose triples disagree has been read across a boundary.
+    """
+    out = {}
+    tables = {}
+    for which, rows, cols, span, bands in (("long", 8, 23, 576, 22),
+                                           ("short", 8, 40, 192, 13)):
+        match = re.search(r"g_scf_%s\[%d\]\[%d\]\s*=\s*\{(.*?)\n    \};"
+            % (which, rows, cols), text, re.S)
+        if not match:
+            raise Fail("minimp3: no g_scf_%s[%d][%d]" % (which, rows, cols))
+        found = []
+        for block in re.findall(r"\{([^{}]*)\}", match.group(1)):
+            values = [int(v) for v in re.findall(r"\d+", block)]
+            if values[-1] != 0:
+                raise Fail("minimp3 g_scf_%s row %d is not zero-terminated"
+                           % (which, len(found)))
+            values = values[:-1]
+            if which == "short":
+                if len(values) != bands * 3:
+                    raise Fail("minimp3 g_scf_short row %d has %d widths, "
+                               "not %d bands in each of three windows"
+                               % (len(found), len(values), bands))
+                for band in range(bands):
+                    three = values[band * 3:band * 3 + 3]
+                    if three[0] != three[1] or three[1] != three[2]:
+                        raise Fail("minimp3 g_scf_short row %d band %d is "
+                                   "%r across the three windows, which are "
+                                   "meant to be identical"
+                                   % (len(found), band, three))
+                values = values[::3]
+            if len(values) != bands:
+                raise Fail("minimp3 g_scf_%s row %d has %d bands, not %d"
+                           % (which, len(found), len(values), bands))
+            if sum(values) != span:
+                raise Fail("minimp3 g_scf_%s row %d accounts for %d lines "
+                           "and there are %d, so it is not a partition"
+                           % (which, len(found), sum(values), span))
+            found.append(values)
+        if len(found) != rows:
+            raise Fail("minimp3 g_scf_%s: %d rows, not %d"
+                       % (which, len(found), rows))
+        tables[which] = found
+    for rate, row in MINIMP3_ROW.items():
+        out[rate] = {"long": tables["long"][row],
+                     "short": tables["short"][row]}
+    return out
+
+
+def check_minimp3_calibration(sfbands, lsf_sfbands, mini):
+    """Every rate the standards define must agree with minimp3, exactly.
+
+    Twelve rows - six rates, long and short - and all twelve are compared
+    as widths. A single disagreement fails the run, because the only
+    reason to trust minimp3 for the three rates no document defines is
+    that it reproduces the six that two documents do.
+
+    Then the premise the C code's row mapping rests on: that 11.025 and
+    12 kHz use the 16 kHz tables. That is a claim about the format, so it
+    is asserted here rather than assumed at the point of use, and 8 kHz is
+    asserted to be *different* from all six - otherwise this whole third
+    source would be unnecessary and something has been misread.
+    """
+    checked = 0
+    for source, rates in ((sfbands, (44100, 48000, 32000)),
+                          (lsf_sfbands, (22050, 24000, 16000))):
+        for rate in rates:
+            for which in ("long", "short"):
+                theirs = mini[rate][which]
+                ours = [row[0] for row in source[rate][which]]
+                # The standards' tables stop short of the spectrum at the
+                # MPEG-1 rates; the padding band this script adds is a
+                # width too, and minimp3 prints it, so compare the padded
+                # form. That is the point: the pad is checked, not assumed.
+                span = 576 if which == "long" else 192
+                if sum(ours) < span:
+                    ours = ours + [span - sum(ours)]
+                if ours != theirs:
+                    raise Fail(
+                        "minimp3 disagrees with the standard at %d Hz, %s "
+                        "blocks, so the extraction cannot be calibrated and "
+                        "nothing from it is usable:\n  standard %r\n  "
+                        "minimp3  %r" % (rate, which, ours, theirs))
+                checked += 1
+    for rate in (11025, 12000):
+        if mini[rate] != mini[16000]:
+            raise Fail("minimp3 gives %d Hz tables that differ from its "
+                       "16 kHz ones; the row mapping in "
+                       "gaud_mp3_band_row() assumes they are the same"
+                       % rate)
+    for rate in (44100, 48000, 32000, 22050, 24000, 16000):
+        if mini[8000] == mini[rate]:
+            raise Fail("minimp3's 8 kHz tables are identical to its %d Hz "
+                       "ones, which no source says they should be" % rate)
+    return checked
+
+
 def parse_lsf_scalefactor_groups(text):
     """13818-3: how many scalefactors each of the four partitions holds.
 
@@ -1112,6 +1283,15 @@ def emit(data):
  * 32 kHz; rows 3 to 5 are MPEG-2 at 22.05, 24 and 16 kHz, in the order
  * the frame header's rate field numbers them.
  *
+ * **Row 6 is MPEG-2.5 at 8 kHz, and it is from neither document** - that
+ * version is an extension by the format's authors that neither one
+ * describes. It comes from minimp3, which is CC0, and the extraction is
+ * calibrated on the twelve rows above that two standards also define; see
+ * parse_minimp3_sfbands in the generator. **MPEG-2.5 at 11.025 and 12 kHz
+ * has no row of its own** because its tables are identical to the 16 kHz
+ * ones in row 5, which is asserted when this file is generated and is why
+ * gaud_mp3_band_row() maps those two rates onto that row.
+ *
  * **MPEG-2 has 22 long bands and 13 short ones where MPEG-1 has 21 and
  * 12**, which is why the band count is a table of its own rather than a
  * constant. 13818-3's own prose says 21 and 12 and its tables print 22
@@ -1152,10 +1332,23 @@ def emit(data):
                     count += 1
                 counts.append(count)
                 rows.append(boundaries + [0] * (width - len(boundaries)))
-    out.rows("const uint16_t gaud_mp3_sfb_long[6][24]", long_rows)
-    out.array("const uint8_t gaud_mp3_sfb_long_bands[6]", long_counts)
-    out.rows("const uint16_t gaud_mp3_sfb_short[6][15]", short_rows)
-    out.array("const uint8_t gaud_mp3_sfb_short_bands[6]", short_counts)
+    # Row 6: MPEG-2.5 at 8 kHz, from minimp3 rather than from a standard,
+    # and as widths rather than boundaries - so the boundaries are summed
+    # here. 11.025 and 12 kHz get no row; their tables are row 5's, which
+    # check_minimp3_calibration asserts.
+    for which, rows, counts, width in (("long", long_rows, long_counts, 24),
+                                       ("short", short_rows, short_counts,
+                                        15)):
+        widths = data["minimp3_sfbands"][8000][which]
+        boundaries = [0]
+        for one in widths:
+            boundaries.append(boundaries[-1] + one)
+        counts.append(len(widths))
+        rows.append(boundaries + [0] * (width - len(boundaries)))
+    out.rows("const uint16_t gaud_mp3_sfb_long[7][24]", long_rows)
+    out.array("const uint8_t gaud_mp3_sfb_long_bands[7]", long_counts)
+    out.rows("const uint16_t gaud_mp3_sfb_short[7][15]", short_rows)
+    out.array("const uint8_t gaud_mp3_sfb_short_bands[7]", short_counts)
 
     out.write("/* 11172-3 Table 3-B.6: added to the scalefactors when "
               "preflag is set. */\n")
@@ -1490,13 +1683,13 @@ extern const int16_t gaud_mp3_quad_nodes[%d];
 extern const uint16_t gaud_mp3_quad_offset[2];
 
 /** Long-block scalefactor band boundaries, by version and rate. */
-extern const uint16_t gaud_mp3_sfb_long[6][24];
+extern const uint16_t gaud_mp3_sfb_long[7][24];
 /** How many long bands each row of ::gaud_mp3_sfb_long has. */
-extern const uint8_t gaud_mp3_sfb_long_bands[6];
+extern const uint8_t gaud_mp3_sfb_long_bands[7];
 /** Short-block band boundaries, within one of the three windows. */
-extern const uint16_t gaud_mp3_sfb_short[6][15];
+extern const uint16_t gaud_mp3_sfb_short[7][15];
 /** How many short bands each row of ::gaud_mp3_sfb_short has. */
-extern const uint8_t gaud_mp3_sfb_short_bands[6];
+extern const uint8_t gaud_mp3_sfb_short_bands[7];
 /** Added to the scalefactors when preflag is set, Table 3-B.6. */
 extern const uint8_t gaud_mp3_pretab[22];
 /** MPEG-2's scalefactor partition sizes, by group and block shape. */
@@ -1562,6 +1755,9 @@ def main(argv):
     parser.add_argument("--lsf-url",
         default="https://courses.e-ce.uth.gr/CE401/tree_menu/tutorials/"
                 "MPEG2/13818-3.pdf")
+    parser.add_argument("--minimp3",
+        help="a local copy of minimp3.h, for the MPEG-2.5 band tables")
+    parser.add_argument("--minimp3-url", default=MINIMP3_URL)
     parser.add_argument("--out", default=os.path.join(ROOT, "src", "codec",
         "mp3"))
     parser.add_argument("--check", action="store_true",
@@ -1569,15 +1765,20 @@ def main(argv):
     args = parser.parse_args(argv[1:])
 
     with tempfile.TemporaryDirectory(prefix="ghoti-mp3-tables-") as scratch:
-        one = args.pdf or fetch(args.url, scratch)
-        two = args.lsf_pdf or fetch(args.lsf_url, os.path.join(scratch, "b")
-            if False else scratch)
+        one = args.pdf or fetch(args.url, scratch, "iso11172-3.pdf")
+        two = args.lsf_pdf or fetch(args.lsf_url, scratch, "iso13818-3.pdf")
+        three = args.minimp3 or fetch(args.minimp3_url, scratch, "minimp3.h")
         if not args.pdf:
             print("fetched %s\n  sha256 %s" % (args.url, digest(one)))
         if not args.lsf_pdf:
             print("fetched %s\n  sha256 %s" % (args.lsf_url, digest(two)))
+        if not args.minimp3:
+            print("fetched %s\n  sha256 %s" % (args.minimp3_url,
+                digest(three)))
         text = raw_text(one)
         lsf = raw_text(two)
+        with open(three, "r", encoding="utf-8", errors="replace") as handle:
+            mini = handle.read()
 
         data = {
             "scalefactors": parse_scalefactors(text),
@@ -1591,7 +1792,10 @@ def main(argv):
             "lsf_sfbands": parse_lsf_sfbands(lsf),
             "lsf_groups": parse_lsf_scalefactor_groups(lsf),
             "lsf_allocation": parse_lsf_allocation(lsf),
+            "minimp3_sfbands": parse_minimp3_sfbands(mini),
         }
+        calibrated = check_minimp3_calibration(data["sfbands"],
+            data["lsf_sfbands"], data["minimp3_sfbands"])
         quadruples, tables = parse_huffman(text)
         data["quadruples"] = quadruples
         data["tables"] = tables
@@ -1607,6 +1811,12 @@ def main(argv):
           "short bands")
     print("                 6 scalefactor partition groups, 1 Layer II "
           "allocation table")
+    print("minimp3 (CC0):   MPEG-2.5's band tables, %d of its rows checked "
+          "against the" % calibrated)
+    print("                 standards above and identical in every one; "
+          "11.025 and 12 kHz")
+    print("                 reuse the 16 kHz tables, so only 8 kHz is new "
+          "data")
 
     body = emit(data)
     nodes = int(re.search(r"gaud_mp3_huff_nodes\[(\d+)\]", body).group(1))

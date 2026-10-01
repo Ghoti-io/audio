@@ -324,12 +324,11 @@ GAUD_Result gaud_mp3_decoder_open(
   }
   unsigned row = 0;
   if (file->first.layer == 3u && !gaud_mp3_band_row(&file->first, &row)) {
-    /* MPEG-2.5 Layer III, whose scalefactor band tables are in no
-     * standard: the version is an extension by the format's authors that
-     * neither 11172-3 nor 13818-3 defines, so this library has nothing
-     * to generate them from. Refused by name rather than guessed at.
-     * Layers I and II at those sampling frequencies need no band table
-     * and do decode. */
+    /* No reserved version reaches this point - gaud_mp3_header_parse
+     * refuses those - so this is unreachable for a header that parsed.
+     * It stays because gaud_mp3_band_row() is the one place that knows
+     * which rows exist, and a future rate added to the header tables
+     * without a row would otherwise index past the band tables. */
     return GAUD_ERR_UNSUPPORTED;
   }
 

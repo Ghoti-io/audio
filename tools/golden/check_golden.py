@@ -87,12 +87,14 @@ TARGETS = {
 #: Fixtures this library identifies and does not decode, so there is no
 #: decode to hash. **Named rather than filtered by extension**: an
 #: exclusion that is a missing glob is the most invisible kind there is.
-UNDECODABLE = {
-    # MPEG-2.5 Layer III, whose scalefactor band tables are in no
-    # standard - neither 11172-3 nor 13818-3 defines that version at all,
-    # so tools/tables/gen_mp3_tables.py has nothing to generate them from.
-    "mp3_lame_mono_11025.mp3",
-}
+#:
+#: **It is empty, and that is the interesting state.** It held one entry -
+#: MPEG-2.5 Layer III, refused because its scalefactor band tables are in
+#: no standard - and emptying it is what this gate records about that work:
+#: the denominator below went up rather than the numerator, which is the
+#: only direction that means anything. The set stays because the next
+#: refusal wants naming here rather than filtering silently.
+UNDECODABLE = set()
 
 
 def fixtures():

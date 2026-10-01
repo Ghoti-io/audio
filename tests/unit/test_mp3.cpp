@@ -341,6 +341,92 @@ TEST(Mp3Header, SideInformationFollowsTheVersionAndTheChannelCount) {
   }
 }
 
+TEST(Mp3Bands, EveryVersionAndRateHasABandRowAndNoneIsOutOfRange) {
+  /* gaud_mp3_band_row() is the only place that knows which rows the
+   * generated band tables have, so an index it returns past the end of
+   * them is a read off the end of a table on every frame of a legal
+   * file. Every (version, rate index) the header can carry is asked. */
+  for (unsigned version : {0u, 2u, 3u}) {
+    for (unsigned rate = 0; rate < 3u; ++rate) {
+      MP3_Header header;
+      ASSERT_TRUE(gaud_mp3_header_parse(
+          Header(version, L3, false, 5u, rate, false, 0u).data(), &header))
+          << "version " << version << " rate index " << rate;
+      unsigned row = 99u;
+      ASSERT_TRUE(gaud_mp3_band_row(&header, &row))
+          << "no band row for version field " << version << " rate index "
+          << rate;
+      ASSERT_LT(row, 7u) << "row " << row << " is past the tables";
+      /* And the row it chose is a partition of the spectrum. A row that
+       * exists but stops short leaves lines with no band, which is the
+       * defect phase 5 found; a row that overshoots indexes past 576. */
+      unsigned longs = gaud_mp3_sfb_long_bands[row];
+      unsigned shorts = gaud_mp3_sfb_short_bands[row];
+      EXPECT_EQ(gaud_mp3_sfb_long[row][0], 0u);
+      EXPECT_EQ(gaud_mp3_sfb_long[row][longs], 576u)
+          << "the long row for " << header.sample_rate << " Hz ends at "
+          << gaud_mp3_sfb_long[row][longs];
+      EXPECT_EQ(gaud_mp3_sfb_short[row][0], 0u);
+      EXPECT_EQ(gaud_mp3_sfb_short[row][shorts], 192u)
+          << "the short row for " << header.sample_rate << " Hz ends at "
+          << gaud_mp3_sfb_short[row][shorts];
+      for (unsigned band = 0; band < longs; ++band) {
+        EXPECT_LT(gaud_mp3_sfb_long[row][band],
+            gaud_mp3_sfb_long[row][band + 1u])
+            << "long band " << band << " of row " << row << " is empty or "
+            << "runs backwards";
+      }
+      for (unsigned band = 0; band < shorts; ++band) {
+        EXPECT_LT(gaud_mp3_sfb_short[row][band],
+            gaud_mp3_sfb_short[row][band + 1u])
+            << "short band " << band << " of row " << row;
+      }
+    }
+  }
+}
+
+TEST(Mp3Bands, TheTwoRatesThatShareTheSixteenKilohertzRowReallyDo) {
+  /* **This is the premise gaud_mp3_band_row() rests on**, and it is
+   * asserted rather than assumed because it is a claim about a version no
+   * standard describes: MPEG-2.5 at 11.025 and 12 kHz uses the same
+   * scalefactor band tables as MPEG-2 at 16 kHz. The generator checks it
+   * against minimp3 when the tables are built; this checks that the
+   * mapping in the C actually lands on that row, which is a different
+   * statement and the one a decode depends on.
+   *
+   * If this ever fails, 11.025 and 12 kHz need a row of their own - not a
+   * different constant here. */
+  MP3_Header sixteen;
+  ASSERT_TRUE(gaud_mp3_header_parse(
+      Header(2u, L3, false, 5u, 2u, false, 0u).data(), &sixteen));
+  ASSERT_EQ(sixteen.sample_rate, 16000u);
+  unsigned reference = 99u;
+  ASSERT_TRUE(gaud_mp3_band_row(&sixteen, &reference));
+
+  for (unsigned rate = 0; rate < 2u; ++rate) {
+    MP3_Header header;
+    ASSERT_TRUE(gaud_mp3_header_parse(
+        Header(0u, L3, false, 5u, rate, false, 0u).data(), &header));
+    ASSERT_TRUE(header.sample_rate == 11025u || header.sample_rate == 12000u);
+    unsigned row = 99u;
+    ASSERT_TRUE(gaud_mp3_band_row(&header, &row));
+    EXPECT_EQ(row, reference)
+        << header.sample_rate << " Hz does not use the 16 kHz band row";
+  }
+
+  /* And 8 kHz does not, which is the whole reason it has a row at all.
+   * Without this the test above would pass on a mapping that sent every
+   * MPEG-2.5 rate to row 5. */
+  MP3_Header eight;
+  ASSERT_TRUE(gaud_mp3_header_parse(
+      Header(0u, L3, false, 5u, 2u, false, 0u).data(), &eight));
+  ASSERT_EQ(eight.sample_rate, 8000u);
+  unsigned row = 99u;
+  ASSERT_TRUE(gaud_mp3_band_row(&eight, &row));
+  EXPECT_NE(row, reference) << "8 kHz shares the 16 kHz band row, and its "
+                               "tables are not the same numbers";
+}
+
 TEST(Mp3Header, TwoFramesAgreeAboutTheStreamAndNotAboutTheBitrate) {
   MP3_Header first;
   MP3_Header second;
@@ -566,54 +652,69 @@ const struct Fixtures {
   uint64_t delay;
   uint64_t padding;
   uint64_t recording;
-  /** Whether this library decodes it. False only for MPEG-2.5 Layer III,
-   *  whose scalefactor band tables are in no standard. */
-  bool decodes;
   /** Whether it is silence by construction, so that the energy check
    *  below does not demand a signal from a file that has none. */
   bool silent;
 } fixtures[] = {
     {"mp3_lame_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 5760u,
-        1105u, 246u, 4409u, true, false},
+        1105u, 246u, 4409u, false},
     {"mp3_lame_mono_44100.mp3", 44100u, 1u, GAUD_CODING_MPEG_LAYER3, 4608u,
-        1105u, 502u, 3001u, true, false},
+        1105u, 502u, 3001u, false},
     {"mp3_lame_vbr_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 1105u, 246u, 4409u, true, false},
+        5760u, 1105u, 246u, 4409u, false},
     {"mp3_lame_truestereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 1105u, 246u, 4409u, true, false},
+        5760u, 1105u, 246u, 4409u, false},
     {"mp3_lame_transient_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        10368u, 1105u, 444u, 8819u, true, false},
+        10368u, 1105u, 444u, 8819u, false},
     {"mp3_lame_stereo_320_48000.mp3", 48000u, 2u, GAUD_CODING_MPEG_LAYER3,
-        6912u, 1105u, 1008u, 4799u, true, false},
+        6912u, 1105u, 1008u, 4799u, false},
     {"mp3_lame_silence_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u, true, true},
+        1105u, 348u, 2003u, true},
     {"mp3_lame_stereo_22050.mp3", 22050u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u, true, false},
+        1105u, 348u, 2003u, false},
     {"mp3_lame_mono_11025.mp3", 11025u, 1u, GAUD_CODING_MPEG_LAYER3, 2304u,
-        1105u, 178u, 1021u, false, false},
+        1105u, 178u, 1021u, false},
+    /* Broadband at an MPEG-2 rate, which the rest of the corpus has only
+     * at MPEG-1 rates; it is check_mpeg_input.py's low-rate calibration. */
+    {"mp3_lame_noise_22050.mp3", 22050u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
+        1105u, 348u, 2003u, false},
+    /* **MPEG-2.5, all three of its sampling frequencies.** 11.025 kHz is
+     * the file above; these are the other two. 12 kHz uses the same band
+     * tables as MPEG-2 at 16 kHz, which is what gaud_mp3_band_row() maps
+     * it onto; 8 kHz has a row of its own that is in neither standard.
+     * Both 8 kHz files, because LAME chose short blocks for the mono one
+     * and long for the stereo one - and the short-block region boundary
+     * is the one place where 8 kHz needed arithmetic of its own, so a
+     * corpus with only the stereo file would have passed with it wrong. */
+    {"mp3_lame_mpeg25_12000.mp3", 12000u, 2u, GAUD_CODING_MPEG_LAYER3, 2880u,
+        1105u, 574u, 1201u, false},
+    {"mp3_lame_mpeg25_mono_8000.mp3", 8000u, 1u, GAUD_CODING_MPEG_LAYER3,
+        2880u, 1105u, 174u, 1601u, false},
+    {"mp3_lame_mpeg25_stereo_8000.mp3", 8000u, 2u, GAUD_CODING_MPEG_LAYER3,
+        2880u, 1105u, 174u, 1601u, false},
     /* The second MP3 encoder, which writes a length tag whose delay and
      * padding are zero. The 529 frames of decoder delay are still real and
      * are still subtracted, and both references do the same: they decode
      * these to 4,079 and 1,775 frames rather than to 4,608 and 2,304. */
     {"mp3_shine_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 4608u,
-        529u, 0u, 4079u, true, false},
+        529u, 0u, 4079u, false},
     {"mp3_shine_mono_44100.mp3", 44100u, 1u, GAUD_CODING_MPEG_LAYER3, 2304u,
-        529u, 0u, 1775u, true, false},
+        529u, 0u, 1775u, false},
     /* Layer II, from both of its writers. Neither puts a length tag in
      * one, so the frames were counted and no trim is stated - and both
      * references decode all of them, which is the same answer. */
     {"mp2_twolame_stereo_44100.mp2", 44100u, 2u, GAUD_CODING_MPEG_LAYER2, 4608u,
-        0u, 0u, 4608u, true, false},
+        0u, 0u, 4608u, false},
     {"mp2_ff_mono_48000.mp2", 48000u, 1u, GAUD_CODING_MPEG_LAYER2, 3456u, 0u,
-        0u, 3456u, true, false},
+        0u, 3456u, false},
     {"mp2_ff_stereo_22050.mp2", 22050u, 2u, GAUD_CODING_MPEG_LAYER2, 2304u, 0u,
-        0u, 2304u, true, false},
+        0u, 2304u, false},
     /* No Xing frame at all: nothing states the length and nothing states
      * the delay. Both references also decode the whole 5,760 frames, so
      * "untrimmed" is not this library being unable to do what they do - it
      * is the file not saying. */
     {"mp3_lame_noxing_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3,
-        5760u, 0u, 0u, 5760u, true, false},
+        5760u, 0u, 0u, 5760u, false},
     /* An ID3v2 tag at the front and an ID3v1 trailer at the end, and **the
      * one fixture where the two references disagree**: libsndfile decodes
      * 2,003 frames and ffmpeg 2,351. 2,351 is 3,456 - 1,105, which is the
@@ -622,7 +723,7 @@ const struct Fixtures {
      * ffmpeg too, so the 128-byte trailer is what defeats its end trim,
      * and 2,003 is what the encoder was given. We agree with libsndfile. */
     {"mp3_tagged_stereo_44100.mp3", 44100u, 2u, GAUD_CODING_MPEG_LAYER3, 3456u,
-        1105u, 348u, 2003u, true, false},
+        1105u, 348u, 2003u, false},
 };
 
 TEST(Mp3Load, EveryFixtureIdentifiesAsTheStreamItIs) {
@@ -1136,13 +1237,15 @@ TEST(Mp3Decode, EveryFixtureDecodesTheFrameCountItStated) {
     ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
     GAUD_Track * track = loaded.track();
     GAUD_Decoder * decoder = nullptr;
-    GAUD_Result opened = gaud_decoder_create(track, &decoder);
-    if (!one.decodes) {
-      EXPECT_EQ(opened, GAUD_ERR_UNSUPPORTED) << one.name;
-      EXPECT_EQ(decoder, nullptr) << one.name;
-      continue;
-    }
-    ASSERT_EQ(opened, GAUD_OK) << one.name;
+    /* **Every fixture decodes.** There used to be a `decodes` flag here
+     * and one file that was false: MPEG-2.5 Layer III, refused because
+     * its band tables are in no standard. They are generated now, so the
+     * flag described nothing and the branch it guarded could not be
+     * taken - which is worse than no branch, because it reads as a
+     * tested refusal path and is not one. The refusals this library does
+     * make are asserted on constructed input instead, where the input
+     * can be made to have the property. */
+    ASSERT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK) << one.name;
     gaud_decoder_destroy(decoder);
 
     std::vector<int16_t> samples = DecodeAll(track);

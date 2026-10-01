@@ -107,13 +107,6 @@ EXCLUSIONS = {
         "15,020, which is the same one-bit agreement as everywhere else. "
         "libsndfile reads all four frames and agrees with us exactly, so "
         "this fixture is still scored."),
-    ("ffmpeg", "mp3_lame_mono_11025.mp3"): (
-        "MPEG-2.5, which this library identifies and does not decode: "
-        "its Layer III scalefactor band tables are in no standard, so "
-        "tools/tables/gen_mp3_tables.py has nothing to generate them "
-        "from. There is no decode of ours to compare."),
-    ("libsndfile", "mp3_lame_mono_11025.mp3"): (
-        "As above: there is no decode of ours to compare."),
 }
 
 

@@ -43,7 +43,7 @@
  */
 
 /* The sha256 of everything below this comment, as generated:
- * ef61ebd5dc95c4aac3207e004e3d438751d0cdde4d8af61ed7f1c40a21403240
+ * e0cdd2753120153b98e6ddeb5c9c0cda8de3ab26a27e804ddebe59e635f656cc
  * A regeneration that prints a different one changed a table. */
 #include "mp3_tables.h"
 
@@ -304,11 +304,20 @@ const uint16_t gaud_mp3_quad_offset[2] = {
  * 32 kHz; rows 3 to 5 are MPEG-2 at 22.05, 24 and 16 kHz, in the order
  * the frame header's rate field numbers them.
  *
+ * **Row 6 is MPEG-2.5 at 8 kHz, and it is from neither document** - that
+ * version is an extension by the format's authors that neither one
+ * describes. It comes from minimp3, which is CC0, and the extraction is
+ * calibrated on the twelve rows above that two standards also define; see
+ * parse_minimp3_sfbands in the generator. **MPEG-2.5 at 11.025 and 12 kHz
+ * has no row of its own** because its tables are identical to the 16 kHz
+ * ones in row 5, which is asserted when this file is generated and is why
+ * gaud_mp3_band_row() maps those two rates onto that row.
+ *
  * **MPEG-2 has 22 long bands and 13 short ones where MPEG-1 has 21 and
  * 12**, which is why the band count is a table of its own rather than a
  * constant. 13818-3's own prose says 21 and 12 and its tables print 22
  * and 13; the tables are what a file is coded against. */
-const uint16_t gaud_mp3_sfb_long[6][24] = {
+const uint16_t gaud_mp3_sfb_long[7][24] = {
     {0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 
      196, 238, 288, 342, 418, 576, 0},
     {0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 
@@ -321,23 +330,26 @@ const uint16_t gaud_mp3_sfb_long[6][24] = {
      278, 332, 394, 464, 540, 576, 0},
     {0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 
      284, 336, 396, 464, 522, 576, 0},
+    {0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 
+     476, 566, 568, 570, 572, 574, 576, 0},
 };
 
-const uint8_t gaud_mp3_sfb_long_bands[6] = {
-    22, 22, 22, 22, 22, 22,
+const uint8_t gaud_mp3_sfb_long_bands[7] = {
+    22, 22, 22, 22, 22, 22, 22,
 };
 
-const uint16_t gaud_mp3_sfb_short[6][15] = {
+const uint16_t gaud_mp3_sfb_short[7][15] = {
     {0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192, 0},
     {0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192, 0},
     {0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192, 0},
     {0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192, 0},
     {0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192, 0},
     {0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192, 0},
+    {0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192, 0},
 };
 
-const uint8_t gaud_mp3_sfb_short_bands[6] = {
-    13, 13, 13, 13, 13, 13,
+const uint8_t gaud_mp3_sfb_short_bands[7] = {
+    13, 13, 13, 13, 13, 13, 13,
 };
 
 /* 11172-3 Table 3-B.6: added to the scalefactors when preflag is set. */

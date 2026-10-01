@@ -99,12 +99,12 @@ static GAUD_Result mp3_probe(const GAUD_Codec * codec, GAUD_Stream * stream,
 /**
  * The codec itself.
  *
- * `GAUD_CAP_DECODE` is declared for Layer III, which is what the name
- * `mp3` means to everyone. Layers I and II are identified and not yet
- * decoded, and so is MPEG-2.5 Layer III, whose scalefactor band tables
- * are in no standard; those tracks answer ::GAUD_ERR_UNSUPPORTED when
- * asked for a decoder, which is the per-track answer a capability bit
- * cannot give.
+ * `GAUD_CAP_DECODE` is declared, and for this codec it holds for
+ * everything the frame header can spell: all three layers, and MPEG-1,
+ * MPEG-2 and MPEG-2.5 alike. The one input that is identified and
+ * refused is the free format, which states no bitrate; that track
+ * answers ::GAUD_ERR_UNSUPPORTED when asked for a decoder, which is the
+ * per-track answer a capability bit cannot give.
  *
  * No encoder: phase 8 brings the perceptual ones, with the two-gate
  * harness their output needs.

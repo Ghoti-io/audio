@@ -35,10 +35,12 @@ An APE trailer is detected, excluded from the audio, and not interpreted.
 **Decoding, in integer arithmetic.** Layer III with every window type,
 both joint stereo modes, the bit reservoir and all 30 usable Huffman
 tables; Layer II with all five allocation tables and its intensity
-stereo; Layer I with every quantiser width. MPEG-1 and MPEG-2's lower
-sampling frequencies. The output is signed 16-bit, and **there is no
-floating point anywhere in the decoder** - which is what makes the next
-paragraph possible.
+stereo; Layer I with every quantiser width. **Every sampling frequency
+the format has**, which is to say MPEG-1's three, MPEG-2's three and
+MPEG-2.5's three - see below for where the last three's scalefactor band
+tables come from, since no standard contains them. The output is signed
+16-bit, and **there is no floating point anywhere in the decoder** -
+which is what makes the next paragraph possible.
 
 **The same bytes on every architecture.** `make check-golden`
 cross-compiles this library for s390x and powerpc64, decodes the whole
@@ -46,6 +48,44 @@ corpus under qemu, and compares hashes with this machine. That is a
 promise about this library rather than about a reference, and no
 comparison against a reference could establish it: both references are
 floating point and are entitled to differ from themselves between builds.
+
+## MPEG-2.5, and where a table with no standard comes from
+
+MPEG-2.5 halves MPEG-2's sampling frequencies again, to 8, 11.025 and
+12 kHz. **It is not in any standard**: neither ISO/IEC 11172-3 nor
+ISO/IEC 13818-3 defines that version, the frame header spells it with a
+field value 11172-3 marks reserved, and its Layer III scalefactor band
+tables appear in no document. Every other table in this library is
+extracted from one of those two texts by `tools/tables/gen_mp3_tables.py`,
+so these three sampling frequencies needed a different answer.
+
+**Two of the three needed no new data at all.** The band tables for
+11.025 and 12 kHz are not similar to MPEG-2's 16 kHz tables, they are the
+same numbers, so those two rates index the row this library already
+generates from 13818-3 and their support rests on that document. The
+generator asserts the equality when it builds the tables and a unit test
+asserts that the mapping in the C actually lands on that row, because the
+two are different claims and a decode depends on both.
+
+**Only 8 kHz is new**, one long row of 22 bands and one short row of 13.
+Those come from minimp3, whose CC0-1.0 dedication puts them in the public
+domain, and what makes taking them sound is not that implementation's
+reputation but the overlap: minimp3 carries all nine sampling
+frequencies, six of them are in the two standards, and **all twelve of
+those long and short rows are compared against what was extracted from
+the documents before any of the remaining rows is used.** Twelve of
+twelve are identical, including the padding band the generator computes
+rather than reads. A single disagreement fails the run and nothing from
+minimp3 is used.
+
+Two further readings were taken and both agree on all nine rates:
+ffmpeg's, which indexes its tables per rate where minimp3 collapses two
+of them, and **LAME's own encoder tables** - which is the one that
+settles it. For a format with no standard the correctness criterion is
+not conformance to a text but agreement with the encoders that write the
+files, and LAME is the encoder that wrote every MPEG-2.5 fixture in this
+corpus. An encoder and a decoder that disagree about the band map produce
+wrong audio, so the encoder's table is the authority there is.
 
 ## What it is scored against, and how closely
 
@@ -55,6 +95,19 @@ which is minimp3. Neither is the other's front end - unlike FLAC, where
 four of this library's references are libFLAC wearing different hats.
 **sox is not a reference here**: the build in the oracle image has no
 MPEG handler at all, which was measured rather than assumed.
+
+There is also a gate that consults **no other decoder at all**.
+`make check-mpeg-input` compares our decode against the signal the
+encoder was given, which is possible because the corpus is synthesised
+from closed-form expressions and so the input can be regenerated rather
+than stored. It exists for MPEG-2.5 specifically: both references carry
+byte-identical copies of the same band tables, so a differential against
+them is blind to one class of error - a table every implementation agrees
+on and that is wrong about the actual spectrum. Measured, every band the
+encoder kept is within **0.67 dB** of the input on the MPEG-2.5 fixtures
+and 0.13 dB on the MPEG-1 calibration; with the 8 kHz row deliberately
+replaced by the 16 kHz one the same measurement reads 5.2 to 6.1 dB, so
+the instrument separates the two.
 
 `make check-mpeg` scores every fixture against both, and the agreement is
 **one least significant bit of 16** - the difference is 88 to 106 dB
@@ -193,18 +246,32 @@ because this instrument named the arm they reach.
 
 ## Known gaps
 
-- **MPEG-2.5 Layer III is refused.** Its scalefactor band tables are in
-  no standard: the version is an extension by the format's authors that
-  neither ISO/IEC 11172-3 nor ISO/IEC 13818-3 defines, and this library's
-  tables are generated from those two documents and nothing else. Layers
-  I and II at 8, 11.025 and 12 kHz need no band table and do decode.
-  `gaud_decoder_create()` answers `GAUD_ERR_UNSUPPORTED` for the Layer
-  III case, by name rather than by guessing at the tables.
-- **Mixed blocks have never been exercised.** The code is there; no
-  encoder in existence emits one, and the two standards disagree about
-  where the long part of such a granule ends at the lower sampling
-  frequencies. The reading used is 36 lines, which is what both
-  documents' tables give for every MPEG-1 rate.
+Three entries left this list when MPEG-2.5 was implemented, and one of
+them is worth naming as a near miss: the short-block Huffman region
+boundary is "the first 36 lines" in the standard's prose, and that
+sentence is true for eight of the nine sampling frequencies. It is three
+short bands counted once per window, and MPEG-1's first three short bands
+are four lines each; at 8 kHz they are eight lines each and the region is
+72. Written as the band count it always was, it would have been right
+everywhere. Written as 36 it was wrong at one rate, and the shape of the
+failure is the argument for the corpus having both an 8 kHz mono file and
+an 8 kHz stereo one: LAME chose short blocks for the mono file only, so
+stereo at 8 kHz agreed with both references to one bit while mono was
+2.1 dB out.
+
+- **Mixed blocks have never been exercised**, and at 8 kHz the two
+  reference decoders disagree about them. The code is there; no encoder
+  in existence emits one. For the MPEG-1 and MPEG-2 rates the reading
+  used is 36 lines of long block, and minimp3's own mixed-block table
+  agrees with that at all six - 8 bands of 4 or 6 at MPEG-1 rates, 6
+  bands of 6 at the MPEG-2 ones, 36 lines either way - which retires the
+  part of this gap that was about the standards disagreeing. At 8 kHz
+  minimp3's table gives 3 bands of 12, again 36 lines, while ffmpeg
+  handles "the 72 first exponents as long blocks" and refuses the case
+  outright with a request-sample diagnostic. Nothing can write the input
+  that would settle it, so neither reading is implemented in preference:
+  8 kHz mixed blocks take the same 36 lines as everything else and the
+  disagreement is recorded here.
 - **No encoder.** Phase 8, with the two-gate harness perceptual output
   needs.
 - **The free format**, which states no bitrate, so a frame's length is

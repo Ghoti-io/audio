@@ -361,9 +361,9 @@ void gaud_mp3_close(const GAUD_Codec * codec, GAUD_Doc * doc);
 /**
  * @brief ::GAUD_Codec::decoder_open: a pull decoder over this track.
  *
- * @return ::GAUD_ERR_UNSUPPORTED for a Layer I or II track, which this
- *   library identifies and does not yet decode, and for MPEG-2.5 Layer
- *   III, whose scalefactor band tables are in no standard.
+ * @return ::GAUD_ERR_UNSUPPORTED for a free-format track, whose frames
+ *   state no bitrate; every layer and every version the header can spell
+ *   decodes.
  */
 GAUD_Result gaud_mp3_decoder_open(
     const GAUD_Codec * codec, GAUD_Track * track, GAUD_Decoder ** out);
@@ -594,8 +594,11 @@ GAUD_Result gaud_mp3_layer3_frame(MP3_Layer3 * state, const MP3_Header * header,
  * @brief Which row of the scalefactor band tables this stream uses.
  *
  * Rows 0 to 2 are MPEG-1 and rows 3 to 5 are MPEG-2, by the header's rate
- * index. @return false for MPEG-2.5, whose band tables are in no
- * standard; see the refusal in gaud_mp3_decoder_open().
+ * index. MPEG-2.5 at 8 kHz is row 6; at 11.025 and 12 kHz it shares row 5
+ * with MPEG-2 at 16 kHz, whose tables are the same numbers.
+ *
+ * @return false only for a version with no rows at all, which no header
+ * that parsed can carry.
  */
 bool gaud_mp3_band_row(const MP3_Header * header, unsigned * out_row);
 

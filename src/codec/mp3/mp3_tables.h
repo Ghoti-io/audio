@@ -83,13 +83,13 @@ extern const int16_t gaud_mp3_quad_nodes[60];
 extern const uint16_t gaud_mp3_quad_offset[2];
 
 /** Long-block scalefactor band boundaries, by version and rate. */
-extern const uint16_t gaud_mp3_sfb_long[6][24];
+extern const uint16_t gaud_mp3_sfb_long[7][24];
 /** How many long bands each row of ::gaud_mp3_sfb_long has. */
-extern const uint8_t gaud_mp3_sfb_long_bands[6];
+extern const uint8_t gaud_mp3_sfb_long_bands[7];
 /** Short-block band boundaries, within one of the three windows. */
-extern const uint16_t gaud_mp3_sfb_short[6][15];
+extern const uint16_t gaud_mp3_sfb_short[7][15];
 /** How many short bands each row of ::gaud_mp3_sfb_short has. */
-extern const uint8_t gaud_mp3_sfb_short_bands[6];
+extern const uint8_t gaud_mp3_sfb_short_bands[7];
 /** Added to the scalefactors when preflag is set, Table 3-B.6. */
 extern const uint8_t gaud_mp3_pretab[22];
 /** MPEG-2's scalefactor partition sizes, by group and block shape. */

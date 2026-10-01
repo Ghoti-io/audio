@@ -763,6 +763,15 @@ check-mpeg: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_mpeg.py
 
+# The only decode gate here that consults no other decoder. MPEG-2.5's
+# band tables are in no standard and both references carry the same copy
+# of them, so a differential against those two cannot see a table they
+# agree on and that is wrong. This one compares against the input signal.
+check-mpeg-input: ## Fail if our MPEG decode's spectrum departs from the encoder's input
+check-mpeg-input: $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
+		python3 $(ORACLE)/check_mpeg_input.py
+
 check-writer: ## Fail if a reference cannot read what our writer produced
 check-tags: ## Fail if a reference reads our tags differently than we do
 check-tags: $(TAG_PROBE)
@@ -897,6 +906,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: check-outoftree check-golden
 .PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
 .PHONY: oracle-build oracle-probe oracle-version check-tags
+.PHONY: check-mpeg check-mpeg-input mpeg-coverage
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands

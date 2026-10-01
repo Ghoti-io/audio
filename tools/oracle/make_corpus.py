@@ -403,6 +403,18 @@ SIGNALS = {
     # that forces a gate to be relaxed is a bad fixture, not a reason to
     # relax the gate.
     "noise": "0.98*(2*random(%(c)d)-1)",
+    # Broadband *and* different in each channel, which plain "noise" is
+    # not. **ffmpeg's random(x) ignores x as a seed** - it names the
+    # variable slot the state lives in, not the sequence - so
+    # `random(0)|random(1)` produces two identical channels, and a
+    # stereo noise fixture built from it has no side signal for a
+    # mid/side decoder to get wrong. Measured, not assumed: the two
+    # channels of that expression compare equal sample for sample.
+    # Modulating the shared noise with a channel-dependent envelope
+    # decorrelates them - side is 0.33 of mid here - while keeping the
+    # spectrum flat across all eight octaves to Nyquist.
+    "noisestereo":
+        "0.9*(2*random(%(c)d)-1)*(0.6+0.4*sin(2*PI*%(f)d*t))",
     # Quantised to 256, so every sample has eight low zero bits. The
     # rounding has to happen in the signal rather than afterwards, because
     # ffmpeg's own sample conversion would reintroduce the low bits.
@@ -579,6 +591,38 @@ MP3_CASES = [
      ["-b:a", "64k"]),
     ("mp3_lame_mono_11025", "libmp3lame", 1, 11025, 1021, "tone",
      ["-b:a", "32k"]),
+    # Broadband at an MPEG-2 rate, which the corpus otherwise has only at
+    # MPEG-1 rates. It is the calibration for check_mpeg_input.py: that
+    # gate's verdict on the MPEG-2.5 band tables means nothing unless the
+    # same measurement passes on a decode whose tables came out of a
+    # standard, and this is a low sampling frequency one.
+    # 128 kbit/s at 22.05 kHz, which is a generous rate for that
+    # bandwidth: a calibration fixture wants the encoder transparent, so
+    # that what this gate measures is the band map and not the quantiser.
+    # At 64k the same fixture sat 2.5 dB from the input against a 3 dB
+    # threshold, which is a false failure waiting for a LAME upgrade.
+    ("mp3_lame_noise_22050", "libmp3lame", 2, 22050, 2003, "noisestereo",
+     ["-b:a", "128k"]),
+    # **The three MPEG-2.5 rates, and these three files are what the band
+    # tables for a version no standard describes rest on.** 11.025 and 12
+    # kHz use the 16 kHz tables and 8 kHz has a row of its own, taken from
+    # minimp3; so 12 kHz scores the row mapping and 8 kHz scores the only
+    # table in this library that came from an implementation rather than a
+    # document.
+    #
+    # **Noise and not a tone, deliberately.** The scalefactor band defect
+    # phase 5 found was invisible in every tone fixture and 8.6 dB wide in
+    # the two broadband ones, because a tone occupies a handful of bands
+    # and a wrong band table is a wrong *envelope*. A tone at 8 kHz would
+    # score these tables at perhaps three of their 22 bands.
+    ("mp3_lame_mpeg25_12000", "libmp3lame", 2, 12000, 1201, "noise",
+     ["-b:a", "48k"]),
+    ("mp3_lame_mpeg25_mono_8000", "libmp3lame", 1, 8000, 1601, "noise",
+     ["-b:a", "32k"]),
+    # Stereo at 8 kHz as well, so the new row is read through the joint
+    # stereo path and not only the single-channel one.
+    ("mp3_lame_mpeg25_stereo_8000", "libmp3lame", 2, 8000, 1601,
+     "noisestereo", ["-b:a", "64k"]),
     # The second MP3 encoder.
     ("mp3_shine_stereo_44100", "libshine", 2, 44100, 4409, "tone",
      ["-b:a", "128k"]),

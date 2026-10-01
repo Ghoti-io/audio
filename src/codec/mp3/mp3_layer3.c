@@ -149,6 +149,21 @@ bool gaud_mp3_band_row(const MP3_Header * header, unsigned * out_row) {
     *out_row = 3u + header->rate_index;
     return true;
   }
+  /* MPEG-2.5, whose rate field numbers 11.025, 12 and 8 kHz in that
+   * order. **Only 8 kHz has a row of its own.** The band tables for
+   * 11.025 and 12 kHz are not merely similar to the 16 kHz ones - they
+   * are the same numbers, which is checked where the tables are
+   * generated rather than believed here, so those two rates index row 5
+   * and this library's MPEG-2.5 support at them rests on 13818-3 and not
+   * on anybody's implementation.
+   *
+   * 8 kHz is the one row no standard contains; see the provenance note
+   * above ::gaud_mp3_sfb_long. */
+  static const unsigned mpeg25[3] = {5u, 5u, 6u};
+  if (header->version == MP3_MPEG25 && header->rate_index < 3u) {
+    *out_row = mpeg25[header->rate_index];
+    return true;
+  }
   return false;
 }
 
@@ -507,12 +522,25 @@ static unsigned decode_spectrum(MP3_Bits * bits, const MP3_Granule * granule,
   unsigned bands = gaud_mp3_sfb_long_bands[row];
   unsigned region[3];
   if (granule->window_switching) {
-    /* The standard states these rather than transmitting them. For three
-     * short windows the first region is the first 36 lines, which is the
-     * first three short bands counted once per window; otherwise it is
-     * the first eight long bands. */
+    /* The standard states these rather than transmitting them: the first
+     * region is the first three short bands counted once per window, or
+     * the first eight long bands when the window is switched but not
+     * short. Both are expressed here as a *band count* into the table
+     * for this stream, which is the whole point.
+     *
+     * **A literal 36 here is right for eight of the nine sampling
+     * frequencies and wrong for 8 kHz.** The standard's own prose says
+     * "36" because MPEG-1's first three short bands are four lines each;
+     * at 8 kHz they are eight lines each and the region is 72. Writing
+     * it as a line count made it a constant that quietly stopped being
+     * true, and the way it failed is worth recording: 8 kHz *stereo*
+     * agreed with both references to one bit while 8 kHz *mono* was
+     * 2.1 dB out, because the encoder only chose short blocks for the
+     * mono file. The same arithmetic applies to the eight-long-band
+     * case, where boundaries[8] is 36, 54 or 108 by rate and has always
+     * been a lookup. */
     region[0] = granule->block_type == 2u && !granule->mixed_block
-        ? 36u
+        ? 3u * (unsigned)gaud_mp3_sfb_short[row][3]
         : boundaries[8];
     region[1] = 576u;
   }
