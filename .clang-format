@@ -9,11 +9,38 @@ DerivePointerAlignment: false
 PointerAlignment: Middle
 AllowShortFunctionsOnASingleLine: None
 ColumnLimit: 80
-SortIncludes: true
 SpacesBeforeTrailingComments: 1
 ReflowComments: true
 MaxEmptyLinesToKeep: 2
 AlignOperands: false
+
+# The three below were added 2026-09-30 after measuring this file against the
+# code it claims to describe. No build target runs clang-format, so nothing
+# had ever reported that the config and the house style disagreed on 1,965
+# lines of 19,935. Each setting below closes a disagreement the code is
+# CONSISTENT about. The 1,206 lines that still differ are mostly places the
+# code wraps earlier than the column limit to group arguments by meaning, and
+# it does that both ways - 206 sites break straight after the open paren and
+# 333 fill the first line - so no single setting can agree with both, and this
+# file is guidance for an editor rather than something to gate on.
+
+# A continuation breaks BEFORE the operator, not after it:
+#     GAUD_Result result
+#         = gaud_meta_create(allocator, &meta);
+# LLVM's default puts the `=` on the first line. This one setting accounts for
+# 562 of the 759 lines these three settings close.
+BreakBeforeBinaryOperators: All
+
+# A switch over an enum of one-line answers reads as a table:
+#     case WAV_FORMAT_MULAW: return GAUD_CODING_G711_ULAW;
+# LLVM's default splits every one of these in two.
+AllowShortCaseLabelsOnASingleLine: true
+
+# Include order is the author's. In C it can decide whether a file compiles,
+# and a formatter that silently permutes it is doing something no formatter
+# should do on its own. Three files disagreed; none of the three was wrong.
+SortIncludes: false
+
 BraceWrapping:
   AfterClass:      false
   AfterControlStatement: false
