@@ -33,10 +33,13 @@ So the measure is per-band energy against the input's, in bands wide
 enough that a perceptual encoder's own decisions do not move them:
 
   - **below the encoder's cutoff, every band must track the input.** The
-    measured agreement is within 0.7 dB on every MPEG-2.5 fixture and
-    0.13 dB on the MPEG-1 one, which is far tighter than a lossy codec
-    has to be and is a statement about the band map rather than about the
-    quantiser.
+    measured worst case is 1.96 dB, at 12 kHz and 48 kbit/s where the
+    encoder is working hardest; the 8 kHz fixtures are within 0.71 dB and
+    the 48 kHz calibration within 0.65. The threshold is 3 dB, and the
+    separation that matters is the other side of it: with the 8 kHz band
+    row deliberately replaced by the 16 kHz one, the same measurement
+    reads 5.24 and 6.33 dB. So 3 dB sits about a decibel above the worst
+    correct answer and two below the wrong one.
   - **the overall level** must match, which is what the phase 5 band-table
     defect moved: 8.6 dB, on exactly this kind of signal.
   - **the spectral centroid** must land near the input's. This is the one
@@ -76,6 +79,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import make_corpus  # noqa: E402
 import oracle_env as oracle  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -91,7 +95,8 @@ OUT = os.path.join(ROOT, "tests", "out")
 BANDS = 16
 
 #: Below the cutoff: the most a band may differ from the input's, in dB.
-#: Measured worst case is 0.67 dB over every fixture here.
+#: Measured worst case is 1.96 over every fixture here and 5.24 with a
+#: wrong band table; see the separation argument in the file comment.
 MAX_BAND_DB = 3.0
 
 #: How far below the robust in-band level a band must fall to count as
@@ -113,14 +118,13 @@ MAX_LEVEL_DB = 3.0
 #: Measured worst case is 0.152; a wrong band map moves it much further.
 MAX_CENTROID = 0.30
 
-#: The signal table, which has to agree with make_corpus.py's. Repeated
-#: rather than imported because make_corpus.py writes into tests/data on
-#: import-time constants and this gate must never regenerate a fixture.
-SIGNALS = {
-    "noise": "0.98*(2*random(%(c)d)-1)",
-    "noisestereo": "0.9*(2*random(%(c)d)-1)*(0.6+0.4*sin(2*PI*%(f)d*t))",
-    "tone": "0.6*sin(2*PI*%(f)d*t)+0.25*sin(2*PI*%(g)d*t)",
-}
+#: The signal table, **imported and not copied.** An earlier version of
+#: this file repeated it, with a comment claiming make_corpus.py could not
+#: be imported safely. That was wrong - nothing runs at its module level
+#: but a `sys.path.insert` - and the copy was a second place for the same
+#: definition to live, which is how a gate comes to regenerate a signal
+#: that no longer matches the fixture it is scoring.
+SIGNALS = make_corpus.SIGNALS
 
 #: name, channels, rate, frames, signal. The three MPEG-2.5 fixtures,
 #: because they are the ones whose band tables came from an
@@ -133,10 +137,10 @@ CASES = [
     # band table came from an implementation rather than a document.
     ("mp3_lame_mpeg25_mono_8000.mp3", 1, 8000, 1601, "noise", False),
     ("mp3_lame_mpeg25_stereo_8000.mp3", 2, 8000, 1601, "noisestereo", False),
-    ("mp3_lame_mpeg25_12000.mp3", 2, 12000, 1201, "noise", False),
+    ("mp3_lame_mpeg25_12000.mp3", 2, 12000, 1201, "noisestereo", False),
     # The calibration: MPEG-1 and MPEG-2, whose tables come from the two
     # standards, measured the same way by the same code.
-    ("mp3_lame_stereo_320_48000.mp3", 2, 48000, 4799, "noise", True),
+    ("mp3_lame_stereo_320_48000.mp3", 2, 48000, 4799, "noisestereo", True),
     ("mp3_lame_noise_22050.mp3", 2, 22050, 2003, "noisestereo", True),
 ]
 

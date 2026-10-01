@@ -40,7 +40,9 @@ What is varied, and why each axis is here rather than being one more file:
               significand rather than the exponent.
 """
 
+import math
 import os
+import struct
 import subprocess
 import sys
 
@@ -403,18 +405,34 @@ SIGNALS = {
     # that forces a gate to be relaxed is a bad fixture, not a reason to
     # relax the gate.
     "noise": "0.98*(2*random(%(c)d)-1)",
-    # Broadband *and* different in each channel, which plain "noise" is
-    # not. **ffmpeg's random(x) ignores x as a seed** - it names the
-    # variable slot the state lives in, not the sequence - so
-    # `random(0)|random(1)` produces two identical channels, and a
-    # stereo noise fixture built from it has no side signal for a
-    # mid/side decoder to get wrong. Measured, not assumed: the two
-    # channels of that expression compare equal sample for sample.
-    # Modulating the shared noise with a channel-dependent envelope
-    # decorrelates them - side is 0.33 of mid here - while keeping the
-    # spectrum flat across all eight octaves to Nyquist.
+    # **Every stereo fixture that wants broadband content uses this and
+    # not "noise" above.** ffmpeg's `random(x)` ignores x as a seed - it
+    # names the variable slot the state lives in, not the sequence - so
+    # `random(0)|random(1)` produces two *identical* channels, measured
+    # equal sample for sample. A stereo noise fixture built that way has
+    # no side signal at all, which defeats the reason ffmpeg_make() gives
+    # for making channels differ and leaves a mid/side decoder nothing to
+    # get wrong.
+    #
+    # The shared noise is modulated by an envelope whose phase depends on
+    # the channel, so channel 1 is quiet where channel 0 is loud. The
+    # `+PI*%(c)d` is the whole of it. Two properties that a plainer fix
+    # does not have:
+    #
+    #   - **the two channels have the same amplitude distribution**, being
+    #     one envelope half a period apart, so neither is systematically
+    #     quieter and no test can come to depend on which is which;
+    #   - **the peak stays at full scale** - 32,047 of 32,767 against
+    #     flat noise's 32,110 - because the envelope reaches 1.0 rather
+    #     than scaling the whole signal down.
+    #
+    # Chosen by measurement over three candidates. side/mid is 0.47 here
+    # against 0.32 for `0.9*noise*(0.6+0.4*sin)` and 0.21 for noise plus
+    # a channel-distinct tone, and all three keep 4 of the 7 frames of
+    # the 320 kbit/s fixture using the bit reservoir, which is what that
+    # fixture is for.
     "noisestereo":
-        "0.9*(2*random(%(c)d)-1)*(0.6+0.4*sin(2*PI*%(f)d*t))",
+        "0.98*(2*random(%(c)d)-1)*(0.6+0.4*sin(2*PI*220*t+PI*%(c)d))",
     # Quantised to 256, so every sample has eight low zero bits. The
     # rounding has to happen in the signal rather than afterwards, because
     # ffmpeg's own sample conversion would reintroduce the low bits.
@@ -438,7 +456,32 @@ SIGNALS = {
     # The `^` is exponentiation in ffmpeg's expression language; `pow`
     # would need a comma, and the filtergraph splits on commas before the
     # expression parser sees them.
-    "transient": "0.9*(2*random(%(c)d)-1)*((t*8-floor(t*8))^16)",
+    # The envelope's phase depends on the channel for the reason
+    # "noisestereo" above gives at length: with `random(x)` ignoring x and
+    # one envelope shared, both channels came out identical, and this is
+    # the only fixture in the corpus with short blocks - so every
+    # short-block arm of the decoder was being exercised with a side
+    # channel of exactly zero.
+    #
+    # **0.08 of a period, and the small number is the point.** The offset
+    # trades two things off and both were measured, at 192 kbit/s over
+    # this fixture's own length:
+    #
+    #   offset  side/mid   frames with mid/side on, of 9
+    #   0       0.0000     9      <- what this was: M/S everywhere, and
+    #                                nothing in the side channel to code
+    #   0.08    0.7801     3
+    #   0.15    0.9332     2
+    #   0.5     1.0000     0      <- fully decorrelated, so LAME stops
+    #                                choosing mid/side at all
+    #
+    # A large offset decorrelates the channels so thoroughly that the
+    # encoder abandons mid/side, which would *lose* the coverage this
+    # fixture has. 0.08 keeps both: a real side signal, and three frames
+    # of mid/side against six without - which also exercises the
+    # per-frame switch that no other fixture changes.
+    "transient": "0.9*(2*random(%(c)d)-1)"
+                 "*((t*8+0.08*%(c)d-floor(t*8+0.08*%(c)d))^16)",
     "rich": "0.15*(sin(2*PI*110*t)+sin(2*PI*113*t)+sin(2*PI*220*t)"
             "+sin(2*PI*227*t)+sin(2*PI*331*t)+sin(2*PI*337*t)"
             "+sin(2*PI*447*t))",
@@ -580,8 +623,8 @@ MP3_CASES = [
     ("mp3_lame_transient_44100", "libmp3lame", 2, 44100, 8819, "transient",
      ["-b:a", "192k"]),
     # The largest frames the format allows, and the fullest reservoir.
-    ("mp3_lame_stereo_320_48000", "libmp3lame", 2, 48000, 4799, "noise",
-     ["-b:a", "320k"]),
+    ("mp3_lame_stereo_320_48000", "libmp3lame", 2, 48000, 4799,
+     "noisestereo", ["-b:a", "320k"]),
     # Silence: every scalefactor band empty, so the count1 region covers
     # the whole spectrum and the big-values region is nothing at all.
     ("mp3_lame_silence_44100", "libmp3lame", 2, 44100, 2003, "silence",
@@ -615,7 +658,7 @@ MP3_CASES = [
     # the two broadband ones, because a tone occupies a handful of bands
     # and a wrong band table is a wrong *envelope*. A tone at 8 kHz would
     # score these tables at perhaps three of their 22 bands.
-    ("mp3_lame_mpeg25_12000", "libmp3lame", 2, 12000, 1201, "noise",
+    ("mp3_lame_mpeg25_12000", "libmp3lame", 2, 12000, 1201, "noisestereo",
      ["-b:a", "48k"]),
     ("mp3_lame_mpeg25_mono_8000", "libmp3lame", 1, 8000, 1601, "noise",
      ["-b:a", "32k"]),
@@ -637,7 +680,7 @@ MP2_CASES = [
     ("mp2_twolame_stereo_44100", "libtwolame", 2, 44100, 4409, "tone",
      ["-b:a", "192k"]),
     ("mp2_ff_mono_48000", "mp2", 1, 48000, 2399, "tone", ["-b:a", "128k"]),
-    ("mp2_ff_stereo_22050", "mp2", 2, 22050, 2003, "noise",
+    ("mp2_ff_stereo_22050", "mp2", 2, 22050, 2003, "noisestereo",
      ["-b:a", "96k"]),
     # The three below were added after `make mpeg-coverage` named arms
     # nothing reached, which is the instrument doing its job:
@@ -823,10 +866,122 @@ def layer1_make(path):
         handle.write(bytes(out))
 
 
+#: The least side energy, relative to mid, that a signal used by a
+#: multi-channel fixture must produce. A tenth is far below what any of
+#: them measures and far above the zero an undifferentiated one gives.
+MIN_SIDE_RATIO = 0.10
+
+#: How much of each signal to generate for the check: one second at
+#: 48 kHz. See check_signals() for why it is not shorter.
+CHECK_FRAMES = 48000
+
+#: Signals that are allowed less side energy than that, and why. **Named
+#: with reasons and as narrow as they can be**: `silence` is exempt from
+#: both halves of the check because two silent channels are equal by
+#: definition, while `sideright` is exempt only from the floor - it must
+#: still have *some* side signal, and a version of it with none would be
+#: caught.
+SIDE_EXEMPT = {
+    "silence": "two silent channels are identical by definition, and a "
+               "fixture of silence is what the empty-band paths need",
+    "sideright": "a deliberately tiny side channel is the whole point: it "
+                 "is what makes a FLAC encoder choose side/right "
+                 "decorrelation, which no other fixture reaches. It must "
+                 "still be nonzero, and that half of the check applies",
+}
+
+
+def multichannel_signals():
+    """Every signal name a case with two or more channels uses.
+
+    Read off the tables rather than listed, because a list would be a
+    second place to update and would silently stop covering a case that
+    moved. The channel count sits in a different position in each table,
+    so each is unpacked with its own shape.
+    """
+    used = set()
+    for name, codec, bits, channels, rate, frames, signal, flags in FLAC_CASES:
+        if channels > 1:
+            used.add(signal)
+    for name, writer, bits, channels, rate, frames, signal in FLAC_OGG_CASES:
+        if channels > 1:
+            used.add(signal)
+    for table in (MP3_CASES, MP2_CASES):
+        for name, writer, channels, rate, frames, signal, flags in table:
+            if channels > 1:
+                used.add(signal)
+    return used
+
+
+def check_signals():
+    """Assert that what a signal varies per channel actually varies.
+
+    **This exists because the obvious check does not work.** The defect it
+    guards against was `"noise": "0.98*(2*random(%(c)d)-1)"` formatted once
+    per channel: the two expressions differ as *text*, so comparing the
+    formatted strings passes, and ffmpeg's `random(x)` ignores x as a seed
+    - it names the variable slot its state lives in - so the two channels
+    came out equal sample for sample. Every stereo noise fixture in the
+    corpus had no side signal, for as long as those fixtures existed.
+
+    Nor can it be checked on the *fixtures*: a lossy encoder makes the two
+    channels of its output differ by its own coding noise whatever went
+    in, and mp2_ff_stereo_22050 measured a side/mid of 0.022 while its
+    source was two identical channels. The check has to be on the signal,
+    before an encoder touches it.
+
+    So each signal a multi-channel case uses is generated as two channels
+    and the side energy is measured. It is a property of the table, so a
+    signal added later is covered without anyone remembering this.
+
+    **A full second, and the length is not arbitrary.** The first version
+    of this check used 512 frames, which is 10 ms, and reported the
+    transient as having identical channels - because its envelope repeats
+    eight times a second, so 10 ms is a window in which both channels are
+    silent and therefore equal. A probe whose window is shorter than the
+    period of what it measures reports whatever the window contains. One
+    second covers eight periods of the slowest modulation in the table;
+    anything slower added later needs this raised with it.
+    """
+    failures = []
+    print("  signals used by a multi-channel fixture:")
+    for signal in sorted(multichannel_signals()):
+        path = os.path.join(DATA, ".signal-check.raw")
+        raw_signal(path, signal, 16, 2, 48000, CHECK_FRAMES)
+        with open(path, "rb") as handle:
+            data = handle.read()
+        os.remove(path)
+        values = struct.unpack("<%dh" % (len(data) // 2), data)
+        left = values[0::2]
+        right = values[1::2]
+        mid = [(a + b) / 2.0 for a, b in zip(left, right)]
+        side = [(a - b) / 2.0 for a, b in zip(left, right)]
+        power = lambda v: math.sqrt(sum(x * x for x in v) / len(v)) if v else 0.0
+        ratio = power(side) / power(mid) if power(mid) else 0.0
+        note = ""
+        exempt = signal in SIDE_EXEMPT
+        if left == right and signal != "silence":
+            note = "  IDENTICAL CHANNELS"
+            failures.append("%s produces two identical channels, so every "
+                            "multi-channel fixture using it has no side "
+                            "signal" % signal)
+        elif not exempt and ratio < MIN_SIDE_RATIO:
+            note = "  TOO LITTLE SIDE"
+            failures.append("%s gives a side/mid of %.4f and the floor is "
+                            "%.2f" % (signal, ratio, MIN_SIDE_RATIO))
+        elif exempt:
+            note = "  exempt: %s" % SIDE_EXEMPT[signal][:46]
+        print("    %-14s side/mid %.4f%s" % (signal, ratio, note))
+    if failures:
+        raise SystemExit("make_corpus: %s"
+                         % "\n            ".join(failures))
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
     print(oracle.provenance(
         ["ffmpeg", "sox", "libsndfile", "pywave", "flac"]))
+    check_signals()
 
     made = []
     for name, container, codec, channels, rate, frames in CASES:

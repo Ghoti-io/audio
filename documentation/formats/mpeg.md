@@ -114,10 +114,12 @@ than stored. It exists for MPEG-2.5 specifically: both references carry
 byte-identical copies of the same band tables, so a differential against
 them is blind to one class of error - a table every implementation agrees
 on and that is wrong about the actual spectrum. Measured, every band the
-encoder kept is within **0.67 dB** of the input on the MPEG-2.5 fixtures
-and 0.13 dB on the MPEG-1 calibration; with the 8 kHz row deliberately
-replaced by the 16 kHz one the same measurement reads 5.2 to 6.1 dB, so
-the instrument separates the two.
+encoder kept is within **1.96 dB** of the input across every fixture -
+0.71 dB at 8 kHz, 0.65 dB on the MPEG-1 calibration, and 1.96 dB at
+12 kHz where the encoder has the least room. With the 8 kHz row
+deliberately replaced by the 16 kHz one the same measurement reads 5.24
+and 6.33 dB, so the 3 dB threshold sits about a decibel above the worst
+correct answer and two below the wrong one.
 
 `make check-mpeg` scores every fixture against both, and the agreement is
 **one least significant bit of 16** - the difference is 88 to 106 dB
@@ -246,13 +248,24 @@ says nothing about how much of the decoder ran to produce it - which is
 the lesson phase 4 learned when a third of the FLAC decoder turned out
 never to have executed while every reference agreed byte for byte.
 
-As of this writing it reaches 57 of 72 arms. Two of the fifteen it does
-not are unreachable by construction (the standard marks Huffman tables 4
-and 14 unused and this library refuses a frame that selects one); five
-need an encoder nothing in the image has, including intensity stereo,
-which LAME has never implemented; and five are Huffman tables that two
-encoders between them simply never chose. Three fixtures were added
-because this instrument named the arm they reach.
+As of this writing it reaches 63 of 72 arms, and **nothing reachable is
+unreached.** Of the nine it does not: two are unreachable by construction
+(the standard marks Huffman tables 4 and 14 unused and this library
+refuses a frame that selects one); five need an encoder nothing in the
+image is, including intensity stereo, which LAME has never implemented,
+and the mixed block, which nothing emits; and two - a granule with no
+reservoir, and a sample that saturated - are reached by unit tests on
+hand-built frames instead, which is the right answer, since nothing in
+the corpus is that loud and every fixture's first frame is grounded.
+
+Three fixtures were added because this instrument named the arm they
+reach. **The last five Huffman tables fell to something else entirely**:
+giving the stereo noise and transient fixtures channels that actually
+differ. They had been listed for two phases as "reachable, and LAME
+simply never chose them", and the reason it never chose them was that
+those fixtures' two channels were bit-identical, so every region of
+every granule saw the same maximum value. The fix was to the corpus's
+signal generator and not to any fixture written for the purpose.
 
 ## Known gaps
 
