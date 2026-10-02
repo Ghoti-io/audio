@@ -3433,6 +3433,255 @@ TEST(OpusBands, TheBudgetClampSitsAboveEverythingThatReadsIt) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Putting the energy back: sections 4.3.5 and 4.3.6.
+
+TEST(OpusOutput, AntiCollapseAndDenormalisationMatchTheReference) {
+  // One digest across all three stages in the order the decoder runs
+  // them, because anti-collapse rewrites the spectrum that
+  // denormalisation then reads - checking them apart would miss a stage
+  // that is right on its own inputs and wrong on the ones it gets.
+  uint64_t digest = 1469598103934665603ull;
+  unsigned long cases = 0;
+  for (int lm = 0; lm <= 3; ++lm) {
+    CELT_Mode mode;
+    ASSERT_TRUE(gaud_celt_mode_init(&mode, (unsigned)lm));
+    int blocks = 1 << lm;
+    int frame = (int)mode.size;
+    std::vector<int16_t> x((size_t)(2 * frame));
+    std::vector<int32_t> out((size_t)(2 * frame));
+    for (int channels = 1; channels <= 2; ++channels) {
+      for (int start = 0; start <= 17; start += 17) {
+        int step = 21 - start - 1 > 0 ? 21 - start - 1 : 1;
+        for (int end = start + 1; end <= 21; end += step) {
+          for (int rep = 0; rep < 24; ++rep) {
+            int16_t energy[42];
+            int16_t one_ago[42];
+            int16_t two_ago[42];
+            unsigned char collapse[42];
+            int32_t pulses[21];
+            int32_t amplitude[42];
+            unsigned state = (unsigned)(lm * 7919 + channels * 104729
+                + start * 31 + end * 17 + rep * 37);
+            for (int i = 0; i < 2 * frame; ++i) {
+              state = state * 1103515245u + 12345u;
+              x[(size_t)i] = (int16_t)(((int)(state >> 17) - 16384) / 4);
+            }
+            for (int i = 0; i < 42; ++i) {
+              state = state * 1103515245u + 12345u;
+              energy[i] = (int16_t)((int)((state >> 16) & 0x7FFF) - 16384);
+              state = state * 1103515245u + 12345u;
+              one_ago[i] = (int16_t)((int)((state >> 16) & 0x7FFF) - 16384);
+              state = state * 1103515245u + 12345u;
+              two_ago[i] = (int16_t)((int)((state >> 16) & 0x7FFF) - 16384);
+              state = state * 1103515245u + 12345u;
+              collapse[i] = (unsigned char)((state >> 18)
+                  & (unsigned)((1u << blocks) - 1u));
+            }
+            for (int i = 0; i < 21; ++i) {
+              state = state * 1103515245u + 12345u;
+              pulses[i] = (int32_t)((state >> 18) % 4096u);
+            }
+            gaud_celt_anti_collapse(&mode, x.data(), collapse,
+                (uint32_t)channels, (uint32_t)frame, (uint32_t)start,
+                (uint32_t)end, energy, one_ago, two_ago, pulses, 0xDEADBEEFu);
+            for (int i = 0; i < channels * frame; ++i) {
+              digest = Fnv1a(digest, x[(size_t)i]);
+            }
+            gaud_celt_log2_amp(amplitude, energy, (uint32_t)start,
+                (uint32_t)end, (uint32_t)channels);
+            for (int i = 0; i < 21 * channels; ++i) {
+              digest = Fnv1a(digest, amplitude[(size_t)i]);
+            }
+            gaud_celt_denormalise_bands(&mode, x.data(), out.data(), amplitude,
+                (uint32_t)end, (uint32_t)channels);
+            for (int i = 0; i < channels * frame; ++i) {
+              digest = Fnv1a(digest, out[(size_t)i]);
+            }
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 768u);
+  EXPECT_EQ(digest, 0x9A90B60CA133ED51ull);
+}
+
+TEST(OpusOutput, TheEnvelopeComesBackAsTheAmplitudeItNames) {
+  // The independent reading: the envelope is a base-two logarithm in
+  // Q10, relative to a per-band mean held in Q4 decibels, and this is
+  // supposed to be two to that power in Q(16-4). Checked against the
+  // real exponential rather than against the reference, which is what
+  // says the two tables are being combined the right way round.
+  int16_t energy[42];
+  int32_t amplitude[42];
+  double worst = 0.0;
+  unsigned long compared = 0;
+  for (int32_t level = -14 * 1024; level <= 8 * 1024; level += 97) {
+    for (int i = 0; i < 42; ++i) {
+      energy[i] = (int16_t)level;
+    }
+    gaud_celt_log2_amp(amplitude, energy, 0u, CELT_BANDS, 1u);
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      double exponent = (double)level / 1024.0
+          + (double)gaud_opus_e_means[band] / 16.0;
+      double want = std::pow(2.0, exponent) * 65536.0 / 16.0;
+      if (want < 16.0 || want > 1e9) {
+        continue;
+      }
+      // The error has two sources that do not pile up: the
+      // exponential's own 1.08e-4, and the half-unit of the final
+      // rounding shift. Measured, the worst case reaches 0.9979 of
+      // their sum - so the bound has to carry both terms, and a purely
+      // relative one would be 3% at the quiet end and say nothing.
+      EXPECT_LE(std::fabs((double)amplitude[band] - want),
+          0.5 + want * 1.08e-4)
+          << "level " << level << " band " << band;
+      if (want >= 1024.0) {
+        worst = std::max(worst, RelativeError((double)amplitude[band], want));
+      }
+      ++compared;
+    }
+  }
+  EXPECT_GT(compared, 3000u);
+  // Measured: 5.44e-4 once the result has room for it.
+  EXPECT_LT(worst, 5.5e-4);
+  // Outside [start,end) the array is cleared rather than left alone,
+  // which is what lets the caller reuse it between frames.
+  for (int i = 0; i < 42; ++i) {
+    energy[i] = 0;
+    amplitude[i] = 12345;
+  }
+  gaud_celt_log2_amp(amplitude, energy, 3u, 7u, 2u);
+  for (uint32_t channel = 0; channel < 2u; ++channel) {
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      if (band < 3u || band >= 7u) {
+        EXPECT_EQ(amplitude[channel * CELT_BANDS + band], 0)
+            << "channel " << channel << " band " << band;
+      } else {
+        EXPECT_GT(amplitude[channel * CELT_BANDS + band], 0);
+      }
+    }
+  }
+}
+
+TEST(OpusOutput, DenormalisationScalesAndThenStops) {
+  // A unit-norm bin times the band's amplitude, and nothing above the
+  // last coded band. The second half is what band-limits the output,
+  // and it is the easier of the two to get wrong by leaving the
+  // previous frame's tail in place.
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  std::vector<int16_t> x(mode.size, (int16_t)0);
+  std::vector<int32_t> out(mode.size, (int32_t)-1);
+  int32_t amplitude[42];
+  for (int i = 0; i < 42; ++i) {
+    amplitude[i] = 0;
+  }
+  // One band, one bin at full scale, so the result is readable.
+  const uint32_t kBand = 10;
+  uint32_t first = (uint32_t)mode.edges[kBand] << mode.lm;
+  x[first] = 16384;
+  amplitude[kBand] = 1 << 20;
+  gaud_celt_log2_amp(amplitude, nullptr, 0u, 0u, 0u);
+  amplitude[kBand] = 1 << 20;
+  gaud_celt_denormalise_bands(&mode, x.data(), out.data(), amplitude,
+      kBand + 1u, 1u);
+  // (x / 16384) * amplitude, to within the Q15 multiply's rounding.
+  EXPECT_NEAR((double)out[first], (double)amplitude[kBand], 64.0);
+  for (uint32_t bin = 0; bin < mode.size; ++bin) {
+    if (bin != first) {
+      EXPECT_EQ(out[bin], 0) << "bin " << bin;
+    }
+  }
+  // Everything above the last coded band is zero even when the shape
+  // array still holds something there.
+  std::fill(x.begin(), x.end(), (int16_t)16384);
+  std::fill(out.begin(), out.end(), (int32_t)-1);
+  for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+    amplitude[band] = 1 << 18;
+  }
+  gaud_celt_denormalise_bands(&mode, x.data(), out.data(), amplitude, 5u, 1u);
+  uint32_t coded_to = (uint32_t)mode.edges[5] << mode.lm;
+  for (uint32_t bin = coded_to; bin < mode.size; ++bin) {
+    ASSERT_EQ(out[bin], 0) << "bin " << bin;
+  }
+  EXPECT_GT(out[0], 0);
+}
+
+TEST(OpusOutput, AntiCollapseFillsOnlyTheBlocksTheMaskCallsEmpty) {
+  // The structural half, independent of the reference: a block whose
+  // mask bit is set must come through untouched, and one whose bit is
+  // clear must come back non-silent. Those two together are what the
+  // stage is for - and a version that refilled everything would pass a
+  // digest comparison against nothing at all.
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  int blocks = 8;
+  std::vector<int16_t> x(mode.size);
+  std::vector<int16_t> before(mode.size);
+  int16_t energy[42];
+  int16_t one_ago[42];
+  int16_t two_ago[42];
+  unsigned char collapse[42];
+  int32_t pulses[21];
+  unsigned long filled = 0;
+  unsigned long kept = 0;
+  for (int i = 0; i < 42; ++i) {
+    // A band that has just got much louder, which is where the noise
+    // is loudest and so where this is easiest to see.
+    energy[i] = 8192;
+    one_ago[i] = 0;
+    two_ago[i] = 0;
+  }
+  for (int i = 0; i < 21; ++i) {
+    pulses[i] = 64;
+  }
+  for (int pattern = 1; pattern < 255; pattern += 7) {
+    for (uint32_t i = 0; i < mode.size; ++i) {
+      x[i] = (int16_t)(1000 + (int)(i % 97));
+    }
+    before = x;
+    for (int i = 0; i < 42; ++i) {
+      collapse[i] = (unsigned char)pattern;
+    }
+    gaud_celt_anti_collapse(&mode, x.data(), collapse, 1u, mode.size, 0u,
+        CELT_BANDS, energy, one_ago, two_ago, pulses, 0x12345678u);
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      uint32_t width = (uint32_t)(mode.edges[band + 1] - mode.edges[band]);
+      uint32_t base = (uint32_t)mode.edges[band] << mode.lm;
+      bool any_clear = ((unsigned)pattern & ((1u << blocks) - 1u))
+          != ((1u << blocks) - 1u);
+      for (int block = 0; block < blocks; ++block) {
+        bool changed = false;
+        bool nonzero = false;
+        for (uint32_t j = 0; j < width; ++j) {
+          uint32_t at = base + (j << mode.lm) + (uint32_t)block;
+          changed = changed || x[at] != before[at];
+          nonzero = nonzero || x[at] != 0;
+        }
+        if (((unsigned)pattern >> block) & 1u) {
+          // Kept - but the whole band is renormalised if any of its
+          // other blocks was refilled, so "untouched" only holds when
+          // nothing in the band was.
+          if (!any_clear) {
+            EXPECT_FALSE(changed) << "band " << band << " block " << block;
+          }
+          ++kept;
+        } else {
+          EXPECT_TRUE(changed) << "band " << band << " block " << block;
+          EXPECT_TRUE(nonzero) << "band " << band << " block " << block;
+          ++filled;
+        }
+      }
+    }
+  }
+  EXPECT_GT(filled, 1000u);
+  EXPECT_GT(kept, 1000u);
+}
+
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -216,6 +216,13 @@ const unsigned char gaud_opus_e_prob_model[336] = {
     135, 49, 137, 39, 157, 32, 145, 29, 97, 33, 77, 40,
 };
 
+/** The mean energy per band, in Q4 decibels; 21 used of 25. */
+const int8_t gaud_opus_e_means[25] = {
+    103, 100, 92, 85, 81, 77, 72, 70, 78, 75, 73, 71,
+    78, 74, 69, 72, 70, 74, 76, 71, 60, 60, 60, 60,
+    60,
+};
+
 /** Coarse energy's time prediction, per frame size, Q15. */
 const int16_t gaud_opus_pred_coef[4] = {
     29440, 26112, 21248, 16384,

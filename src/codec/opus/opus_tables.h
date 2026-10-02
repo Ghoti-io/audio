@@ -86,6 +86,9 @@ extern const unsigned char gaud_opus_cache_caps50[168];
 /** Laplace parameters for coarse energy, 4 by 2 by 42. */
 extern const unsigned char gaud_opus_e_prob_model[336];
 
+/** The mean energy per band, in Q4 decibels; 21 used of 25. */
+extern const int8_t gaud_opus_e_means[25];
+
 /** Coarse energy's time prediction, per frame size, Q15. */
 extern const int16_t gaud_opus_pred_coef[4];
 

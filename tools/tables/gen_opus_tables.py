@@ -516,8 +516,12 @@ def extract(root, rfc_text):
              "unsigned char", 168),
             ("celt/quant_bands.c", "e_prob_model",
              "unsigned char", 4 * 2 * 42),
+            ("celt/quant_bands.c", "eMeans", "int8_t", 25),
     ):
         values = read_array(root, relative, name)
+        # The reference's one camel-case array name; everything else here
+        # is already in the shape this library spells its symbols.
+        name = "e_means" if name == "eMeans" else name
         if len(values) != expect:
             raise SystemExit(
                 f"gen_opus_tables: {name} has {len(values)} entries, not "
@@ -612,6 +616,7 @@ extern "C" {
         "beta_coef": "Coarse energy's frequency prediction, Q15.",
         "beta_intra": "The same, for a frame coded without history.",
         "log2_frac_table": "Cost of coding one of k+1 values, in eighths of a bit.",
+        "e_means": "The mean energy per band, in Q4 decibels; 21 used of 25.",
     }
     for name in tables:
         if name not in notes:

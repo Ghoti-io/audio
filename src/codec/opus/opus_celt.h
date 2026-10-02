@@ -610,6 +610,79 @@ void gaud_celt_quant_all_bands(OPUS_Range * range, const CELT_Mode * mode,
     int32_t total_bits, int32_t balance, uint32_t coded_bands, uint32_t * seed,
     int16_t * scratch);
 
+/**
+ * @brief Refill the time blocks that ended up with no energy at all.
+ *
+ * Section 4.3.5. A transient frame divides each band into time blocks,
+ * and a block the allocator could not afford to code comes out of
+ * section 4.3.4 as silence. Silence between two loud blocks is heard as
+ * a gap - the artifact the whole transient machinery exists to avoid -
+ * so a collapsed block is filled with noise instead, at a level derived
+ * from how far this frame's energy has risen above the two before it.
+ *
+ * The collapse masks ::gaud_celt_quant_all_bands produced are what says
+ * which blocks those are. Both ends run the same generator from the
+ * same seed, so the noise is agreed.
+ *
+ * @param mode The frame size.
+ * @param x The spectrum, adjusted in place.
+ * @param collapse One mask per band per channel.
+ * @param channels 1 or 2.
+ * @param size Entries per channel in @p x.
+ * @param start First band.
+ * @param end One past the last.
+ * @param energy This frame's band energies, in Q(::CELT_DB_SHIFT);
+ *   `2 * ::CELT_BANDS` entries whatever @p channels is, because a mono
+ *   frame still reads the second channel's history - the stream may
+ *   have been stereo a frame ago.
+ * @param previous1 The frame before's, same shape.
+ * @param previous2 The one before that, same shape.
+ * @param pulses The allocation, in eighths of a bit per band.
+ * @param seed The folding generator's state; not advanced for the
+ *   caller, because the reference passes it by value here.
+ */
+void gaud_celt_anti_collapse(const CELT_Mode * mode, int16_t * x,
+    const unsigned char * collapse, uint32_t channels, uint32_t size,
+    uint32_t start, uint32_t end, const int16_t * energy,
+    const int16_t * previous1, const int16_t * previous2,
+    const int32_t * pulses, uint32_t seed);
+
+/**
+ * @brief Turn the band energies back into linear amplitudes.
+ *
+ * RFC 6716's `log2Amp`. The envelope is coded as a base-two logarithm
+ * relative to a per-band mean, so this adds the mean back and raises
+ * two to it. Bands outside `[start, end)` are zeroed rather than left
+ * alone, because the caller may be reusing the array.
+ *
+ * @param amplitude Receives one per band per channel.
+ * @param energy The decoded envelope, in Q(::CELT_DB_SHIFT).
+ * @param start First band.
+ * @param end One past the last.
+ * @param channels 1 or 2.
+ */
+void gaud_celt_log2_amp(int32_t * amplitude, const int16_t * energy,
+    uint32_t start, uint32_t end, uint32_t channels);
+
+/**
+ * @brief Give each band back the energy the envelope says it has.
+ *
+ * Section 4.3.6, the inverse of the normalisation the encoder did: the
+ * shape vectors are unit-norm, so this is a multiply per bin. Bins
+ * above @p end are zeroed, which is what makes a band-limited frame
+ * band-limited.
+ *
+ * @param mode The frame size.
+ * @param x The normalised spectrum, @p channels by @p mode->size.
+ * @param out Receives the result, same shape.
+ * @param amplitude One per band per channel, from ::gaud_celt_log2_amp.
+ * @param end One past the last coded band.
+ * @param channels 1 or 2.
+ */
+void gaud_celt_denormalise_bands(const CELT_Mode * mode, const int16_t * x,
+    int32_t * out, const int32_t * amplitude, uint32_t end,
+    uint32_t channels);
+
 #ifdef __cplusplus
 }
 #endif
