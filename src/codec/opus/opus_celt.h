@@ -173,6 +173,63 @@ static inline int32_t gaud_celt_max32(int32_t a, int32_t b) {
   return a > b ? a : b;
 }
 
+/** The most pulses one band can be given; RFC 6716's MAX_PULSES. */
+#define CELT_MAX_PULSES 128
+
+/**
+ * @brief `V(N,K)`, and a row of the `U` it is built from.
+ *
+ * On return @p u holds `U(n,i)` for every `i` up to `k+1`, which is what
+ * ::gaud_celt_decode_pulses walks. Needs @p u to have at least `k+2`
+ * entries, and @p n of at least two.
+ *
+ * @param n Dimensions.
+ * @param k Pulses.
+ * @param u Receives the row.
+ * @return `V(n,k)`: how many vectors of @p n integers sum in absolute
+ *   value to @p k.
+ */
+uint32_t gaud_celt_pvq_urow(unsigned n, unsigned k, uint32_t * u);
+
+/**
+ * @brief `V(N,K)` on its own, including the degenerate cases.
+ *
+ * @param n Dimensions.
+ * @param k Pulses.
+ * @return `V(n,k)`; 1 when @p k is zero and 0 when @p n is zero.
+ */
+uint32_t gaud_celt_pvq_v(unsigned n, unsigned k);
+
+/**
+ * @brief Turn one codebook index back into its pulse vector.
+ *
+ * Section 4.3.4.2's enumeration, separated from the reading of the
+ * index so that it can be driven directly - which is how it is checked
+ * against the reference implementation, over every index the
+ * conformance vectors actually produce.
+ *
+ * @param y Receives the vector; @p n entries.
+ * @param n Dimensions, at least two.
+ * @param k Pulses, at least one and at most ::CELT_MAX_PULSES.
+ * @param index Below `V(n,k)`.
+ */
+void gaud_celt_pulses_from_index(
+    int * y, unsigned n, unsigned k, uint32_t index);
+
+/**
+ * @brief Read one band's pulse vector, section 4.3.4.2.
+ *
+ * Reads a single uniformly distributed index and turns it back into the
+ * vector of @p n signed integers whose absolute values sum to @p k.
+ *
+ * @param range The range decoder.
+ * @param y Receives the vector; @p n entries.
+ * @param n Dimensions, at least two.
+ * @param k Pulses, at least one and at most ::CELT_MAX_PULSES.
+ */
+void gaud_celt_decode_pulses(
+    OPUS_Range * range, int * y, unsigned n, unsigned k);
+
 /**
  * @brief The per-band ceiling on allocation, section 4.3.3.
  *

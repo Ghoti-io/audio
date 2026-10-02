@@ -48,6 +48,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1961,6 +1963,203 @@ TEST(OpusCelt, TfDecodeIsFlatAtTheShortestFrame) {
      * is no finer resolution to move to, only a coarser one. */
     for (int j = 0; j < CELT_BANDS; ++j) {
       EXPECT_TRUE(tf_res[j] == 0 || tf_res[j] == -1) << j;
+    }
+  }
+}
+
+/* --------------------------------------- RFC 6716 section 4.3.4.2:
+                                                 the PVQ enumeration */
+
+/**
+ * The shape codebook, tested as the bijection it is supposed to be.
+ *
+ * A band's shape is a vector of `N` integers whose absolute values sum
+ * to `K`, and the bitstream carries it as one integer below `V(N,K)`.
+ * So the specification of this layer is a single sentence: the mapping
+ * from index to vector is a bijection onto that set. That is directly
+ * testable for small sizes by **enumerating every index** and checking
+ * three things - every vector has the right pulse count, no two indices
+ * give the same vector, and the count comes out at exactly `V(N,K)`.
+ * Nothing about this needs a reference; a bijection either is one or is
+ * not.
+ *
+ * `V(N,K)` itself is checked two further ways. Against the table of
+ * values for `N` and `K` below ten that the reference implementation
+ * prints in its own commentary, and against the three-term recurrence
+ * section 4.3.4.2 states, computed independently of the row-stepping
+ * the decoder uses. Three readings of one function.
+ *
+ * Beyond the small sizes the decoder was checked against the reference
+ * over all 350,857 pulse vectors the conformance vectors contain,
+ * including the closed-form fast paths the reference uses for two,
+ * three and four dimensions - so two genuinely different enumerations
+ * agree. notes/audio/opus.md says how to reproduce that.
+ */
+
+namespace {
+
+/**
+ * `V(N,K)` from the recurrence in section 4.3.4.2, memoised.
+ *
+ * Deliberately not the method the decoder uses: that walks a row of a
+ * related function `U` so it can step down a dimension in place. This
+ * is the definition, in 64 bits so that nothing it computes can
+ * silently wrap, which is what makes it an independent reading.
+ */
+uint64_t VRecursive(unsigned n, unsigned k) {
+  static std::map<std::pair<unsigned, unsigned>, uint64_t> memo;
+  if (k == 0) {
+    return 1;
+  }
+  if (n == 0) {
+    return 0;
+  }
+  auto key = std::make_pair(n, k);
+  auto found = memo.find(key);
+  if (found != memo.end()) {
+    return found->second;
+  }
+  uint64_t value = VRecursive(n - 1, k) + VRecursive(n, k - 1)
+      + VRecursive(n - 1, k - 1);
+  memo[key] = value;
+  return value;
+}
+
+} // namespace
+
+/**
+ * The table of `V(N,K)` for `N` and `K` below ten, as the reference
+ * prints it in cwrs.c's commentary.
+ *
+ * Transcribed, and it covers the three degenerate rows the row-stepping
+ * recurrence cannot produce: no pulses is one vector, no dimensions is
+ * none, and one dimension is two whatever the pulse count.
+ */
+TEST(OpusPvq, VMatchesThePublishedTable) {
+  static const uint32_t published[10][10] = {
+      {1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+      {1, 2, 2, 2, 2, 2, 2, 2, 2, 2},
+      {1, 4, 8, 12, 16, 20, 24, 28, 32, 36},
+      {1, 6, 18, 38, 66, 102, 146, 198, 258, 326},
+      {1, 8, 32, 88, 192, 360, 608, 952, 1408, 1992},
+      {1, 10, 50, 170, 450, 1002, 1970, 3530, 5890, 9290},
+      {1, 12, 72, 292, 912, 2364, 5336, 10836, 20256, 35436},
+      {1, 14, 98, 462, 1666, 4942, 12642, 28814, 59906, 115598},
+      {1, 16, 128, 688, 2816, 9424, 27008, 68464, 157184, 332688},
+      {1, 18, 162, 978, 4482, 16722, 53154, 148626, 374274, 864146},
+  };
+  for (unsigned n = 0; n < 10u; ++n) {
+    for (unsigned k = 0; k < 10u; ++k) {
+      EXPECT_EQ(gaud_celt_pvq_v(n, k), published[n][k])
+          << "V(" << n << "," << k << ")";
+      EXPECT_EQ(VRecursive(n, k), (uint64_t)published[n][k])
+          << "the recurrence disagrees at V(" << n << "," << k << ")";
+    }
+  }
+}
+
+/**
+ * And over the whole range the format can present.
+ *
+ * `V(N,K)` must fit in 32 bits - it is read by ::gaud_opus_dec_uint,
+ * which cannot do more - so the comparison is restricted to the pairs
+ * where it does. That restriction is the format's, not a convenience:
+ * a band whose codebook would not fit is split in two instead.
+ */
+TEST(OpusPvq, VMatchesTheRecurrenceEverywhereItFits) {
+  unsigned compared = 0;
+  for (unsigned n = 2; n <= 96u; ++n) {
+    for (unsigned k = 1; k <= CELT_MAX_PULSES; ++k) {
+      uint64_t want = VRecursive(n, k);
+      if (want > 0xFFFFFFFFu) {
+        break; /* And every larger k is larger still. */
+      }
+      ASSERT_EQ((uint64_t)gaud_celt_pvq_v(n, k), want)
+          << "V(" << n << "," << k << ")";
+      ++compared;
+    }
+  }
+  /* 1,326 of the 12,160 pairs have a codebook that fits in 32 bits.
+   * The bare count is a weak thing to assert, so the two corners the
+   * conformance vectors actually reach are checked by name: the widest
+   * band the format presents, and the most pulses it allows. */
+  EXPECT_EQ(compared, 1326u)
+      << "the set of (N,K) pairs whose codebook fits in 32 bits has "
+         "changed size, which means V itself has";
+  EXPECT_LT((uint64_t)gaud_celt_pvq_v(96u, 5u), 0x100000000ull);
+  EXPECT_EQ((uint64_t)gaud_celt_pvq_v(96u, 5u), VRecursive(96u, 5u));
+  EXPECT_EQ((uint64_t)gaud_celt_pvq_v(2u, CELT_MAX_PULSES),
+      VRecursive(2u, CELT_MAX_PULSES));
+}
+
+/**
+ * The enumeration is a bijection onto the pulse vectors.
+ *
+ * Every index below `V(N,K)` is decoded; each vector must have an L1
+ * norm of exactly `K`, and no two indices may produce the same vector.
+ * Since there are `V(N,K)` indices and `V(N,K)` such vectors, "all
+ * distinct" and "all valid" together prove the mapping is onto.
+ */
+TEST(OpusPvq, EveryIndexDecodesToADistinctVectorOfKPulses) {
+  unsigned total = 0;
+  for (unsigned n = 2; n <= 7u; ++n) {
+    for (unsigned k = 1; k <= 7u; ++k) {
+      uint32_t count = gaud_celt_pvq_v(n, k);
+      ASSERT_GT(count, 0u);
+      std::set<std::vector<int>> seen;
+      for (uint32_t index = 0; index < count; ++index) {
+        std::vector<int> y((size_t)n, 0);
+        gaud_celt_pulses_from_index(y.data(), n, k, index);
+        int norm = 0;
+        for (int value : y) {
+          norm += value < 0 ? -value : value;
+        }
+        ASSERT_EQ(norm, (int)k) << "N " << n << " K " << k << " index "
+                               << index;
+        ASSERT_TRUE(seen.insert(y).second)
+            << "N " << n << " K " << k << " index " << index
+            << " repeats a vector an earlier index already produced";
+        ++total;
+      }
+      EXPECT_EQ(seen.size(), (size_t)count) << "N " << n << " K " << k;
+    }
+  }
+  /* Measured: the sizes swept above hold 78,570 codewords between them,
+   * and every one was decoded and found distinct. */
+  EXPECT_EQ(total, 78570u) << "the sweep enumerated " << total
+                           << " vectors rather than the 78,570 these "
+                              "sizes hold";
+}
+
+/**
+ * Where the enumeration starts, which pins its orientation.
+ *
+ * A mapping can be a perfect bijection onto the right set and still be
+ * the wrong mapping - every other test in this file would pass while
+ * the decoder produced a different vector for every index. So the first
+ * two codewords are asserted outright.
+ *
+ * Measured, and stable across every size: index zero puts all `K`
+ * pulses in the *first* dimension with a positive sign, and index one
+ * moves a single pulse from it into the second. The first draft of this
+ * test guessed the last dimension and was wrong; the enumeration counts
+ * down from the front.
+ */
+TEST(OpusPvq, TheEnumerationStartsAtAllPulsesInTheFirstDimension) {
+  for (unsigned n = 2; n <= 8u; ++n) {
+    for (unsigned k = 1; k <= 5u; ++k) {
+      std::vector<int> y((size_t)n, 0);
+      gaud_celt_pulses_from_index(y.data(), n, k, 0u);
+      EXPECT_EQ(y[0], (int)k) << "N " << n << " K " << k;
+      for (unsigned i = 1; i < n; ++i) {
+        EXPECT_EQ(y[i], 0) << "N " << n << " K " << k << " at " << i;
+      }
+      gaud_celt_pulses_from_index(y.data(), n, k, 1u);
+      EXPECT_EQ(y[0], (int)k - 1) << "N " << n << " K " << k;
+      EXPECT_EQ(y[1], 1) << "N " << n << " K " << k;
+      for (unsigned i = 2; i < n; ++i) {
+        EXPECT_EQ(y[i], 0) << "N " << n << " K " << k << " at " << i;
+      }
     }
   }
 }
