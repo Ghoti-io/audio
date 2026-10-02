@@ -327,6 +327,7 @@ INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 # they compile and link nothing, and a machine that can regenerate a corpus is
 # not necessarily one with the suite installed.
 DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help opus-vectors \
+	check-opus-tables \
 	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
@@ -798,6 +799,13 @@ check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_opus.py
 
+check-opus-tables: ## Fail if the generated CELT tables are not what the RFC yields
+# Needs the network, so it is asked for by name and is not in TEST_GATES.
+# The offline half of this claim - that what was compiled in matches
+# Table 55 of the prose - is in tests/unit/test_opus.cpp, where it runs
+# on every `make test`.
+	@python3 tools/tables/gen_opus_tables.py --check
+
 opus-vectors: ## Fetch RFC 6716's conformance vectors (39 MB, deliberate)
 # Separate from the gate that reads them, and for the same reason `corpus`
 # is separate from `check-corpus`: a gate that downloads 39 MB the first
@@ -953,7 +961,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-outoftree check-golden
 .PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
-.PHONY: opus-vectors check-opus-vectors
+.PHONY: opus-vectors check-opus-vectors check-opus-tables
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
 .PHONY: vorbis-coverage check-opus

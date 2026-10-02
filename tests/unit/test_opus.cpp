@@ -39,6 +39,7 @@
 
 #include "../../src/codec/opus/opus_internal.h"
 #include "../../src/codec/opus/opus_range.h"
+#include "../../src/codec/opus/opus_tables.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
@@ -519,6 +520,216 @@ TEST(OpusProbe, OggIsFiveFormatsAndTheProbeDecidesWhich) {
     ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
     EXPECT_STREQ(gaud_doc_codec_name(loaded.doc), one.codec) << one.name;
   }
+}
+
+/* --------------------------------------- RFC 6716 Table 55 and the
+                                              generated CELT tables */
+
+/**
+ * The CELT tables, checked against the one of them the prose prints.
+ *
+ * tools/tables/gen_opus_tables.py generates these from the reference
+ * implementation in Appendix A, which section 6 makes normative, and it
+ * already checks the band layout against Table 55 while doing so. This
+ * repeats that check **against the built library**, which is a different
+ * claim: the generator checks what it read, and this checks what was
+ * compiled in. A table regenerated from a changed source, or edited by
+ * hand afterwards, passes the first and fails this.
+ *
+ * Table 55 below is transcribed from the document a second time, on
+ * purpose. Two transcriptions of one printed table disagree if either
+ * has a typo, which is worth more than one transcription used twice.
+ */
+
+namespace {
+
+/** RFC 6716 Table 55: MDCT bins per channel per band, by frame size. */
+const unsigned char table55[21][4] = {
+    {1, 2, 4, 8}, {1, 2, 4, 8}, {1, 2, 4, 8}, {1, 2, 4, 8},
+    {1, 2, 4, 8}, {1, 2, 4, 8}, {1, 2, 4, 8}, {1, 2, 4, 8},
+    {2, 4, 8, 16}, {2, 4, 8, 16}, {2, 4, 8, 16}, {2, 4, 8, 16},
+    {4, 8, 16, 32}, {4, 8, 16, 32}, {4, 8, 16, 32},
+    {6, 12, 24, 48}, {6, 12, 24, 48},
+    {8, 16, 32, 64},
+    {12, 24, 48, 96},
+    {18, 36, 72, 144},
+    {22, 44, 88, 176},
+};
+
+/** The same table's band edges in hertz. */
+const unsigned short table55_hz[22] = {
+    0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 2000, 2400, 2800,
+    3200, 4000, 4800, 5600, 6800, 8000, 9600, 12000, 15600, 20000,
+};
+
+} // namespace
+
+TEST(OpusTables, BandWidthsAreTable55AtEveryFrameSize) {
+  for (int band = 0; band < 21; ++band) {
+    int width = gaud_opus_eband5ms[band + 1] - gaud_opus_eband5ms[band];
+    ASSERT_GT(width, 0) << "band " << band;
+    for (int size = 0; size < 4; ++size) {
+      int multiplier = 1 << size;
+      EXPECT_EQ(width * multiplier, (int)table55[band][size])
+          << "band " << band << " at frame size " << multiplier;
+    }
+  }
+}
+
+/**
+ * The same edges in hertz, which is a second fact about them.
+ *
+ * One 2.5 ms bin at 48 kHz is 200 Hz, so the edge table and the
+ * frequency column of Table 55 are the same numbers scaled. A band
+ * layout shifted by one bin passes the width check - every width is
+ * unchanged - and fails this one.
+ */
+TEST(OpusTables, BandEdgesLandOnTable55Frequencies) {
+  for (int edge = 0; edge < 22; ++edge) {
+    EXPECT_EQ(gaud_opus_eband5ms[edge] * 200, (int)table55_hz[edge])
+        << "edge " << edge;
+  }
+  /* And the top of the last band is 20 kHz, not the 24 kHz Nyquist: a
+   * 20 ms frame has 960 bins and the bands cover 800 of them. */
+  EXPECT_EQ(gaud_opus_eband5ms[21], 100);
+  EXPECT_EQ(gaud_opus_eband5ms[21] * 8, 800);
+}
+
+/**
+ * The overlap window rises monotonically to Q15ONE.
+ *
+ * The generator checks it against its formula; what is checked here is
+ * the shape, which is what the overlap-add depends on. The rise is
+ * non-decreasing rather than strictly increasing, because the top of it
+ * sits at the ceiling - and the count of entries there is asserted,
+ * because a window that saturated early would still be monotone.
+ *
+ * **Six entries are 32767 and only five of them are clamped.** The
+ * generator reports five, counting the entries whose formula rounds to
+ * 32768, which Q15 cannot hold; entry 114 arrives at 32767 honestly,
+ * its exact value being 32766.92. The two numbers measure different
+ * things and the first draft of this test asserted the generator's
+ * against the library's.
+ */
+TEST(OpusTables, WindowRisesToQ15One) {
+  int at_ceiling = 0;
+  for (int n = 0; n < 120; ++n) {
+    EXPECT_GT(gaud_opus_window120[n], 0) << "n " << n;
+    EXPECT_LE(gaud_opus_window120[n], 32767) << "n " << n;
+    if (n > 0) {
+      EXPECT_GE(gaud_opus_window120[n], gaud_opus_window120[n - 1])
+          << "n " << n;
+    }
+    if (gaud_opus_window120[n] == 32767) {
+      ++at_ceiling;
+    }
+  }
+  EXPECT_EQ(gaud_opus_window120[119], 32767);
+  EXPECT_EQ(at_ceiling, 6);
+  /* And the entry below them is not there yet, so the ceiling is a
+   * ceiling rather than a flat top the window reaches early. */
+  EXPECT_EQ(gaud_opus_window120[113], 32766);
+}
+
+/**
+ * The allocation table's two monotonicities.
+ *
+ * Across a row the allocation falls, because higher bands get fewer
+ * bits per sample; down a column it rises, because the rows are
+ * increasing overall rates. Both hold for all 231 entries, and a table
+ * read with its two dimensions transposed breaks them - which is the
+ * mistake a flat array of 231 bytes invites.
+ */
+TEST(OpusTables, AllocationTableIsMonotoneBothWays) {
+  const int rows = 11;
+  const int bands = 21;
+  for (int row = 0; row < rows; ++row) {
+    for (int band = 1; band < bands; ++band) {
+      EXPECT_LE(gaud_opus_band_allocation[row * bands + band],
+          gaud_opus_band_allocation[row * bands + band - 1])
+          << "row " << row << " band " << band;
+    }
+  }
+  for (int band = 0; band < bands; ++band) {
+    for (int row = 1; row < rows; ++row) {
+      EXPECT_GE(gaud_opus_band_allocation[row * bands + band],
+          gaud_opus_band_allocation[(row - 1) * bands + band])
+          << "row " << row << " band " << band;
+    }
+  }
+  /* The first row allocates nothing anywhere, and the last allocates
+   * something everywhere: those are the ends of the interpolation. */
+  for (int band = 0; band < bands; ++band) {
+    EXPECT_EQ(gaud_opus_band_allocation[band], 0) << "band " << band;
+    EXPECT_GT(gaud_opus_band_allocation[(rows - 1) * bands + band], 0)
+        << "band " << band;
+  }
+}
+
+/**
+ * Every distribution the range decoder will be handed is terminated.
+ *
+ * ::gaud_opus_dec_icdf stops on the zero at the end of its table and
+ * runs off the end of the array without one, so this is a bound on a
+ * loop rather than a tidiness check. Each table is also checked to be
+ * strictly decreasing, which is what makes it an inverse cumulative
+ * distribution rather than a list.
+ */
+TEST(OpusTables, EveryIcdfIsDecreasingAndZeroTerminated) {
+  struct Table {
+    const char * name;
+    const unsigned char * values;
+    size_t count;
+  };
+  const Table tables[] = {
+      {"trim", gaud_opus_trim_icdf, 11},
+      {"spread", gaud_opus_spread_icdf, 4},
+      {"tapset", gaud_opus_tapset_icdf, 3},
+  };
+  for (const Table & one : tables) {
+    EXPECT_EQ(one.values[one.count - 1], 0u) << one.name;
+    for (size_t i = 1; i < one.count; ++i) {
+      EXPECT_LT(one.values[i], one.values[i - 1]) << one.name << " at " << i;
+    }
+  }
+}
+
+/**
+ * The coarse energy model has a Laplace pair for every band of every
+ * frame size, in both prediction modes.
+ *
+ * Forty-two entries is twenty-one bands times two numbers each, and the
+ * second of each pair is a decay that must leave something to decode -
+ * a zero would make the distribution unreadable past the first symbol.
+ */
+TEST(OpusTables, CoarseEnergyModelCoversEveryBand) {
+  for (int size = 0; size < 4; ++size) {
+    for (int intra = 0; intra < 2; ++intra) {
+      for (int band = 0; band < 21; ++band) {
+        size_t at = ((size_t)size * 2u + intra) * 42u + (size_t)band * 2u;
+        EXPECT_GT(gaud_opus_e_prob_model[at], 0u)
+            << "size " << size << " intra " << intra << " band " << band;
+        EXPECT_GT(gaud_opus_e_prob_model[at + 1u], 0u)
+            << "size " << size << " intra " << intra << " band " << band;
+      }
+    }
+  }
+}
+
+/** The prediction coefficients fall with frame size, and stay in Q15. */
+TEST(OpusTables, PredictionCoefficientsAreQ15AndFall) {
+  for (int size = 0; size < 4; ++size) {
+    EXPECT_GT(gaud_opus_pred_coef[size], 0);
+    EXPECT_LE(gaud_opus_pred_coef[size], 32767);
+    EXPECT_GT(gaud_opus_beta_coef[size], 0);
+    EXPECT_LE(gaud_opus_beta_coef[size], 32767);
+    if (size > 0) {
+      EXPECT_LT(gaud_opus_pred_coef[size], gaud_opus_pred_coef[size - 1]);
+      EXPECT_LT(gaud_opus_beta_coef[size], gaud_opus_beta_coef[size - 1]);
+    }
+  }
+  EXPECT_GT(gaud_opus_beta_intra[0], 0);
+  EXPECT_LE(gaud_opus_beta_intra[0], 32767);
 }
 
 /* ------------------------------------------- RFC 6716 section 3.2:
