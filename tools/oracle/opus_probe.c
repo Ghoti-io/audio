@@ -50,6 +50,7 @@
  */
 
 #include "../../src/codec/opus/opus_celt.h"
+#include "../../src/codec/opus/opus_silk.h"
 #include "../../src/codec/opus/opus_internal.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
@@ -114,8 +115,9 @@ int main(int argc, char ** argv) {
 
   CELT_Decoder * decoder = malloc(sizeof *decoder);
   CELT_Scratch * scratch = malloc(sizeof *scratch);
+  SILK_Decoder * silk = malloc(sizeof *silk);
   int16_t * pcm = malloc(2u * 960u * sizeof *pcm);
-  if (!decoder || !scratch || !pcm) {
+  if (!decoder || !scratch || !silk || !pcm) {
     fprintf(stderr, "opus_probe: out of memory\n");
     return 2;
   }
@@ -136,6 +138,7 @@ int main(int argc, char ** argv) {
      * would still produce plausible audio and the wrong range state.
      */
     gaud_celt_decoder_init(decoder, 2u, 1);
+    memset(silk, 0, sizeof *silk);
     size_t at = 0;
     uint64_t index = 0;
     uint64_t samples = 0;
@@ -170,7 +173,55 @@ int main(int argc, char ** argv) {
          * "written and wrong".
          */
         char range_text[32];
-        if (packet.toc.mode != OPUS_MODE_CELT) {
+        if (packet.toc.mode == OPUS_MODE_SILK) {
+          /*
+           * SILK's parse is the half section 6 is strict about, and it
+           * turns out to carry nothing across a packet boundary: every
+           * parameter coded against a previous one is coded against a
+           * previous one *in the same packet*, because the first frame
+           * of a packet is always independent. So a SILK packet can be
+           * compared even in a stream whose earlier packets were a
+           * mode this probe cannot decode.
+           */
+          seen_other_mode = true;
+          static const int kSilkRate[3] = {8, 12, 16};
+          int rate = kSilkRate[packet.toc.bandwidth < 3u
+                  ? packet.toc.bandwidth
+                  : 2u];
+          int duration_ms = (int)(packet.toc.frame_size / 48u);
+          int channels = packet.toc.stereo ? 2 : 1;
+          if (!gaud_silk_decoder_init(silk, channels, rate, duration_ms)) {
+            snprintf(range_text, sizeof range_text, "none");
+          } else {
+            bool redundant = false;
+            uint32_t rng = 0;
+            for (uint32_t frame = 0; frame < packet.count; ++frame) {
+              OPUS_Range range;
+              gaud_opus_range_init(
+                  &range, packet.frame[frame], packet.length[frame]);
+              gaud_silk_parse_packet(silk, &range);
+              rng = range.rng;
+              /*
+               * src/opus_decoder.c reads one more bit after the SILK
+               * frames whenever 17 bits are left, because that is how
+               * a mode switch hands over a CELT copy of the low band,
+               * and it folds that CELT decoder's own final range into
+               * the state the vector states. Neither half is written
+               * yet, so a packet with room for it is reported as
+               * uncomparable rather than compared and called wrong.
+               */
+              if (gaud_opus_tell(&range) + 17u
+                  <= 8u * (uint32_t)packet.length[frame]) {
+                redundant = true;
+              }
+            }
+            if (redundant) {
+              snprintf(range_text, sizeof range_text, "redundant");
+            } else {
+              snprintf(range_text, sizeof range_text, "%" PRIu32, rng);
+            }
+          }
+        } else if (packet.toc.mode != OPUS_MODE_CELT) {
           seen_other_mode = true;
           snprintf(range_text, sizeof range_text, "none");
         } else if (seen_other_mode) {
@@ -222,6 +273,7 @@ int main(int argc, char ** argv) {
   }
   free(decoder);
   free(scratch);
+  free(silk);
   free(pcm);
   return 0;
 }

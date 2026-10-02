@@ -43,6 +43,7 @@
 #include "../../src/codec/opus/opus_celt_math.h"
 #include "../../src/codec/opus/opus_tables.h"
 #include "../../src/codec/opus/opus_silk_tables.h"
+#include "../../src/codec/opus/opus_silk.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
@@ -1137,6 +1138,260 @@ TEST(OpusSilkTables, EverySignContextCanCodeBothSigns) {
     EXPECT_GE(gaud_opus_silk_sign_icdf[i], 1u) << "at " << i;
     EXPECT_LE(gaud_opus_silk_sign_icdf[i], 255u) << "at " << i;
   }
+}
+
+// --- the SILK parse -------------------------------------------------
+//
+// Everything SILK reads off the bitstream, and nothing it computes.
+// The two tests below are the offline half of a comparison against RFC
+// 6716 Appendix A's own `silk_decode_indices` and `silk_decode_pulses`:
+// the digest was taken from both implementations over the same 51,840
+// cases and the two agreed before it was written down, and the
+// bitstreams in the second test were produced by Appendix A's range
+// *encoder* and decoded identically by both.
+
+namespace {
+
+/** The sweep's bitstreams: varied, cheap, and the same every run. */
+void FillSilk(unsigned char * buffer, int length, uint32_t seed) {
+  for (int i = 0; i < length; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    buffer[i] = (unsigned char)(seed >> 16);
+  }
+}
+
+/** FNV-1a over eight bytes of a value, little end first. */
+void FoldSilk(uint64_t & digest, int64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    digest ^= (uint64_t)((value >> (8 * i)) & 0xFF);
+    digest *= 1099511628211ULL;
+  }
+}
+
+} // namespace
+
+/**
+ * Every combination of the things that change what SILK reads.
+ *
+ * Three sample rates, both frame lengths, the voice-activity flag both
+ * ways, redundancy or not, all three conditional-coding cases, all
+ * three previous signal types, a previous lag or none, five bitstream
+ * lengths and twenty-four bitstreams each: 51,840 frames. Each one is
+ * parsed and everything it produced is folded into one digest - the
+ * indices, every excitation sample, and the range decoder's state
+ * afterwards.
+ *
+ * **The constant is Appendix A's.** It was computed twice, once from
+ * this library and once from the reference built fixed-point, and the
+ * two agreed before either was written here. So a self-contained test
+ * carries the reference's verdict.
+ *
+ * What the sweep reaches, counted rather than assumed: 24,030 of the
+ * frames are voiced, 4,500 extend an LSF index past the nine symbols
+ * its distribution has, 5,910 interpolate the LSFs, 4,050 code an LTP
+ * scaling factor, and 3,750 have a shell block that escapes for extra
+ * bits. It reaches **one** escape and never two, which is why the next
+ * test exists.
+ */
+TEST(OpusSilkParse, EveryParameterCombinationMatchesTheReference) {
+  static const int kRates[3] = {8, 12, 16};
+  std::vector<unsigned char> buffer(256);
+  uint64_t digest = 1469598103934665603ULL;
+  long cases = 0;
+  long voiced = 0;
+  long extended = 0;
+  long interpolated = 0;
+  long scaled = 0;
+  long escaped = 0;
+  SILK_Decoder decoder;
+  for (int rate = 0; rate < 3; ++rate) {
+    for (int subframes = 2; subframes <= 4; subframes += 2) {
+      for (int vad = 0; vad < 2; ++vad) {
+        for (int lbrr = 0; lbrr < 2; ++lbrr) {
+          for (int coding = 0; coding < 3; ++coding) {
+            for (int previous = 0; previous < 3; ++previous) {
+              for (int lag = 0; lag < 2; ++lag) {
+                for (int length = 20; length <= 240; length += 55) {
+                  for (uint32_t seed = 1; seed <= 24; ++seed) {
+                    int fs = kRates[rate];
+                    FillSilk(buffer.data(), length,
+                        seed * 7919u + (uint32_t)(fs * 31 + subframes));
+                    memset(&decoder, 0, sizeof decoder);
+                    ASSERT_TRUE(gaud_silk_decoder_init(
+                        &decoder, 1, fs, subframes == 2 ? 10 : 20));
+                    SILK_Channel * channel = &decoder.channel[0];
+                    channel->vad[0] = vad != 0;
+                    channel->prev_signal_type = (int8_t)previous;
+                    channel->prev_lag_index = (int16_t)(lag ? 37 : 0);
+                    OPUS_Range range;
+                    gaud_opus_range_init(
+                        &range, buffer.data(), (uint32_t)length);
+                    gaud_silk_decode_indices(channel, &range, 0, lbrr != 0,
+                        (SILK_Coding)coding);
+                    gaud_silk_decode_pulses(channel, &range);
+
+                    const SILK_Indices & got = channel->indices;
+                    FoldSilk(digest, got.signal_type);
+                    FoldSilk(digest, got.quant_offset_type);
+                    for (int i = 0; i < subframes; ++i) {
+                      FoldSilk(digest, got.gains[i]);
+                      FoldSilk(digest, got.ltp[i]);
+                    }
+                    for (int i = 0; i <= channel->lpc_order; ++i) {
+                      FoldSilk(digest, got.nlsf[i]);
+                    }
+                    FoldSilk(digest, got.nlsf_interp_q2);
+                    FoldSilk(digest, got.lag_index);
+                    FoldSilk(digest, got.contour_index);
+                    FoldSilk(digest, got.per_index);
+                    FoldSilk(digest, got.ltp_scale_index);
+                    FoldSilk(digest, got.seed);
+                    for (int i = 0; i < channel->frame_length; ++i) {
+                      FoldSilk(digest, channel->pulses[i]);
+                    }
+                    FoldSilk(digest, (int64_t)range.rng);
+
+                    if (got.signal_type == SILK_SIGNAL_VOICED) {
+                      ++voiced;
+                    }
+                    for (int i = 1; i <= channel->lpc_order; ++i) {
+                      if (got.nlsf[i] <= -4 || got.nlsf[i] >= 4) {
+                        ++extended;
+                        break;
+                      }
+                    }
+                    if (got.nlsf_interp_q2 < 4) {
+                      ++interpolated;
+                    }
+                    if (got.ltp_scale_index != 0) {
+                      ++scaled;
+                    }
+                    for (int block = 0; block < channel->shell_blocks;
+                        ++block) {
+                      int sum = 0;
+                      for (int i = 0; i < 16; ++i) {
+                        int value = channel->pulses[block * 16 + i];
+                        sum += value < 0 ? -value : value;
+                      }
+                      // Without an escape a block's magnitudes sum to
+                      // at most sixteen, so this is exact.
+                      if (sum > 16) {
+                        ++escaped;
+                        break;
+                      }
+                    }
+                    ++cases;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 51840);
+  EXPECT_EQ(digest, 8279305155702364975ULL);
+  EXPECT_EQ(voiced, 24030);
+  EXPECT_EQ(extended, 4500);
+  EXPECT_EQ(interpolated, 5910);
+  EXPECT_EQ(scaled, 4050);
+  EXPECT_EQ(escaped, 3750);
+}
+
+/**
+ * A shell block can escape ten times and the eleventh is unwritable.
+ *
+ * Section 4.2.7.8.2 lets a block say "every sample has another
+ * low-order bit" instead of giving a pulse count, repeatedly. Nothing
+ * in the decoder bounds that loop; what bounds it is that at ten
+ * repetitions the distribution shifts by one entry and the escape
+ * symbol ceases to exist. These eleven bitstreams were produced by
+ * Appendix A's range encoder, asked for zero through eleven escapes -
+ * and at eleven **the encoder could not write it**, which is the claim
+ * rather than a limitation of the test. Each decodes here to the same
+ * samples and the same final range state as Appendix A's decoder.
+ *
+ * The run of 0xFF after the first byte is the escape symbol itself:
+ * its probability is one in 256 under these distributions, so each
+ * repetition costs very nearly a whole byte and is visible in the
+ * stream.
+ */
+TEST(OpusSilkParse, TheLsbEscapeReachesTenAndTheTableStopsIt) {
+  struct Case {
+    int escapes;
+    uint32_t range_after;
+    int length;
+    unsigned char bytes[40];
+    int block0[16];
+  };
+  static const Case cases[] = {
+    {0, 188747351u, 10,
+        {0x0C, 0x1C, 0x83, 0x3A, 0xD8, 0x7D, 0x6B, 0x67, 0xEB, 0xE0},
+        {-1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},  // largest 1
+    {1, 223953456u, 14,
+        {0x0E, 0xF1, 0x1F, 0x05, 0xDF, 0x20, 0xAF, 0x84, 0xE7, 0x1F, 0xCF, 0x9B, 0x36, 0x80},
+        {-2, -3, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1}},  // largest 3
+    {2, 51894497u, 16,
+        {0x0E, 0xFF, 0xE2, 0x3E, 0x0B, 0xF5, 0x2F, 0x3C, 0xFF, 0xDA, 0x2E, 0xC1, 0xDB, 0x9F, 0x3A, 0x79},
+        {-5, -6, -1, -2, -1, -2, -1, -2, -1, -2, -1, -2, -1, -2, -1, -2}},  // largest 6
+    {3, 100595500u, 19,
+        {0x0E, 0xFF, 0xFF, 0xC4, 0x7C, 0x17, 0x7A, 0x92, 0xF2, 0x0A, 0x9D, 0x0F, 0x6C, 0x5E, 0x10, 0xD3, 0x3E, 0x81, 0x08},
+        {-10, -13, -2, -5, -2, -5, -2, -5, -2, -5, -2, -5, -2, -5, -2, -5}},  // largest 13
+    {4, 194974882u, 22,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0x88, 0xF8, 0x2F, 0x36, 0xA1, 0x10, 0x21, 0x30, 0xD9, 0x44, 0x7D, 0xF7, 0xAF, 0x8D, 0x9A, 0x89, 0x17, 0x6C},
+        {-21, -26, -5, -10, -5, -10, -5, -10, -5, -10, -5, -10, -5, -10, -5, -10}},  // largest 26
+    {5, 377960525u, 25,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0x11, 0xF0, 0x5D, 0xEA, 0x4B, 0x68, 0xF0, 0x19, 0x6C, 0x28, 0x05, 0x63, 0x60, 0xC1, 0xE0, 0x75, 0xD9, 0x2A, 0x87, 0xF0},
+        {-42, -53, -10, -21, -10, -21, -10, -21, -10, -21, -10, -21, -10, -21, -10, -21}},  // largest 53
+    {6, 732565768u, 28,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x23, 0xE0, 0xBC, 0x17, 0xE4, 0x46, 0x33, 0x1C, 0xB5, 0x95, 0x73, 0x41, 0xB7, 0x7B, 0xAD, 0xD4, 0x28, 0x85, 0xF3, 0x53, 0xEB, 0xE0},
+        {-85, -106, -21, -42, -21, -42, -21, -42, -21, -42, -21, -42, -21, -42, -21, -42}},  // largest 106
+    {7, 1420175106u, 31,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC, 0x47, 0xC1, 0x77, 0xA7, 0x1C, 0xFA, 0x2F, 0xEF, 0xDA, 0x1D, 0xC8, 0x0C, 0x00, 0x9C, 0x17, 0x91, 0x52, 0xAC, 0x50, 0x37, 0x4B, 0xEB, 0xD7, 0xC0},
+        {-170, -213, -42, -85, -42, -85, -42, -85, -42, -85, -42, -85, -42, -85, -42, -85}},  // largest 213
+    {8, 10752347u, 34,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8, 0x8F, 0x82, 0xF0, 0x52, 0x1D, 0xF5, 0x48, 0x67, 0x83, 0xC0, 0xD9, 0x98, 0xC1, 0xFB, 0x87, 0x4E, 0xC4, 0xE7, 0x41, 0xB1, 0xE9, 0x27, 0xEB, 0xD7, 0xAF, 0x80},
+        {-341, -426, -85, -170, -85, -170, -85, -170, -85, -170, -85, -170, -85, -170, -85, -170}},  // largest 426
+    {9, 20843497u, 37,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF1, 0x1F, 0x05, 0xDF, 0x21, 0x49, 0x77, 0xAD, 0x3A, 0x51, 0x7B, 0x14, 0x66, 0x30, 0xBA, 0x53, 0x41, 0x48, 0x54, 0x17, 0x5D, 0x02, 0x52, 0xA6, 0xCB, 0xDB, 0xB3, 0x63, 0x00},
+        {-682, -853, -170, -341, -170, -341, -170, -341, -170, -341, -170, -341, -170, -341, -170, -341}},  // largest 853
+    {10, 242396629u, 39,
+        {0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xE2, 0x66, 0x46, 0x71, 0x55, 0x2D, 0xFC, 0x41, 0xC0, 0x0D, 0xD3, 0xD1, 0x4B, 0x0F, 0xF7, 0x15, 0xA8, 0xEE, 0x22, 0xC1, 0x9C, 0x22, 0x5F, 0x5F, 0xAF, 0x5B, 0x8E, 0x30, 0x60, 0xD8},
+        {-1365, -1706, -341, -682, -341, -682, -341, -682, -341, -682, -341, -682, -341, -682, -341, -682}},  // largest 1706
+  };
+  SILK_Decoder decoder;
+  for (const Case & one : cases) {
+    memset(&decoder, 0, sizeof decoder);
+    ASSERT_TRUE(gaud_silk_decoder_init(&decoder, 1, 8, 10));
+    SILK_Channel * channel = &decoder.channel[0];
+    channel->indices.signal_type = SILK_SIGNAL_INACTIVE;
+    channel->indices.quant_offset_type = 0;
+    OPUS_Range range;
+    gaud_opus_range_init(&range, one.bytes, (uint32_t)one.length);
+    gaud_silk_decode_pulses(channel, &range);
+    EXPECT_EQ(range.rng, one.range_after) << "escapes " << one.escapes;
+    for (int i = 0; i < 16; ++i) {
+      EXPECT_EQ(channel->pulses[i], one.block0[i])
+          << "escapes " << one.escapes << " at " << i;
+    }
+    // The other four blocks of this 10 ms narrowband frame are empty,
+    // which is what makes the first block's magnitudes attributable.
+    for (int i = 16; i < 80; ++i) {
+      EXPECT_EQ(channel->pulses[i], 0) << "escapes " << one.escapes
+                                       << " at " << i;
+    }
+  }
+  // Ten escapes multiply a magnitude by 1024 before the extra bits are
+  // added, so this block reaches 1706 from two pulses - which no
+  // unescaped block could, since their magnitudes sum to sixteen.
+  EXPECT_EQ(cases[10].escapes, 10);
+  int largest = 0;
+  for (int i = 0; i < 16; ++i) {
+    int value = cases[10].block0[i];
+    largest = std::max(largest, value < 0 ? -value : value);
+  }
+  EXPECT_EQ(largest, 1706);
 }
 
 namespace {

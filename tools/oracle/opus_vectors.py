@@ -107,27 +107,23 @@ FILE_SHA256 = {
         "8107b5e33122cd5e2aceae723d8a4ea2ebb30b3493bb11d7f021cd1d8e653aa0",
 }
 
-# Which configurations each vector reaches, measured by reading the table
-# of contents byte of every packet. Recorded so that a gate can say which
-# part of the format a failure is in, and so that the claim "all 32
-# configurations are covered" is checkable rather than asserted.
-# How many packets of each vector end with the final range decoder state
-# RFC 6716 section 6 requires, as measured. Absent names contribute none.
-#
-# This is not a target to reach but a ratchet: it is the number that
-# holds today, and a change in either direction is a finding. Going down
-# is a regression; going up means a mode was implemented and nobody
-# updated the figure, which is worth saying out loud rather than
-# silently passing.
-#
-# Everything missing from it is a SILK or hybrid packet, or a CELT packet
-# in a stream that has already carried one - there is no SILK decoder yet
-# to leave the state those need.
-CELT_RANGE_MATCHED = {
+# How many packets of each vector end with exactly the range decoder
+# state the vector file states. Pinned per vector rather than only in
+# total, because a decoder that stopped answering for one configuration
+# while another gained the same number of packets would keep a total
+# intact. Every entry is a floor that has been reached, never a target:
+# raising one is the measurement of a decoder that reaches further.
+RANGE_MATCHED = {
     "testvector01": 2147,
+    "testvector02": 1185,
+    "testvector03": 998,
+    "testvector04": 1265,
     "testvector07": 4186,
+    "testvector08": 4,
+    "testvector09": 4,
     "testvector10": 965,
     "testvector11": 553,
+    "testvector12": 1056,
 }
 
 CONFIGS = {

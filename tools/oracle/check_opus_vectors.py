@@ -99,7 +99,8 @@ def run_probe(probe, paths):
             current = os.path.basename(parts[1]).replace(".bit", "")
             out[current] = {"packets": 0, "refused": 0, "samples": 0,
                             "configs": set(), "ranges": 0, "matched": 0,
-                            "stale": 0, "absent": 0, "truncated": False}
+                            "stale": 0, "absent": 0, "redundant": 0,
+                            "truncated": False}
         elif parts[0] == "packet" and current:
             entry = out[current]
             entry["packets"] += 1
@@ -112,12 +113,18 @@ def run_probe(probe, paths):
             # "none" is a packet in a mode that has no decoder yet.
             # "stale" is a CELT packet in a stream that has already
             # carried one of those, so the state it should have built
-            # on is missing - not a failure, and not a pass either.
+            # on is missing. "redundant" is a SILK packet with room
+            # after its frames for the mode-switch handover, which
+            # reads one more symbol and folds a second decoder's range
+            # into the answer. None of the three is a failure, and
+            # none is a pass either.
             state = fields.get("range", "none")
             if state == "none":
                 entry["absent"] += 1
             elif state == "stale":
                 entry["stale"] += 1
+            elif state == "redundant":
+                entry["redundant"] += 1
             else:
                 entry["ranges"] += 1
                 if int(state) == int(fields["want_range"]):
@@ -151,6 +158,7 @@ def main(argv):
     total_ranges = 0
     total_matched = 0
     total_stale = 0
+    total_redundant = 0
     total_absent = 0
     seen_configs = set()
 
@@ -167,12 +175,13 @@ def main(argv):
         total_ranges += entry["ranges"]
         total_matched += entry["matched"]
         total_stale += entry["stale"]
+        total_redundant += entry["redundant"]
         total_absent += entry["absent"]
         seen_configs |= entry["configs"]
 
         # Each vector's own count, so a regression says which stream it
         # is in rather than only that the total moved.
-        want_matched = opus_vectors.CELT_RANGE_MATCHED.get(name)
+        want_matched = opus_vectors.RANGE_MATCHED.get(name)
         if want_matched is not None and entry["matched"] != want_matched:
             failures.append(
                 f"{name}: {entry['matched']} packets ended with the "
@@ -240,15 +249,18 @@ def main(argv):
         else:
             print(f"check-opus-vectors: all {total_ranges} final range "
                   "decoder states match the reference exactly")
-        # The two categories that are not yet claimable, named so that
-        # the number above cannot be read as "all of them".
-        print(f"check-opus-vectors: {total_absent} packets are SILK or "
-              f"hybrid, which have no decoder; {total_stale} are CELT in a "
-              "stream that already carried one of those, so the state they "
-              "would build on is missing. Neither is compared.")
-        if total_ranges + total_stale + total_absent != total_packets:
+        # The categories that are not yet claimable, named so that the
+        # number above cannot be read as "all of them".
+        print(f"check-opus-vectors: {total_absent} packets are hybrid, "
+              f"which has no decoder; {total_stale} are CELT in a stream "
+              "that already carried another mode, so the state they would "
+              f"build on is missing; {total_redundant} are SILK with room "
+              "for a mode-switch handover this does not read yet. None of "
+              "the three is compared.")
+        if (total_ranges + total_stale + total_absent + total_redundant
+                != total_packets):
             failures.append(
-                "the three categories do not add up to the packet count, "
+                "the four categories do not add up to the packet count, "
                 "so some packets are being counted twice or not at all")
 
     if failures:
