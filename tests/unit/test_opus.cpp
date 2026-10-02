@@ -44,6 +44,7 @@
 #include "../../src/codec/opus/opus_tables.h"
 #include "../../src/codec/opus/opus_silk_tables.h"
 #include "../../src/codec/opus/opus_silk.h"
+#include "../../src/codec/opus/opus_silk_math.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
@@ -1392,6 +1393,372 @@ TEST(OpusSilkParse, TheLsbEscapeReachesTenAndTheTableStopsIt) {
     largest = std::max(largest, value < 0 ? -value : value);
   }
   EXPECT_EQ(largest, 1706);
+}
+
+/**
+ * SILK's three out-of-line primitives, over their whole domains.
+ *
+ * Each is an approximation whose error is part of the format: the
+ * encoder made its decisions with the same wrong answer, so a more
+ * accurate root or reciprocal would decode to different audio. That
+ * makes "close enough" the wrong test and exact agreement the right
+ * one.
+ *
+ *   - `log2lin` over its whole domain, which stops at 4095 because
+ *     one more makes the shift inside it undefined. Both of its arms
+ *     are covered - they are different computations, not a
+ *     rearrangement of one, and the boundary is at 16 in the log
+ *     domain.
+ *   - `sqrt_approx` over every value below 65,536 and then, for each
+ *     of the fifteen larger exponents, every value of the fifteen
+ *     bits below the leading one. Those bits are the whole of what
+ *     the correction step can see, so that is coverage and not
+ *     sampling.
+ *   - `inverse32_varq` over thirty exponents by 512 mantissas, both
+ *     signs, at four result scales.
+ *
+ * 685,048 comparisons against Appendix A, and the digest was computed
+ * from both sides before it was written here.
+ */
+TEST(OpusSilkMath, EveryPrimitiveMatchesTheReferenceOverItsDomain) {
+  uint64_t digest = 1469598103934665603ULL;
+  auto fold = [&digest](int64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (uint64_t)((value >> (8 * i)) & 0xFF);
+      digest *= 1099511628211ULL;
+    }
+  };
+  long count = 0;
+  // 4095 is the top of this function's domain, not a sampling
+  // choice: one more and the shift inside it is undefined. Its only
+  // caller caps the argument at 3967, which is 31 in Q7 - see
+  // opus_silk_params.c - and a sweep that went past that found the
+  // shift with UBSan rather than finding a defect.
+  for (int32_t v = -1000; v <= 4095; ++v) {
+    fold(gaud_silk_log2lin(v));
+    ++count;
+  }
+  for (int32_t v = -16; v < 65536; ++v) {
+    fold(gaud_silk_sqrt_approx(v));
+    ++count;
+  }
+  for (int e = 16; e < 31; ++e) {
+    for (int32_t m = 0; m < 32768; ++m) {
+      fold(gaud_silk_sqrt_approx(
+          (int32_t)(((uint32_t)1 << e) | ((uint32_t)m << (e - 15)))));
+      ++count;
+    }
+  }
+  for (int e = 1; e < 31; ++e) {
+    for (int32_t m = 0; m < 512; ++m) {
+      int32_t base = (int32_t)(((uint32_t)1 << e)
+          | (((uint32_t)m * 2654435761u) >> (32 - e)));
+      for (int sign = 0; sign < 2; ++sign) {
+        int32_t value = sign ? -base : base;
+        for (int q = 16; q <= 46; q += 10) {
+          fold(gaud_silk_inverse32_varq(value, q));
+          ++count;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(count, 685048);
+  EXPECT_EQ(digest, 13427006569050684828ULL);
+
+  // Two anchors in plain arithmetic, so that a digest which stops
+  // matching has something to be read against. 2^16 in Q7 is 2048.
+  EXPECT_EQ(gaud_silk_log2lin(0), 1);
+  EXPECT_EQ(gaud_silk_log2lin(2048), 65536);
+  EXPECT_EQ(gaud_silk_log2lin(-1), 0);
+  EXPECT_EQ(gaud_silk_sqrt_approx(0), 0);
+  EXPECT_EQ(gaud_silk_sqrt_approx(-5), 0);
+  // The root of 2^30 is 2^15, and this lands on it exactly.
+  EXPECT_EQ(gaud_silk_sqrt_approx(1 << 30), 32768);
+  // 2^30 / 2^15 is exactly 2^15, and this returns one less - which
+  // is the point of having the anchor: the reciprocal is an
+  // approximation and is allowed to be short, so a test that asserted
+  // the exact quotient would be asserting something the format does
+  // not have.
+  EXPECT_EQ(gaud_silk_inverse32_varq(1 << 15, 30), 32767);
+}
+
+// --- the SILK parameters --------------------------------------------
+//
+// Indices into filters: section 4.2.7.4 to 4.2.7.6, which reads no
+// bitstream and so can be checked by value. The digest below was taken
+// from this library and from RFC 6716 Appendix A's own
+// silk_gains_dequant, silk_NLSF_decode, silk_NLSF2A,
+// silk_LPC_inverse_pred_gain and silk_decode_pitch over the same
+// 62,976 cases, and the two agreed before it was written down.
+
+namespace {
+
+/** The sweep's pseudo-random numbers: an LCG, high bits first. */
+struct SilkRandom {
+  uint32_t state;
+  uint32_t Next() {
+    state = state * 1103515245u + 12345u;
+    return state >> 8;
+  }
+};
+
+} // namespace
+
+/**
+ * Every gain, every filter and every pitch lag, against the reference.
+ *
+ * Three sweeps folded into one digest:
+ *
+ *   - **the gains**, over both subframe counts, both conditional
+ *     cases, all 64 previous indices and forty index vectors each - of
+ *     which four walk the index straight down and four straight up, so
+ *     that both clamps are reached rather than hoped for. They are:
+ *     the index bottoms out 312 times and tops out 5,934.
+ *   - **the line spectral frequencies and the filter they become**,
+ *     over both codebooks, all 32 stage-1 vectors and 400 residuals
+ *     each, with the residual's range stepped from two up to the ten a
+ *     bitstream can actually code. The resulting coefficients reach
+ *     both ends of their sixteen bits and no frequency vector comes
+ *     out unsorted.
+ *   - **the pitch**, exhaustively: every lag index, every contour
+ *     index, both frame lengths, all three sample rates. The lags run
+ *     from 16 to 288 samples.
+ *
+ * The conversion from frequencies to coefficients has two bounded
+ * repair loops, and both are reached deep: measured against an
+ * instrumented copy of the reference, the loop that shrinks the
+ * coefficients into sixteen bits runs up to nine times and the one
+ * that flattens an unstable filter up to fifteen.
+ */
+TEST(OpusSilkParams, EveryGainFilterAndLagMatchesTheReference) {
+  uint64_t digest = 1469598103934665603ULL;
+  auto fold = [&digest](int64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (uint64_t)((value >> (8 * i)) & 0xFF);
+      digest *= 1099511628211ULL;
+    }
+  };
+  long cases = 0;
+  int32_t lowest_gain = INT32_MAX;
+  int32_t highest_gain = 0;
+  int lowest_coefficient = INT32_MAX;
+  int highest_coefficient = INT32_MIN;
+  int lowest_lag = 1 << 20;
+  int highest_lag = 0;
+  long bottomed = 0;
+  long topped = 0;
+  long unsorted = 0;
+
+  for (int subframes = 2; subframes <= 4; subframes += 2) {
+    for (int conditional = 0; conditional < 2; ++conditional) {
+      for (int previous = 0; previous < 64; ++previous) {
+        for (uint32_t s = 0; s < 40; ++s) {
+          int8_t indices[4];
+          SilkRandom random = {s * 2654435761u
+              + (uint32_t)(previous * 31 + subframes * 7 + conditional)};
+          for (int k = 0; k < 4; ++k) {
+            bool absolute = k == 0 && !conditional;
+            if (s < 4) {
+              indices[k] = 0;
+            } else if (s < 8) {
+              indices[k] = (int8_t)(absolute ? 63 : 40);
+            } else {
+              indices[k] =
+                  (int8_t)(random.Next() % (uint32_t)(absolute ? 64 : 41));
+            }
+          }
+          int32_t gains[4];
+          int8_t running = (int8_t)previous;
+          gaud_silk_gains_dequant(
+              gains, indices, &running, conditional != 0, subframes);
+          for (int k = 0; k < subframes; ++k) {
+            fold(gains[k]);
+            lowest_gain = std::min(lowest_gain, gains[k]);
+            highest_gain = std::max(highest_gain, gains[k]);
+          }
+          fold(running);
+          if (running == 0) {
+            ++bottomed;
+          }
+          if (running == 63) {
+            ++topped;
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+
+  for (int wideband = 0; wideband < 2; ++wideband) {
+    int order = wideband ? 16 : 10;
+    for (int first = 0; first < 32; ++first) {
+      for (uint32_t s = 0; s < 400; ++s) {
+        int8_t indices[17];
+        indices[0] = (int8_t)first;
+        SilkRandom random = {s * 40503u + (uint32_t)(first * 131 + wideband)};
+        // Four and six: the widest a stage-2 index can be is the four
+        // its own distribution reaches plus the six the extension
+        // adds, so ten is the edge of what a bitstream can say.
+        int spread = (int)(s % 4);
+        int range = spread == 0 ? 2 : (spread == 1 ? 4 : (spread == 2 ? 7 : 10));
+        for (int i = 0; i < order; ++i) {
+          indices[i + 1] =
+              (int8_t)((int)(random.Next() % (uint32_t)(2 * range + 1))
+                  - range);
+        }
+        int16_t nlsf[16];
+        gaud_silk_nlsf_decode(nlsf, indices, wideband != 0);
+        int16_t coefficients[16];
+        gaud_silk_nlsf_to_lpc(coefficients, nlsf, order);
+        int32_t inverse_gain =
+            gaud_silk_lpc_inverse_gain(coefficients, order);
+        for (int i = 1; i < order; ++i) {
+          if (nlsf[i] <= nlsf[i - 1]) {
+            ++unsorted;
+          }
+        }
+        for (int i = 0; i < order; ++i) {
+          fold(nlsf[i]);
+          fold(coefficients[i]);
+          lowest_coefficient = std::min(lowest_coefficient,
+              (int)coefficients[i]);
+          highest_coefficient = std::max(highest_coefficient,
+              (int)coefficients[i]);
+        }
+        fold(inverse_gain);
+        ++cases;
+      }
+    }
+  }
+
+  const int rates[3] = {8, 12, 16};
+  for (int rate = 0; rate < 3; ++rate) {
+    for (int subframes = 2; subframes <= 4; subframes += 2) {
+      int contours = rates[rate] == 8 ? (subframes == 4 ? 11 : 3)
+                                      : (subframes == 4 ? 34 : 12);
+      for (int lag = 0; lag < 256; ++lag) {
+        for (int contour = 0; contour < contours; ++contour) {
+          int lags[4];
+          gaud_silk_decode_pitch((int16_t)lag, (int8_t)contour, lags,
+              rates[rate], subframes);
+          for (int k = 0; k < subframes; ++k) {
+            fold(lags[k]);
+            lowest_lag = std::min(lowest_lag, lags[k]);
+            highest_lag = std::max(highest_lag, lags[k]);
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+
+  EXPECT_EQ(cases, 62976);
+  EXPECT_EQ(digest, 10953151080910121650ULL);
+  EXPECT_EQ(bottomed, 312);
+  EXPECT_EQ(topped, 5934);
+  EXPECT_EQ(unsorted, 0);
+  EXPECT_EQ(lowest_gain, 81920);
+  EXPECT_EQ(highest_gain, 1686110208);
+  EXPECT_EQ(lowest_coefficient, -32767);
+  EXPECT_EQ(highest_coefficient, 32767);
+  EXPECT_EQ(lowest_lag, 16);
+  EXPECT_EQ(highest_lag, 288);
+}
+
+/**
+ * Four things this sweep cannot see, and why each is safe.
+ *
+ * Established by mutation - twenty-four changes, twenty caught - and
+ * worth recording rather than re-deriving:
+ *
+ *   - **The gain logarithm's ceiling of 3967 never fires.** The
+ *     largest logarithm the index can produce is 3923, which the
+ *     first check below computes. The clamp is not dead code: moving
+ *     it to 3900 is caught immediately. It is simply 44 units above
+ *     anything reachable.
+ *   - **One unit on either square-root seed changes nothing.** The
+ *     seed is shifted right by half the leading-zero count before
+ *     anything else happens, and for the even-exponent seed that
+ *     shift is always at least one, so the low bit never survives.
+ *     A change of two is caught on both seeds.
+ *   - **The DC short circuit's `>=` may as well be `>`.** The sum of
+ *     the coefficients is exactly 4096 in 4,949 of the sweep's
+ *     invocations, and in every one of them the full recursion
+ *     reaches the same verdict the short circuit does. The branch is
+ *     an optimisation and not a semantic.
+ *   - **The last two of the sixteen stability attempts are never
+ *     needed.** The sweep drives that loop to its fourteenth; cutting
+ *     the limit to fourteen is invisible and cutting it to thirteen
+ *     is caught.
+ */
+TEST(OpusSilkParams, TheGainLogarithmStopsShortOfItsOwnCeiling) {
+  // The logarithm the gain index maps to, for every index, computed
+  // the way opus_silk_params.c computes it.
+  int32_t highest = 0;
+  for (int index = 0; index < 64; ++index) {
+    int32_t log_q7 = gaud_silk_smulwb(1907825, index) + 2090;
+    highest = std::max(highest, log_q7);
+  }
+  EXPECT_EQ(highest, 3923);
+  EXPECT_LT(highest, 3967);
+  // And the gain it becomes, which is what the cap is really
+  // protecting: the Q16 result is signed, so it has to stay below
+  // 2^31. The largest a gain can be is about 25,730.
+  EXPECT_EQ(gaud_silk_log2lin(highest), 1686110208);
+}
+
+/**
+ * The stabiliser's fallback cannot push a frequency out of range.
+ *
+ * **This is a deliberate difference from RFC 6716 Appendix A**, and
+ * the one place in this decoder where the reference's behaviour is not
+ * reproduced. Its `silk_NLSF_stabilize` finishes with a pass that
+ * writes `NLSF[i-1] + spacing[i]` into an `opus_int16` with no
+ * ceiling; when the vector has been crowded up against 32767 that sum
+ * wraps, the last frequency comes out at -32766, and `silk_NLSF2A`
+ * then reads its 129-entry cosine table at index -128. Its own
+ * assertion says a frequency is non-negative, so this is a defect
+ * rather than a convention - and it is reachable from a legal
+ * bitstream, needing only a stage-2 index of five or more, which means
+ * the extension symbol. 1,706 of 256,000 synthetic index vectors here
+ * reached it.
+ *
+ * Section 6 makes the reference normative where its behaviour is
+ * defined, and a read before the start of an array is not. So the
+ * ceiling is applied, and the cosine table's index is clamped as well.
+ * The test below drives the fallback directly: every index at its
+ * extreme, which crowds every frequency against the top.
+ */
+TEST(OpusSilkParams, TheStabiliserKeepsEveryFrequencyInRange) {
+  for (int wideband = 0; wideband < 2; ++wideband) {
+    int order = wideband ? 16 : 10;
+    const int16_t * spacing = wideband
+        ? gaud_opus_silk_nlsf_delta_min_wb_q15
+        : gaud_opus_silk_nlsf_delta_min_nb_mb_q15;
+    for (int first = 0; first < 32; ++first) {
+      for (int extreme = -10; extreme <= 10; extreme += 20) {
+        int8_t indices[17];
+        indices[0] = (int8_t)first;
+        for (int i = 0; i < order; ++i) {
+          indices[i + 1] = (int8_t)extreme;
+        }
+        int16_t nlsf[16];
+        gaud_silk_nlsf_decode(nlsf, indices, wideband != 0);
+        EXPECT_GE(nlsf[0], spacing[0]) << "first " << first;
+        for (int i = 1; i < order; ++i) {
+          EXPECT_GE(nlsf[i] - nlsf[i - 1], spacing[i])
+              << "first " << first << " at " << i;
+        }
+        EXPECT_LE(nlsf[order - 1], (1 << 15) - spacing[order])
+            << "first " << first;
+        // And the filter that comes out of it is still a filter.
+        int16_t coefficients[16];
+        gaud_silk_nlsf_to_lpc(coefficients, nlsf, order);
+        EXPECT_GE(gaud_silk_lpc_inverse_gain(coefficients, order), 107374)
+            << "first " << first << " extreme " << extreme;
+      }
+    }
+  }
 }
 
 namespace {

@@ -174,9 +174,28 @@ typedef struct {
   bool lbrr[SILK_MAX_FRAMES];           ///< Which frames carry it.
   int8_t prev_signal_type;              ///< For the pitch delta's condition.
   int16_t prev_lag_index;               ///< What that delta is against.
+  int8_t prev_gain_index;               ///< What a delta gain is against.
+  int16_t prev_nlsf_q15[SILK_MAX_LPC_ORDER]; ///< What interpolation starts from.
+  bool first_after_reset;               ///< So nothing is interpolated yet.
   SILK_Indices indices;                 ///< The frame just parsed.
   int pulses[SILK_MAX_FRAME_LENGTH];    ///< Its excitation, signed.
 } SILK_Channel;
+
+/**
+ * One frame's filters, which is what the indices named.
+ *
+ * Section 4.2.8 reconstructs a frame from exactly these: a gain per
+ * subframe, two sets of short-term coefficients (the first half of the
+ * frame may use an interpolated set), and for a voiced frame a pitch
+ * lag and a five-tap filter per subframe.
+ */
+typedef struct {
+  int32_t gains_q16[SILK_MAX_SUBFRAMES];   ///< One per subframe, linear.
+  int16_t lpc_q12[2][SILK_MAX_LPC_ORDER];  ///< First half, then second.
+  int pitch[SILK_MAX_SUBFRAMES];           ///< Lags in samples.
+  int16_t ltp_q14[SILK_MAX_SUBFRAMES * SILK_LTP_ORDER]; ///< Five taps each.
+  int16_t ltp_scale_q14;                   ///< How far the history is scaled.
+} SILK_Parameters;
 
 /** Both channels, plus the stereo prediction the mid one is coded under. */
 typedef struct {
@@ -284,6 +303,85 @@ void gaud_silk_decode_pulses(SILK_Channel * channel, OPUS_Range * range);
  *   packet's SILK section.
  */
 void gaud_silk_parse_packet(SILK_Decoder * decoder, OPUS_Range * range);
+
+/**
+ * @brief Turn one frame's indices into its filters. Section 4.2.7.4-6.
+ *
+ * Reads nothing from the bitstream, so it can be checked by value.
+ *
+ * @param channel The channel, whose @c indices this reads and whose
+ *   gain, line-spectral and reset state it carries forward.
+ * @param out Receives the gains, the coefficients, the pitch and the
+ *   long-term filter.
+ * @param coding Which conditional case the frame was coded under,
+ *   which decides whether its first gain is absolute.
+ */
+void gaud_silk_decode_parameters(
+    SILK_Channel * channel, SILK_Parameters * out, SILK_Coding coding);
+
+/**
+ * @brief The subframe gains, from their indices. Section 4.2.7.4.
+ *
+ * @param gains_q16 Receives one linear gain per subframe.
+ * @param indices The decoded indices.
+ * @param previous The running index, read and updated.
+ * @param conditional True when the first index is a delta.
+ * @param subframes 2 or 4.
+ */
+void gaud_silk_gains_dequant(int32_t * gains_q16, const int8_t * indices,
+    int8_t * previous, bool conditional, int subframes);
+
+/**
+ * @brief The line spectral frequencies, from their indices.
+ *
+ * Sections 4.2.7.5.1 to 4.2.7.5.4: the stage-1 vector, the predicted
+ * residual, the weighting, and the repair pass that makes the result
+ * a filter.
+ *
+ * @param nlsf_q15 Receives the frequencies, ascending and spaced.
+ * @param indices The stage-1 index and then one per coefficient.
+ * @param wideband True for the sixteenth-order codebook.
+ */
+void gaud_silk_nlsf_decode(
+    int16_t * nlsf_q15, const int8_t * indices, bool wideband);
+
+/**
+ * @brief Frequencies to prediction coefficients. Section 4.2.7.5.6.
+ *
+ * Including both repair loops: ten attempts at making the result fit
+ * in sixteen bits and sixteen at making it stable.
+ *
+ * @param lpc_q12 Receives @p order coefficients.
+ * @param nlsf_q15 The frequencies.
+ * @param order 10 or 16.
+ */
+void gaud_silk_nlsf_to_lpc(
+    int16_t * lpc_q12, const int16_t * nlsf_q15, int order);
+
+/**
+ * @brief One over the prediction gain, in Q30, or zero if unstable.
+ *
+ * Runs the Levinson recursion backwards to recover the reflection
+ * coefficients; a magnitude at or beyond one means a pole outside the
+ * unit circle.
+ *
+ * @param lpc_q12 The coefficients.
+ * @param order How many.
+ * @return The inverse gain, or 0 for an unstable filter.
+ */
+int32_t gaud_silk_lpc_inverse_gain(const int16_t * lpc_q12, int order);
+
+/**
+ * @brief The pitch lag of each subframe. Section 4.2.7.6.1.
+ *
+ * @param lag_index The frame's primary lag, as an offset from 2 ms.
+ * @param contour_index Which per-subframe offset vector to add.
+ * @param lags Receives one lag per subframe, in samples.
+ * @param fs_khz 8, 12 or 16.
+ * @param subframes 2 or 4.
+ */
+void gaud_silk_decode_pitch(int16_t lag_index, int8_t contour_index,
+    int * lags, int fs_khz, int subframes);
 
 #ifdef __cplusplus
 }
