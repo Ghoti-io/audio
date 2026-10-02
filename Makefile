@@ -326,7 +326,7 @@ INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 # When this library grows corpus and oracle goals, they belong in this list too:
 # they compile and link nothing, and a machine that can regenerate a corpus is
 # not necessarily one with the suite installed.
-DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help \
+DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help opus-vectors \
 	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
@@ -744,8 +744,17 @@ $(VORBIS_PROBE): $(ORACLE)/vorbis_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
+OPUS_PROBE := $(APP_DIR)/oracle/opus_probe$(EXE_EXTENSION)
+
+$(OPUS_PROBE): $(ORACLE)/opus_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET) $(LIBVER_GEN)
+	@printf "\n### Compiling Oracle Probe: opus_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
 oracle-probe: ## Build the probes the differentials drive
-oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE) $(VORBIS_PROBE)
+oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE) $(VORBIS_PROBE) \
+		$(OPUS_PROBE)
 
 oracle-build: ## Build the pinned reference image: ffmpeg, sox, libsndfile, python3, mutagen, flac and opus
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
@@ -788,6 +797,23 @@ check-opus: ## Fail if a reference disagrees about what an Opus stream is
 check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_opus.py
+
+opus-vectors: ## Fetch RFC 6716's conformance vectors (39 MB, deliberate)
+# Separate from the gate that reads them, and for the same reason `corpus`
+# is separate from `check-corpus`: a gate that downloads 39 MB the first
+# time it runs means something different on its first run than on its
+# second. The hash is checked before anything is unpacked.
+	@python3 $(ORACLE)/opus_vectors.py --fetch
+
+check-opus-vectors: ## Fail if we read RFC 6716's conformance vectors wrongly
+# The strictest gate here, once there is a decoder: RFC 6716 section 6
+# requires the same FINAL RANGE DECODER STATE as the reference for every
+# packet, which is an exact integer equality over every symbol a frame
+# contained rather than a tolerance on samples. Until the decoder exists
+# it asserts the framing and the durations, and refuses to stay quiet if
+# GAUD_CAP_DECODE appears while no range state is being compared.
+check-opus-vectors: $(OPUS_PROBE)
+	@GAUD_OPUS_PROBE=$(OPUS_PROBE) python3 $(ORACLE)/check_opus_vectors.py
 
 check-vorbis: ## Fail if a reference disagrees about what a Vorbis stream is
 check-vorbis: $(DUMP_PROBE)
@@ -927,6 +953,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-outoftree check-golden
 .PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
+.PHONY: opus-vectors check-opus-vectors
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
 .PHONY: vorbis-coverage check-opus
