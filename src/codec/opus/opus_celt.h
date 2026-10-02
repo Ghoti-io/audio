@@ -396,6 +396,72 @@ void gaud_celt_decode_final_energy(OPUS_Range * range,
     const int * priority, int32_t left, uint32_t start, uint32_t end,
     uint32_t channels);
 
+/** The widest band, in frame bins: 22 bins of 2.5 ms at `lm = 3`. */
+#define CELT_MAX_BAND_BINS 176
+
+/** Spread: no rotation at all. */
+#define CELT_SPREAD_NONE 0
+
+/** Spread: the weakest rotation, `f_r` of 15. */
+#define CELT_SPREAD_LIGHT 1
+
+/** Spread: `f_r` of 10, and the value a decoder assumes when none is sent. */
+#define CELT_SPREAD_NORMAL 2
+
+/** Spread: the strongest rotation, `f_r` of 5. */
+#define CELT_SPREAD_AGGRESSIVE 3
+
+/**
+ * @brief Scale a band back to unit norm.
+ *
+ * Section 4.3.4.2 leaves the shape vector with whatever length the
+ * pulses gave it; this is what makes it a direction. Used on its own
+ * after folding and after a stereo rotation, where the vector being
+ * normalised did not come from ::gaud_celt_alg_unquant.
+ *
+ * **The energy accumulator is 32 bits and that is a real ceiling.** A
+ * band of @p n entries at full scale sums to `n << 28`, which overflows
+ * past @p n of eight. CELT never gets near it - every vector reaching
+ * here is about unit norm, so the sum is about `2^28` whatever @p n is,
+ * and even an intensity-stereo sum of two of them stays inside - but it
+ * is a property of the input rather than of this code, and RFC 6716
+ * accumulates in 32 bits too. A sweep of full-scale bands finds it
+ * immediately, which is how it came to be written down.
+ *
+ * @param x The band, @p n entries, adjusted in place.
+ * @param n How many bins; at least one.
+ * @param gain The length to give it, in Q15.
+ */
+void gaud_celt_renormalise_vector(int16_t * x, uint32_t n, int16_t gain);
+
+/**
+ * @brief Decode one band's shape: the pulses, normalised and rotated.
+ *
+ * Sections 4.3.4.2 and 4.3.4.3 together, which is how the reference
+ * packages them. Reads one codebook index, turns it into the pulse
+ * vector, scales that to @p gain, and then rotates it to spread the
+ * pulses out - because a handful of pulses in a wide band is a comb
+ * filter, and the rotation turns it back into noise.
+ *
+ * The rotation is by `pi*g_r*g_r/4` where `g_r = N/(N + f_r*K)`, with
+ * `f_r` from @p spread; a band of 8 bins or more per block is rotated
+ * twice, the first time by the complementary angle and at a stride of
+ * `round(sqrt(N/B))`. All of that is section 4.3.4.3's prose, which for
+ * once states the arithmetic completely.
+ *
+ * @param x Receives the band, @p n entries.
+ * @param n How many bins; at least two, at most ::CELT_MAX_BAND_BINS.
+ * @param k How many pulses; at least one.
+ * @param spread One of the four ::CELT_SPREAD_NONE values.
+ * @param blocks How many time blocks the band spans.
+ * @param range The range decoder.
+ * @param gain The length to give the result, in Q15.
+ * @return The collapse mask: a set bit per time block that got a pulse.
+ *   Section 4.3.5 needs it to decide which blocks were emptied.
+ */
+unsigned gaud_celt_alg_unquant(int16_t * x, uint32_t n, uint32_t k,
+    unsigned spread, uint32_t blocks, OPUS_Range * range, int16_t gain);
+
 #ifdef __cplusplus
 }
 #endif

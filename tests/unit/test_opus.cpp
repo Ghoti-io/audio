@@ -2575,6 +2575,461 @@ TEST(OpusMath, EveryFunctionReturnsTheReferencesIntegersAcrossItsDomain) {
 }
 
 
+// ---------------------------------------------------------------------------
+// One band's shape: section 4.3.4.2's pulses, normalised, then 4.3.4.3's
+// rotation.
+//
+// Section 4.3.4.3 is the one part of CELT the prose states completely - the
+// gain, the angle, the 2-D rotation, the order the rotations are applied
+// in, the condition and stride for the second pass. So the transcription
+// can be checked against the document and not only against the source, and
+// that is worth doing because the two disagree. See below.
+
+// The pseudo-random bytes the sweeps below decode from. An LCG rather than
+// anything principled: what matters is only that both this and the probe
+// that compares against RFC 6716's implementation produce the same bytes.
+void FillBits(unsigned seed, std::vector<unsigned char> & out) {
+  unsigned state = seed * 1103515245u + 12345u;
+  for (size_t i = 0; i < out.size(); ++i) {
+    state = state * 1103515245u + 12345u;
+    out[i] = (unsigned char)(state >> 16);
+  }
+}
+
+// V(n,k) in double, so that it can exceed 32 bits and still be compared.
+// CELT splits a band rather than letting its codebook pass 2^32, so a pair
+// that does not fit is not an input alg_unquant ever sees. Asking the
+// library's own V here would be useless: it returns uint32_t, and the
+// answer wraps exactly when this needs to notice that it would.
+bool CodebookFitsIn32Bits(int n, int k) {
+  std::vector<double> row((size_t)k + 1, 2.0);
+  row[0] = 1.0;
+  for (int i = 2; i <= n; ++i) {
+    double previous = row[0];
+    for (int j = 1; j <= k; ++j) {
+      double current = row[(size_t)j];
+      row[(size_t)j] = current + row[(size_t)j - 1] + previous;
+      previous = current;
+    }
+  }
+  return row[(size_t)k] < 4294967296.0;
+}
+
+// Section 4.3.4.3's rotation chain, in double, from the prose.
+//
+// `flip` selects which sign the 2-D rotation uses. The prose prints
+//     x_i' =  cos*x_i + sin*x_j
+//     x_j' = -sin*x_i + cos*x_j
+// and says it applies to "the normalized vector decoded in Section
+// 4.3.4.2" - the decoder's vector. It does not: that matrix is the
+// *encoder's*, and the decoder applies its inverse. Negating the sine
+// turns one into the other, and with that one change the formula
+// reproduces the reference decoder to the last bit of a double. A test
+// below pins both halves of that, so neither the correction nor the
+// discrepancy can be quietly lost.
+void ProseRotate(double * x, int len, int stride, double c, double s) {
+  for (int i = 0; i < len - stride; ++i) {
+    double xi = x[i];
+    double xj = x[i + stride];
+    x[i] = c * xi + s * xj;
+    x[i + stride] = -s * xi + c * xj;
+  }
+  for (int i = len - 2 * stride - 1; i >= 0; --i) {
+    double xi = x[i];
+    double xj = x[i + stride];
+    x[i] = c * xi + s * xj;
+    x[i + stride] = -s * xi + c * xj;
+  }
+}
+
+// The whole of section 4.3.4.3 applied to an already-normalised band.
+void ProseSpread(double * x, int n, int k, int blocks, int spread, bool as_printed) {
+  static const int kFactor[4] = {0, 15, 10, 5};
+  if (spread == CELT_SPREAD_NONE || 2 * k >= n) {
+    return;
+  }
+  double gain = (double)n / (double)(n + kFactor[spread] * k);
+  double theta = 3.14159265358979323846 * gain * gain / 4.0;
+  double c = std::cos(theta);
+  double s = std::sin(theta);
+  int stride2 = 0;
+  if (n >= 8 * blocks) {
+    // round(sqrt(n/blocks)), which is what the reference's counting loop
+    // computes; `blocks >> 2` in that loop cannot change the answer while
+    // n is a multiple of blocks, which in CELT it always is.
+    stride2 = 1;
+    while ((stride2 * stride2 + stride2) * blocks + (blocks >> 2) < n) {
+      ++stride2;
+    }
+  }
+  int len = n / blocks;
+  double sign = as_printed ? 1.0 : -1.0;
+  for (int i = 0; i < blocks; ++i) {
+    // The wide pass is first and uses the complementary angle.
+    if (stride2 != 0) {
+      ProseRotate(x + i * len, len, stride2, s, sign * c);
+    }
+    ProseRotate(x + i * len, len, 1, c, sign * s);
+  }
+}
+
+// The band sizes and pulse counts a split can hand alg_unquant, and the
+// gains quant_all_bands forms. 176 is the widest band there is: 22 bins of
+// 2.5 ms at the longest frame.
+const int kShapeN[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24,
+    28, 32, 36, 40, 44, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 176};
+const int kShapeK[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 20, 24, 32, 40,
+    48, 64, 80, 96, 112, 128};
+const int16_t kShapeGain[] = {32767, 23170, 16384, 8192, 1};
+
+TEST(OpusShape, EveryBandDecodesToTheReferencesVector) {
+  // As with the math primitives, this digest is RFC 6716's own answer: it
+  // was computed from Appendix A's alg_unquant and from this one over the
+  // identical sweep, and the two agreed before it was written down. The
+  // fold takes the whole band, the collapse mask, and the bit position
+  // afterwards - so a shape that is right but costs the wrong number of
+  // bits fails too, which is the failure that would desynchronise a frame.
+  uint64_t digest = 1469598103934665603ull;
+  std::vector<unsigned char> bits(4096);
+  std::vector<int16_t> x(256);
+  OPUS_Range range;
+  unsigned long cases = 0;
+  unsigned long skipped = 0;
+  for (int n : kShapeN) {
+    for (int k : kShapeK) {
+      if (!CodebookFitsIn32Bits(n, k)) {
+        ++skipped;
+        continue;
+      }
+      for (int blocks = 1; blocks <= 16; blocks <<= 1) {
+        if (n % blocks != 0) {
+          continue;
+        }
+        for (int spread = 0; spread <= 3; ++spread) {
+          for (int g = 0; g < 5; ++g) {
+            for (int seed = 0; seed < 3; ++seed) {
+              FillBits((unsigned)(n * 7919 + k * 104729 + blocks * 31
+                           + spread * 17 + g * 5 + seed),
+                  bits);
+              gaud_opus_range_init(&range, bits.data(), bits.size());
+              unsigned mask = gaud_celt_alg_unquant(x.data(), (uint32_t)n,
+                  (uint32_t)k, (unsigned)spread, (uint32_t)blocks, &range,
+                  kShapeGain[g]);
+              for (int i = 0; i < n; ++i) {
+                digest = Fnv1a(digest, x[(size_t)i]);
+              }
+              digest = Fnv1a(Fnv1a(digest, mask), gaud_opus_tell_frac(&range));
+              ++cases;
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 54060u);
+  EXPECT_EQ(skipped, 378u);
+  EXPECT_EQ(digest, 0x5F473D65B31F1BB2ull);
+}
+
+TEST(OpusShape, RenormalisationMatchesTheReference) {
+  // alg_unquant never calls this; folding and the stereo rotation do, and
+  // neither is written yet. Checked now because the reference is to hand.
+  static const int16_t kGain[] = {32767, 23170, 16384, 1};
+  uint64_t digest = 1469598103934665603ull;
+  std::vector<int16_t> x(256);
+  unsigned long cases = 0;
+  for (int n : kShapeN) {
+    for (int s = 0; s < 24; ++s) {
+      for (int g = 0; g < 4; ++g) {
+        unsigned state = (unsigned)(n * 31 + s * 7919 + g * 17) * 1103515245u
+            + 12345u;
+        // s == 0 is the all-zero band, which is the case the reference's
+        // EPSILON exists for: without it the logarithm has no argument.
+        // The rest sweep the magnitude down from full scale to one,
+        // because that constant only changes the *answer* on a band whose
+        // energy is small enough for it to survive the normalising shift -
+        // on a loud band it is shifted straight back out, and a sweep of
+        // loud bands alone cannot tell it is there.
+        int shift = (s == 0) ? 0 : (s - 1) % 15;
+        // Divide down to keep the band near unit norm, which here is
+        // 16384. A band of n full-scale entries has an energy of n*2^28,
+        // and the int32 accumulator - int32 in the reference too -
+        // overflows past n of 8. So a sweep of full-scale bands would be
+        // testing arithmetic CELT never performs, and reaching it through
+        // undefined behaviour; UBSan said so.
+        int divisor = 1;
+        while (divisor * divisor < n) {
+          ++divisor;
+        }
+        for (int i = 0; i < n; ++i) {
+          state = state * 1103515245u + 12345u;
+          x[(size_t)i] = (s == 0)
+              ? (int16_t)0
+              : (int16_t)(((((int)(state >> 17) - 16384) / divisor)) >> shift);
+        }
+        gaud_celt_renormalise_vector(x.data(), (uint32_t)n, kGain[g]);
+        for (int i = 0; i < n; ++i) {
+          digest = Fnv1a(digest, x[(size_t)i]);
+        }
+        ++cases;
+      }
+    }
+  }
+  EXPECT_EQ(cases, 3072u);
+  EXPECT_EQ(digest, 0x0542717F7F4C3804ull);
+}
+
+TEST(OpusShape, TheRotationIsTheProsesWithItsSineNegated) {
+  // The independent reading: section 4.3.4.3's own arithmetic, in double.
+  // Two things are asserted and the second is what makes the first mean
+  // anything - the formula *as printed* does not reproduce the decoder, so
+  // a transcription that silently followed the document would fail here.
+  std::vector<unsigned char> bits(4096);
+  std::vector<int16_t> rotated(256);
+  std::vector<int16_t> plain(256);
+  std::vector<double> model(256);
+  OPUS_Range range;
+  double worst_corrected = 0.0;
+  double worst_as_printed = 0.0;
+  unsigned long cases = 0;
+  for (int n : kShapeN) {
+    for (int k : kShapeK) {
+      if (!CodebookFitsIn32Bits(n, k)) {
+        continue;
+      }
+      for (int blocks = 1; blocks <= 8; blocks <<= 1) {
+        if (n % blocks != 0) {
+          continue;
+        }
+        for (int spread = 1; spread <= 3; ++spread) {
+          FillBits((unsigned)(n * 7919 + k * 104729 + blocks * 31 + spread * 17),
+              bits);
+          // The same band without any rotation is the model's input.
+          gaud_opus_range_init(&range, bits.data(), bits.size());
+          gaud_celt_alg_unquant(plain.data(), (uint32_t)n, (uint32_t)k,
+              CELT_SPREAD_NONE, (uint32_t)blocks, &range, 32767);
+          gaud_opus_range_init(&range, bits.data(), bits.size());
+          gaud_celt_alg_unquant(rotated.data(), (uint32_t)n, (uint32_t)k,
+              (unsigned)spread, (uint32_t)blocks, &range, 32767);
+          for (bool as_printed : {false, true}) {
+            // CELT's unit vector is 16384, not 32768.
+            for (int i = 0; i < n; ++i) {
+              model[(size_t)i] = plain[(size_t)i] / 16384.0;
+            }
+            ProseSpread(model.data(), n, k, blocks, spread, as_printed);
+            double worst = 0.0;
+            for (int i = 0; i < n; ++i) {
+              worst = std::max(worst,
+                  std::fabs(rotated[(size_t)i] / 16384.0 - model[(size_t)i]));
+            }
+            if (as_printed) {
+              worst_as_printed = std::max(worst_as_printed, worst);
+            } else {
+              worst_corrected = std::max(worst_corrected, worst);
+            }
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+  EXPECT_GT(cases, 1000u);
+  // Measured: 6.02e-4 per entry of a unit vector, which is the 16-bit
+  // arithmetic and nothing else.
+  EXPECT_LT(worst_corrected, 6.1e-4);
+  // And as the document prints it, up to 1.99 out on a unit vector - the
+  // whole vector inverted, not a rounding difference.
+  EXPECT_GT(worst_as_printed, 1.0);
+}
+
+TEST(OpusShape, TheRotationKeepsTheLengthItWasGiven) {
+  // The chain is orthogonal, so whatever normalise_residual produced must
+  // survive it. This is independent of the reference and of the prose: a
+  // sign error inside one 2-D rotation leaves it true, but a scale error
+  // anywhere does not.
+  std::vector<unsigned char> bits(4096);
+  std::vector<int16_t> x(256);
+  OPUS_Range range;
+  double lowest = 1e9;
+  double highest = 0.0;
+  for (int n : kShapeN) {
+    for (int k : kShapeK) {
+      if (!CodebookFitsIn32Bits(n, k)) {
+        continue;
+      }
+      for (int blocks = 1; blocks <= 8; blocks <<= 1) {
+        if (n % blocks != 0) {
+          continue;
+        }
+        for (int spread = 0; spread <= 3; ++spread) {
+          FillBits((unsigned)(n * 7919 + k * 104729 + blocks * 31 + spread * 17),
+              bits);
+          gaud_opus_range_init(&range, bits.data(), bits.size());
+          gaud_celt_alg_unquant(x.data(), (uint32_t)n, (uint32_t)k,
+              (unsigned)spread, (uint32_t)blocks, &range, 32767);
+          double energy = 0.0;
+          for (int i = 0; i < n; ++i) {
+            double v = x[(size_t)i] / 16384.0;
+            energy += v * v;
+          }
+          double norm = std::sqrt(energy);
+          lowest = std::min(lowest, norm);
+          highest = std::max(highest, norm);
+        }
+      }
+    }
+  }
+  // Measured: 0.99933 to 1.00101 in CELT's own units, where one is 16384.
+  EXPECT_GT(lowest, 0.9990);
+  EXPECT_LT(highest, 1.0015);
+}
+
+TEST(OpusShape, ADenseBandIsLeftAloneWhateverTheSpreadSays) {
+  // Rotating a band whose pulses already fill half its bins would only
+  // blur it, so the rotation is skipped - and then all four spread values
+  // have to agree, including the two that are not CELT_SPREAD_NONE.
+  std::vector<unsigned char> bits(4096);
+  std::vector<int16_t> reference(256);
+  std::vector<int16_t> x(256);
+  OPUS_Range range;
+  unsigned long dense = 0;
+  unsigned long sparse_and_different = 0;
+  for (int n : kShapeN) {
+    for (int k : kShapeK) {
+      if (!CodebookFitsIn32Bits(n, k)) {
+        continue;
+      }
+      FillBits((unsigned)(n * 7919 + k * 104729), bits);
+      gaud_opus_range_init(&range, bits.data(), bits.size());
+      gaud_celt_alg_unquant(reference.data(), (uint32_t)n, (uint32_t)k,
+          CELT_SPREAD_NONE, 1u, &range, 32767);
+      for (int spread = 1; spread <= 3; ++spread) {
+        gaud_opus_range_init(&range, bits.data(), bits.size());
+        gaud_celt_alg_unquant(x.data(), (uint32_t)n, (uint32_t)k,
+            (unsigned)spread, 1u, &range, 32767);
+        bool same = std::equal(x.begin(), x.begin() + n, reference.begin());
+        if (2 * k >= n) {
+          EXPECT_TRUE(same) << "dense band rotated: n=" << n << " k=" << k
+                            << " spread=" << spread;
+          ++dense;
+        } else if (!same) {
+          ++sparse_and_different;
+        }
+      }
+    }
+  }
+  // Both arms have to be populated or this says nothing: a function that
+  // never rotated anything would satisfy the first on its own.
+  EXPECT_GT(dense, 300u);
+  EXPECT_GT(sparse_and_different, 300u);
+}
+
+TEST(OpusShape, TheCollapseMaskNamesTheBlocksThatGotAPulse) {
+  // Section 4.3.5 needs this two stages later, to find the time blocks
+  // that ended with no energy. With the rotation off, the mask is directly
+  // checkable: a block is in it exactly when the band is nonzero there.
+  std::vector<unsigned char> bits(4096);
+  std::vector<int16_t> x(256);
+  OPUS_Range range;
+  unsigned long with_an_empty_block = 0;
+  for (int n : kShapeN) {
+    for (int k : kShapeK) {
+      if (!CodebookFitsIn32Bits(n, k)) {
+        continue;
+      }
+      for (int blocks = 1; blocks <= 16; blocks <<= 1) {
+        if (n % blocks != 0 || n / blocks < 1) {
+          continue;
+        }
+        for (int seed = 0; seed < 4; ++seed) {
+          FillBits((unsigned)(n * 7919 + k * 104729 + blocks * 31 + seed), bits);
+          gaud_opus_range_init(&range, bits.data(), bits.size());
+          unsigned mask = gaud_celt_alg_unquant(x.data(), (uint32_t)n,
+              (uint32_t)k, CELT_SPREAD_NONE, (uint32_t)blocks, &range, 32767);
+          // At least one pulse was coded, so at least one block is in it.
+          ASSERT_NE(mask, 0u) << "n=" << n << " k=" << k << " B=" << blocks;
+          ASSERT_LT(mask, 1u << blocks);
+          if (blocks == 1) {
+            EXPECT_EQ(mask, 1u);
+            continue;
+          }
+          int per_block = n / blocks;
+          for (int b = 0; b < blocks; ++b) {
+            bool nonzero = false;
+            for (int j = 0; j < per_block; ++j) {
+              nonzero = nonzero || x[(size_t)(b * per_block + j)] != 0;
+            }
+            EXPECT_EQ(((mask >> b) & 1u) != 0u, nonzero)
+                << "n=" << n << " k=" << k << " B=" << blocks << " block=" << b;
+            if (!nonzero) {
+              ++with_an_empty_block;
+            }
+          }
+        }
+      }
+    }
+  }
+  // An empty block is the case section 4.3.5 exists for, so the sweep has
+  // to produce some or the assertion above is only ever checking ones.
+  EXPECT_GT(with_an_empty_block, 100u);
+}
+
+
+TEST(OpusShape, TheWideStrideIsTheRoundedSquareRootTheProseAsksFor) {
+  // This one tests arithmetic rather than code, and says so. The reference
+  // finds the wide-pass stride by counting up - the largest s with
+  // (s*s+s)*B + (B>>2) < N - where section 4.3.4.3 simply says
+  // "round(sqrt(N/nb_blocks))". The two agree, which is what licenses
+  // reading the loop as that formula.
+  //
+  // It also settles the `B >> 2` term, which is the one mutation of the
+  // shape coder that no test catches: with N a multiple of B, as CELT
+  // always has it, removing it changes nothing. That is not luck. The left
+  // side moves in steps of B and the term is below B, so it can never
+  // cross the comparison. Where N is *not* a multiple of B it does matter,
+  // which is why it is in the reference and stays here.
+  unsigned long multiples = 0;
+  unsigned long multiples_affected = 0;
+  unsigned long others = 0;
+  unsigned long others_affected = 0;
+  for (int blocks = 1; blocks <= 64; ++blocks) {
+    for (int n = 8 * blocks; n <= 2048; ++n) {
+      int with_term = 1;
+      while ((with_term * with_term + with_term) * blocks + (blocks >> 2) < n) {
+        ++with_term;
+      }
+      int without_term = 1;
+      while ((without_term * without_term + without_term) * blocks < n) {
+        ++without_term;
+      }
+      if (n % blocks == 0) {
+        ++multiples;
+        if (with_term != without_term) {
+          ++multiples_affected;
+        }
+        // round(sqrt(n/blocks)), as the prose puts it.
+        double want = (double)n / (double)blocks;
+        int rounded = 1;
+        while ((rounded + 0.5) * (rounded + 0.5) < want) {
+          ++rounded;
+        }
+        EXPECT_EQ(with_term, rounded) << "N=" << n << " B=" << blocks;
+      } else {
+        ++others;
+        if (with_term != without_term) {
+          ++others_affected;
+        }
+      }
+    }
+  }
+  EXPECT_GT(multiples, 9000u);
+  EXPECT_EQ(multiples_affected, 0u);
+  // The control: the term is not vacuous, only unreachable from here.
+  EXPECT_GT(others_affected, 2000u);
+  EXPECT_GT(others, 100000u);
+}
+
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
