@@ -73,6 +73,8 @@ PROBE = {
     "pywave": (["pywave-version"], "Python 3.13.5 wave"),
     "mutagen": (["mutagen-version"], "mutagen 1.47.0"),
     "flac": (["flac-version"], "flac 1.5.0"),
+    "opusdec": (["opusdec-version"], "opusdec 1.5.2"),
+    "opus_compare": (["opus-compare-version"], "opus_compare 1.5.2"),
 }
 
 # Which implementation each reference actually answers a FLAC question with.
@@ -94,6 +96,40 @@ FLAC_ENGINE = {
     "sox": "libFLAC",
     "libsndfile": "libFLAC",
     "flac": "libFLAC",
+}
+
+# The same question for Vorbis, where it has a different answer and a
+# sharper edge.
+#
+# **libsndfile reaches Vorbis through libvorbis**, so it and anything else
+# built on libvorbis are one implementation; ffmpeg's native decoder is a
+# second. That much is FLAC's shape again. What is not is that **ffmpeg's
+# own two Vorbis decoders are two implementations for sample values and
+# one reading for the length** - `-c:a vorbis` and `-c:a libvorbis` differ
+# by up to 2 of 32,768 on most samples, and agree exactly on how many
+# samples there are, because the trim is applied in the Ogg demuxer they
+# share. A gate that wanted two readings of a *length* out of ffmpeg
+# would get one. planning/audio.md section 11.25.
+VORBIS_ENGINE = {
+    "ffmpeg": "ffmpeg-native",
+    "libsndfile": "libvorbis",
+    "sox": "libvorbis",
+}
+
+# And for Opus, where the count is two and both are real.
+#
+# libavcodec has a native Opus decoder as well as a libopus wrapper, and
+# `-c:a opus` selects the native one - so ffmpeg and opusdec are two
+# implementations in the way phase 5's two MPEG decoders were. The third
+# name here is not a third implementation and is not meant to be:
+# `opus_compare` is libopus's own conformance tool, which is the point of
+# it. RFC 6716 defines a conforming decoder as one whose output that tool
+# accepts, so it answers a different question from either decoder rather
+# than the same question a third time.
+OPUS_ENGINE = {
+    "ffmpeg": "ffmpeg-native",
+    "opusdec": "libopus",
+    "opus_compare": "libopus-conformance",
 }
 
 

@@ -34,4 +34,5 @@ void gaud_register_builtin_codecs(void) {
   gaud_ogg_flac_register();
   gaud_mp3_register();
   gaud_vorbis_register();
+  gaud_opus_register();
 }

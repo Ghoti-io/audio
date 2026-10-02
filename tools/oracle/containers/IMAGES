@@ -49,16 +49,36 @@
 # Building it:
 #   make oracle-build
 
-ffmpeg	localhost/ghoti-audio-oracle-refs:deb13	ffmpeg 7.1.5	libavformat's RIFF and IFF demuxers; the most widely deployed reader of both formats
-sox	localhost/ghoti-audio-oracle-refs:deb13	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
-libsndfile	localhost/ghoti-audio-oracle-refs:deb13	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
-pywave	localhost/ghoti-audio-oracle-refs:deb13	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
-mutagen	localhost/ghoti-audio-oracle-refs:deb13	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
-flac	localhost/ghoti-audio-oracle-refs:deb13	flac 1.5.0	The format's own reference implementation. `flac -t` verifies a file's STREAMINFO MD5, which scores the whole decoder at once; libFLAC underneath is also what sox and libsndfile answer FLAC questions with
+ffmpeg	localhost/ghoti-audio-oracle-refs:deb13-2	ffmpeg 7.1.5	libavformat's RIFF and IFF demuxers; the most widely deployed reader of both formats
+sox	localhost/ghoti-audio-oracle-refs:deb13-2	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
+libsndfile	localhost/ghoti-audio-oracle-refs:deb13-2	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
+pywave	localhost/ghoti-audio-oracle-refs:deb13-2	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
+mutagen	localhost/ghoti-audio-oracle-refs:deb13-2	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
+flac	localhost/ghoti-audio-oracle-refs:deb13-2	flac 1.5.0	The format's own reference implementation. `flac -t` verifies a file's STREAMINFO MD5, which scores the whole decoder at once; libFLAC underneath is also what sox and libsndfile answer FLAC questions with
+opusdec	localhost/ghoti-audio-oracle-refs:deb13-2	opusdec 1.5.2	libopus through opus-tools' front end - the implementation RFC 6716 defines conformance against. The *libopus* version is pinned and not opus-tools', because libopus is what decides an answer
+opus_compare	localhost/ghoti-audio-oracle-refs:deb13-2	opus_compare 1.5.2	**The only normative reference in this image.** RFC 6716 defines a conforming decoder as one whose output this tool accepts, so it answers pass or fail rather than a number to argue about. Built from the libopus source of the same snapshot, because Debian packages the library and not this one file
 
 # Not here yet:
 #   afconvert  Apple's own, and the reference that decides what AIFF-C really
 #              means. It is macOS-only, so it cannot live in this image; when
 #              something turns on a disagreement about AIFF-C it will have to
 #              be run by hand and its answer committed.
-#   opusdec    Phase 6 brings the codec it answers about.
+# Raised to deb13-2 by phase 6, which added the two Opus lines above.
+# §11.13's rule applies to them as it does to FLAC's four: **for Opus the
+# count is two, and the second is inside ffmpeg** - libavcodec has a
+# native Opus decoder as well as a libopus wrapper, and `-c:a opus`
+# selects the native one. opusdec and ffmpeg are therefore two
+# implementations in the way phase 5's two MPEG decoders were.
+#
+# Phase 6's own trap was a different shape and is about Vorbis: ffmpeg's
+# two Vorbis decoders are two implementations for sample *values* and one
+# reading for the *length*, because the trim happens in the demuxer they
+# share. And libsndfile *wraps* on an int16 overflow where ffmpeg clips,
+# so the two swap round between the two questions. planning/audio.md
+# §§11.25 and 11.29.
+#
+# Not here, and deliberately:
+#   oggdec     vorbis-tools' decoder, which is libvorbis - the same
+#              implementation libsndfile already answers Vorbis questions
+#              with. A third name for a second implementation is what
+#              §11.13 is about; it would add a row and no information.

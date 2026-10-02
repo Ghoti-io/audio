@@ -1,0 +1,14 @@
+#!/bin/sh
+# "opus_compare <libopus version>".
+#
+# The tool itself prints no version: it is one self-contained file from
+# the libopus source and has no banner. So the build records which
+# source it came from and this reads that back, after checking the
+# binary actually runs - which its usage line on stderr is the only
+# evidence of.
+#
+# **Printing the recorded version without running the binary would be a
+# version check that passes on a missing tool**, which is the shape of
+# check this file exists to avoid.
+opus_compare 2>&1 | grep -q '^Usage: ' || exit 1
+printf 'opus_compare %s\n' "$(cat /usr/local/share/opus-compare-version)"

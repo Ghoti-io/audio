@@ -269,6 +269,7 @@
 #define gaud_mp3_register GHOTIIO_AUDIO(gaud_mp3_register)
 #define gaud_ogg_flac_register GHOTIIO_AUDIO(gaud_ogg_flac_register)
 #define gaud_vorbis_register GHOTIIO_AUDIO(gaud_vorbis_register)
+#define gaud_opus_register GHOTIIO_AUDIO(gaud_opus_register)
 #define gaud_codec_has GHOTIIO_AUDIO(gaud_codec_has)
 #define gaud_register_builtin_codecs \
   GHOTIIO_AUDIO(gaud_register_builtin_codecs)

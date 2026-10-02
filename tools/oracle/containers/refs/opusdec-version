@@ -1,0 +1,8 @@
+#!/bin/sh
+# "opusdec <libopus version>", and the *libopus* version rather than
+# opus-tools', because libopus is what decides an answer: opusdec is a
+# front end and its own version moves separately. The banner reads
+# "opusdec opus-tools 0.2 (using libopus 1.5.2)", so the libopus number
+# is the last field with its closing parenthesis stripped.
+opusdec --version 2>&1 | head -1 \
+  | sed 's/.*using libopus \([^)]*\)).*/opusdec \1/'

@@ -88,15 +88,34 @@ TARGETS = {
 #: decode to hash. **Named rather than filtered by extension**: an
 #: exclusion that is a missing glob is the most invisible kind there is.
 #:
-#: **Empty again, and that is the whole of what two phases have recorded
-#: here.** It held one entry in phase 5 - MPEG-2.5 Layer III, refused
-#: because its scalefactor band tables are in no standard - and ten in
-#: phase 6, the Vorbis fixtures, between identification landing and the
-#: decoder landing. Emptying it both times is the direction that means
-#: anything: the denominator went up rather than the numerator. The set
-#: stays because the next refusal wants naming here rather than
-#: filtering silently.
-UNDECODABLE = set()
+#: It held one entry in phase 5 - MPEG-2.5 Layer III, refused because its
+#: scalefactor band tables are in no standard - and ten in phase 6, the
+#: Vorbis fixtures, between identification landing and the decoder
+#: landing. Emptying it both times is the direction that means anything:
+#: the denominator went up rather than the numerator.
+#:
+#: It now holds the fifteen Opus fixtures, for the third turn of the same
+#: cycle. They are named here rather than left out of ::EXTENSIONS,
+#: because a hole that is a missing glob is one nobody can see - which
+#: this file said before phase 6 and was then caught by twice over, once
+#: in its own extension list and once in the shell script below.
+UNDECODABLE = {
+    "opus_celt_5dot1.opus",
+    "opus_celt_lowdelay_2ms5.opus",
+    "opus_celt_mono_60ms.opus",
+    "opus_celt_mono_swb.opus",
+    "opus_celt_silence.opus",
+    "opus_celt_stereo_10ms.opus",
+    "opus_celt_stereo_96k.opus",
+    "opus_hybrid_mono_fb.opus",
+    "opus_hybrid_mono_swb.opus",
+    "opus_silk_mono_40ms.opus",
+    "opus_silk_mono_mb.opus",
+    "opus_silk_mono_nb.opus",
+    "opus_silk_mono_wb.opus",
+    "opus_silk_stereo_60ms.opus",
+    "opus_tagged_stereo.opus",
+}
 
 #: Every extension the corpus holds that this gate reasons about. A file
 #: with an extension not in here is not excluded - it is invisible, which
@@ -108,8 +127,8 @@ UNDECODABLE = set()
 #: it - so ten fixtures were expected on the target, never decoded there,
 #: and reported as "did not happen there". A missing glob again, ten
 #: lines below the comment saying so.
-EXTENSIONS = (".wav", ".aiff", ".aifc", ".flac", ".oga", ".ogg", ".mp3",
-              ".mp2", ".mp1")
+EXTENSIONS = (".wav", ".aiff", ".aifc", ".flac", ".oga", ".ogg", ".opus",
+              ".mp3", ".mp2", ".mp1")
 
 
 def fixtures():
@@ -292,6 +311,9 @@ def main():
               "not in that number:" % len(UNDECODABLE))
         for name in sorted(UNDECODABLE):
             print("  %s" % name)
+        print("  Named rather than left out of the extension list,"
+              " because a hole that is a missing glob is one nobody can"
+              " see.")
     return 0
 
 

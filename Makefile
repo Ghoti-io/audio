@@ -707,7 +707,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 # and could not find the disagreement the whole arrangement exists to find.
 
 ORACLE := tools/oracle
-ORACLE_IMAGE := localhost/ghoti-audio-oracle-refs:deb13
+ORACLE_IMAGE := localhost/ghoti-audio-oracle-refs:deb13-2
 
 # Both probes are built like an example - the static archive whole - so each
 # binary carries the code under test rather than whatever is installed.
@@ -747,7 +747,7 @@ $(VORBIS_PROBE): $(ORACLE)/vorbis_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 oracle-probe: ## Build the probes the differentials drive
 oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE) $(VORBIS_PROBE)
 
-oracle-build: ## Build the pinned ffmpeg, sox, libsndfile, python3, mutagen and flac image
+oracle-build: ## Build the pinned reference image: ffmpeg, sox, libsndfile, python3, mutagen, flac and opus
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if none would
@@ -783,6 +783,11 @@ check-mpeg-input: $(DUMP_PROBE)
 vorbis-coverage: ## Count which arms of the Vorbis setup parser the corpus reaches
 vorbis-coverage: $(VORBIS_PROBE)
 	@GAUD_VORBIS_PROBE=$(VORBIS_PROBE) python3 $(ORACLE)/vorbis_coverage.py
+
+check-opus: ## Fail if a reference disagrees about what an Opus stream is
+check-opus: $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
+		python3 $(ORACLE)/check_opus.py
 
 check-vorbis: ## Fail if a reference disagrees about what a Vorbis stream is
 check-vorbis: $(DUMP_PROBE)
@@ -924,7 +929,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: check-fixtures corpus check-corpus check-writer flac-coverage
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
-.PHONY: vorbis-coverage
+.PHONY: vorbis-coverage check-opus
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands

@@ -827,6 +827,113 @@ def mpeg_make(path, codec, channels, rate, frames, signal, flags):
     os.remove(raw)
 
 
+# Phase 6's Opus fixtures. **One encoder, and that is the format rather
+# than a gap**: libopus is the only Opus encoder that exists in any
+# meaningful sense, and RFC 6716 defines conformance against libopus's
+# own decoder anyway - so a second writer would be a second front end to
+# the same coder.
+#
+# What varies instead is the *mode*, which is the axis Opus has and
+# nothing else here does. A packet is SILK, CELT, or both at once, chosen
+# by one of 32 configurations in its first byte, and the choice can
+# change from packet to packet. The three are three coders:
+#
+#   SILK    linear prediction, for speech. Narrow, medium and wide band,
+#           at 10, 20, 40 and 60 ms.
+#   CELT    a transform coder, for music. The only mode below 10 ms.
+#   hybrid  SILK below 8 kHz and CELT above it, at 10 and 20 ms.
+#
+# The encoder is steered into each by `-application` and `-cutoff`
+# together - the application chooses the coder it prefers and the cutoff
+# chooses the bandwidth, and the two decide the configuration between
+# them. The configuration each case actually produced is asserted in the
+# unit tests rather than hoped for, because a libopus upgrade may choose
+# differently and the corpus would lose an arm silently.
+#
+#   name, channels, frames, signal, extra encoder flags
+OPUS_CASES = [
+    # CELT, full band, 20 ms - what music at a normal rate becomes.
+    ("opus_celt_stereo_96k", 2, 9600, "tone",
+     ["-b:a", "96k", "-application", "audio"]),
+    # CELT at 2.5 ms, the shortest frame the format has, and the only
+    # one SILK cannot code at all.
+    ("opus_celt_lowdelay_2ms5", 2, 9600, "noisestereo",
+     ["-b:a", "128k", "-application", "lowdelay",
+      "-frame_duration", "2.5"]),
+    ("opus_celt_stereo_10ms", 2, 9600, "tone",
+     ["-b:a", "96k", "-frame_duration", "10"]),
+    # CELT super-wide rather than full band.
+    ("opus_celt_mono_swb", 1, 9600, "tone",
+     ["-b:a", "48k", "-cutoff", "12000"]),
+    # SILK at each of its three bandwidths, which are three different
+    # sets of linear prediction tables.
+    ("opus_silk_mono_nb", 1, 9600, "tone",
+     ["-b:a", "12k", "-application", "voip", "-cutoff", "4000"]),
+    ("opus_silk_mono_mb", 1, 9600, "tone",
+     ["-b:a", "16k", "-application", "voip", "-cutoff", "6000"]),
+    ("opus_silk_mono_wb", 1, 9600, "tone",
+     ["-b:a", "20k", "-application", "voip", "-cutoff", "8000"]),
+    # SILK's two long frames. 40 and 60 ms are coded as two and three
+    # 20 ms subframes inside one frame, which is a different thing from
+    # a packet holding several frames.
+    ("opus_silk_mono_40ms", 1, 9600, "tone",
+     ["-b:a", "20k", "-application", "voip", "-cutoff", "8000",
+      "-frame_duration", "40"]),
+    ("opus_silk_stereo_60ms", 2, 9600, "noisestereo",
+     ["-b:a", "24k", "-application", "voip", "-cutoff", "8000",
+      "-frame_duration", "60"]),
+    # Hybrid, both of its bandwidths: SILK below 8 kHz and CELT above,
+    # in one packet, which is the mode with no analogue anywhere else.
+    ("opus_hybrid_mono_swb", 1, 9600, "tone",
+     ["-b:a", "32k", "-application", "voip", "-cutoff", "12000"]),
+    ("opus_hybrid_mono_fb", 1, 9600, "tone",
+     ["-b:a", "24k", "-application", "voip"]),
+    # **A packet of several frames**, which is framing code 3 - the
+    # arbitrary one, with a count and two flags. Every case above is
+    # code 0, one frame per packet, so this is the only fixture that
+    # reaches the other three quarters of the framing.
+    ("opus_celt_mono_60ms", 1, 9600, "tone",
+     ["-b:a", "24k", "-frame_duration", "60"]),
+    # Six channels, which is channel mapping family 1 - and family 1's
+    # channel order is Vorbis's, so the same permutation applies.
+    ("opus_celt_5dot1", 6, 4800, "tone",
+     ["-b:a", "256k", "-application", "audio"]),
+    # Silence, for the arms a packet with no energy takes.
+    ("opus_celt_silence", 2, 4800, "silence",
+     ["-b:a", "64k", "-application", "audio"]),
+]
+
+
+def opus_make(path, channels, frames, signal, flags, tags=False):
+    """One Opus fixture.
+
+    **The input is 48 kHz and nothing else**, which is not laziness: an
+    Opus decoder outputs at 48 kHz whatever the encoder was given, the
+    granule positions are counted at 48 kHz, and feeding the encoder
+    another rate would only add a resampler to the generator. The
+    bandwidth - which is the thing that varies - is chosen by `-cutoff`
+    rather than by the input rate.
+    """
+    raw = path + ".raw"
+    raw_signal(raw, signal, 16, channels, 48000, frames)
+    argv = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "s16le", "-ar", "48000", "-ac", str(channels), "-i", raw,
+        "-c:a", "libopus",
+    ] + list(flags)
+    if tags:
+        for key, value in TAGS:
+            argv += ["-metadata", "%s=%s" % (key, value)]
+    argv += [
+        "-fflags", "+bitexact", "-flags:a", "+bitexact",
+        "-serial_offset", str(OGG_SERIAL),
+        "-map_metadata", "0" if tags else "-1",
+        "-f", "ogg", path,
+    ]
+    run(oracle.command("ffmpeg", argv, scratch=DATA))
+    os.remove(raw)
+
+
 def vorbis_make(path, codec, channels, rate, frames, signal, flags,
                 tags=False):
     """One Vorbis fixture.
@@ -1033,6 +1140,9 @@ def multichannel_signals():
         for name, writer, channels, rate, frames, signal, flags in table:
             if channels > 1:
                 used.add(signal)
+    for name, channels, frames, signal, flags in OPUS_CASES:
+        if channels > 1:
+            used.add(signal)
     return used
 
 
@@ -1232,6 +1342,20 @@ def main():
     made.append(path)
     print("  %-30s %s" % ("vorbis_tagged_stereo_44100",
                           os.path.getsize(path)))
+
+    # Opus. Spelled `.opus`, which is what RFC 7845 asks for and what
+    # every reader keys on - unlike Vorbis, where `.ogg` won before Xiph
+    # had an opinion.
+    for name, channels, frames, signal, flags in OPUS_CASES:
+        path = os.path.join(DATA, "%s.opus" % name)
+        opus_make(path, channels, frames, signal, flags)
+        made.append(path)
+        print("  %-30s %s" % (name, os.path.getsize(path)))
+
+    path = os.path.join(DATA, "opus_tagged_stereo.opus")
+    opus_make(path, 2, 4800, "tone", ["-b:a", "96k"], tags=True)
+    made.append(path)
+    print("  %-30s %s" % ("opus_tagged_stereo", os.path.getsize(path)))
 
     print("%d fixtures in tests/data/" % len(made))
 

@@ -54,10 +54,16 @@
  *   setup accepted with one out of range is a memory error waiting for a
  *   packet rather than a wrong answer.
  *
+ * The Opus arms are here rather than in a harness of their own for the
+ * same reason the Vorbis ones are: the page layer underneath is shared,
+ * and a mutation that produces a valid page is worth handing to every
+ * mapping that might claim it.
+ *
  * Build with: make fuzz-ogg
  * Run:        make fuzz-run-ogg FUZZ_TIME=300
  */
 
+#include "../../src/codec/opus/opus_internal.h"
 #include "../../src/codec/vorbis/vorbis_internal.h"
 #include "../../src/container/ogg/ogg.h"
 #include <ghoti.io/audio/audio.h>
@@ -363,6 +369,74 @@ void fuzz_setup(const uint8_t * data, size_t size) {
   free(packet);
 }
 
+/**
+ * One Opus packet's table of contents, read directly.
+ *
+ * Small and reached by nothing else: the framing is one byte and up to
+ * two more, and the three things it can say that are impossible - a
+ * count of zero, a packet past 120 milliseconds, a stated first-frame
+ * length running past the packet - are each one comparison that a
+ * loader never evaluates, because it only ever sees packets an encoder
+ * wrote.
+ */
+void fuzz_opus_toc(const uint8_t * data, size_t size) {
+  OPUS_Toc toc;
+  memset(&toc, 0, sizeof(toc));
+  if (gaud_opus_parse_toc(data, size, &toc) != GAUD_OK) {
+    return;
+  }
+  /* What a caller is entitled to assume about an accepted packet, and
+   * what the decoder will size its buffers from. */
+  if (toc.frames == 0 || toc.frame_size == 0) {
+    abort();
+  }
+  /* A packet is at most 120 milliseconds, which is 5,760 samples at the
+   * 48 kHz the granule positions are counted in. */
+  if ((uint64_t)toc.frames * toc.frame_size > 5760u) {
+    abort();
+  }
+  if (toc.mode != OPUS_MODE_SILK && toc.mode != OPUS_MODE_HYBRID
+      && toc.mode != OPUS_MODE_CELT) {
+    abort();
+  }
+  if (toc.bandwidth > 4u || toc.code > 3u) {
+    abort();
+  }
+}
+
+/** One OpusHead, read directly. */
+void fuzz_opus_head(const uint8_t * data, size_t size) {
+  size_t total = OPUS_MAGIC_SIZE + size;
+  uint8_t * packet = (uint8_t *)malloc(total);
+  if (!packet) {
+    return;
+  }
+  memcpy(packet, OPUS_HEAD_MAGIC, OPUS_MAGIC_SIZE);
+  memcpy(packet + OPUS_MAGIC_SIZE, data, size);
+  OPUS_Head head;
+  memset(&head, 0, sizeof(head));
+  if (gaud_opus_parse_head(packet, total, &head) == GAUD_OK) {
+    /* Every number a later packet will index, which is what the parse
+     * exists to establish. */
+    if (head.channels == 0 || head.channels > OPUS_MAX_CHANNELS) {
+      abort();
+    }
+    if ((head.version >> 4) != 0) {
+      abort();
+    }
+    if (head.streams == 0 || head.coupled > head.streams) {
+      abort();
+    }
+    for (uint32_t i = 0; i < head.channels; ++i) {
+      if (head.mapping[i] != 255u
+          && head.mapping[i] >= head.streams + head.coupled) {
+        abort();
+      }
+    }
+  }
+  free(packet);
+}
+
 /** Load a whole file, for whichever Ogg mapping claims it. */
 void fuzz_file(const uint8_t * data, size_t size) {
   GAUD_Stream * stream = NULL;
@@ -434,7 +508,7 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
    * files would never reach the seek layer: a loader reaches it only
    * after the mapping's signature has already been accepted, and almost
    * every mutation breaks that first. */
-  unsigned mode = data[0] % 5u;
+  unsigned mode = data[0] % 7u;
   const uint8_t * body = data + 1;
   size_t body_size = size - 1u;
   switch (mode) {
@@ -450,8 +524,14 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   case 3:
     fuzz_identification(body, body_size);
     break;
-  default:
+  case 4:
     fuzz_setup(body, body_size);
+    break;
+  case 5:
+    fuzz_opus_toc(body, body_size);
+    break;
+  default:
+    fuzz_opus_head(body, body_size);
     break;
   }
   return 0;

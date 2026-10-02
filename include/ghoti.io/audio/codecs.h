@@ -81,6 +81,20 @@ GAUD_API void gaud_mp3_register(void);
  */
 GAUD_API void gaud_vorbis_register(void);
 
+/**
+ * @brief Register Opus in Ogg (RFC 6716 and RFC 7845).
+ *
+ * Reads what the stream says about itself - the channel count, the tags,
+ * and the length, which is the last page's granule position minus the
+ * pre-skip the format states - and does not yet decode it. The codec
+ * declares ::GAUD_CAP_METADATA_READ and not ::GAUD_CAP_DECODE.
+ *
+ * The sample rate reported is always 48,000, which is the format's
+ * decision: a decoder may output at any of five rates and the rate in
+ * the header is marked informational.
+ */
+GAUD_API void gaud_opus_register(void);
+
 GAUD_API void gaud_register_builtin_codecs(void);
 
 #ifdef __cplusplus

@@ -31,11 +31,39 @@
 #             above. **WAV only**: Python 3.13 removed `aifc` under PEP 594,
 #             so there is no stdlib AIFF reader any more and AIFF is scored
 #             by the other three.
+# opusdec     opus-tools' decoder, which is libopus - the implementation
+#             RFC 6716 defines conformance against. Added in phase 6.
+# opus_compare
+#             **The only normative tool in this image.** RFC 6716 does
+#             not define Opus by a bitstream and a transform; it defines
+#             a conforming decoder as one whose output `opus_compare`
+#             accepts against the reference decoder's. So this is the one
+#             reference here that answers pass or fail rather than a
+#             number to be argued about, and planning/audio.md section 12
+#             says it is what MPEG audio could not have, because ISO/IEC
+#             11172-4's vectors cannot be obtained.
+#
+#             It is built here rather than installed, because Debian
+#             packages libopus and not this: it is one self-contained
+#             file in the libopus source that needs nothing but libc and
+#             libm. The source comes from the same dated snapshot as
+#             every binary package below, so it is pinned the same way,
+#             and the build records which version it came from because
+#             the tool prints no banner of its own.
 # flac        The format's own reference implementation, added in phase 4.
 #             `flac -d` is the definition of a correct decode and `flac -t`
 #             verifies the STREAMINFO MD5 of a file we wrote, which is a
 #             whole-decoder check no comparison of ours could construct.
 #             `metaflac` reads the metadata blocks.
+#
+# **For Opus the reference count is two, and the second one is inside
+# ffmpeg.** libavcodec has a native Opus decoder as well as a libopus
+# wrapper, and the native one is what `-c:a opus` selects - so opusdec
+# and ffmpeg are two implementations, in the way phase 5's two MPEG
+# decoders were and FLAC's four names were not. The trap phase 6 found is
+# a different one and is about Vorbis: ffmpeg's two Vorbis decoders are
+# two implementations for sample *values* and one reading for the
+# *length*, because the trim happens in the demuxer they share.
 #
 # **For FLAC the reference count is two, not five, and that has to be said
 # out loud.** sox reaches FLAC through libsox_fmt_flac, libsndfile links
@@ -100,16 +128,51 @@ RUN apt-get update -qq \
       python3-mutagen=1.47.0-1 \
       flac=1.5.0+ds-2 \
       libflac14=1.5.0+ds-2 \
+      opus-tools=0.2-1+b3 \
+      libopus0=1.5.2-2 \
     && rm -rf /var/lib/apt/lists/*
+
+# opus_compare, built from the libopus source of the same snapshot.
+#
+# `--download-only` and an untar rather than `apt-get source`, because
+# unpacking a Debian source package needs dpkg-dev and this needs one
+# file out of the upstream tarball. The compiler is installed for this
+# step and removed with it, so the finished image has no toolchain in it
+# - a reference image that could build things is a reference image whose
+# answers depend on what was built in it.
+#
+# The version is recorded for opus-compare-version to read back: the tool
+# has no banner, so the only honest statement of what it is comes from
+# the build.
+ARG OPUS_VERSION=1.5.2
+RUN printf 'Types: deb-src\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' \
+      "$SNAPSHOT" > /etc/apt/sources.list.d/debian-src.sources \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends gcc libc6-dev >/dev/null \
+    && cd /tmp \
+    && apt-get source --download-only libopus0=1.5.2-2 \
+    && tar xf "opus_${OPUS_VERSION}.orig.tar.gz" \
+    && gcc -O2 -o /usr/local/bin/opus_compare \
+         -I "opus-${OPUS_VERSION}/include" \
+         "opus-${OPUS_VERSION}/src/opus_compare.c" -lm \
+    && mkdir -p /usr/local/share \
+    && printf '%s\n' "$OPUS_VERSION" \
+         > /usr/local/share/opus-compare-version \
+    && apt-get purge -y gcc libc6-dev >/dev/null \
+    && apt-get autoremove -y >/dev/null \
+    && rm -rf /tmp/opus* /etc/apt/sources.list.d/debian-src.sources \
+         /var/lib/apt/lists/*
 
 # The probes oracle_env.py runs, copied in rather than written with printf
 # inside a RUN: font's first draft did that and its escapes reached the file
 # literally, which puts a quoting layer between a check and the fact it checks.
 COPY ffmpeg-version sox-version libsndfile-version pywave-version \
-      mutagen-version flac-version /usr/local/bin/
+      mutagen-version flac-version opusdec-version opus-compare-version \
+      /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/ffmpeg-version /usr/local/bin/sox-version \
       /usr/local/bin/libsndfile-version /usr/local/bin/pywave-version \
-      /usr/local/bin/mutagen-version /usr/local/bin/flac-version
+      /usr/local/bin/mutagen-version /usr/local/bin/flac-version \
+      /usr/local/bin/opusdec-version /usr/local/bin/opus-compare-version
 
 # A locale, pinned, because regex lost 1,855 differential rows to an image
 # that had none. Nothing here reads a name out of a file yet, but sox and
@@ -124,4 +187,5 @@ ENV TZ=UTC SOURCE_DATE_EPOCH=0
 
 ENTRYPOINT []
 CMD ["sh", "-c", "ffmpeg-version; sox-version; libsndfile-version; \
-pywave-version; mutagen-version; flac-version"]
+pywave-version; mutagen-version; flac-version; opusdec-version; \
+opus-compare-version"]
