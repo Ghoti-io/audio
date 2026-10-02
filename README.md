@@ -439,7 +439,7 @@ What is deliberately absent:
 | \ref format_coding "formats/coding.md" | G.711 and the two ADPCM families: one algorithm in two framings, and where the references disagree |
 | \ref metadata "metadata.md" | Tags, raw carriage and cover art: the schemes, the encodings, and where they disagree |
 | \ref writing_a_codec "writing-a-codec.md" | The compatibility contract for a codec in another repository |
-| \ref development "development.md" | Building, the gates, and why a clean tree is a different test |
+| \ref audio_development "development.md" | Building, the gates, and why a clean tree is a different test |
 
 `make docs` builds the manual those pages feed.
 
