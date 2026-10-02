@@ -101,6 +101,17 @@ extern "C" {
 /** Samples in the longest frame, 20 ms at 16 kHz. */
 #define SILK_MAX_FRAME_LENGTH 320
 
+/** Samples in the longest subframe, 5 ms at 16 kHz. */
+#define SILK_MAX_SUBFRAME_LENGTH 80
+
+/**
+ * How much decoded output the long-term predictor can look back over.
+ *
+ * Twenty milliseconds, which is more than the longest pitch period the
+ * format can code, so a subframe's predictor never reaches past it.
+ */
+#define SILK_LTP_MEM_MS 20
+
 /** How far a stage-2 LSF index goes before the extension takes over. */
 #define SILK_NLSF_MAX_AMPLITUDE 4
 
@@ -177,8 +188,19 @@ typedef struct {
   int8_t prev_gain_index;               ///< What a delta gain is against.
   int16_t prev_nlsf_q15[SILK_MAX_LPC_ORDER]; ///< What interpolation starts from.
   bool first_after_reset;               ///< So nothing is interpolated yet.
+  int ltp_mem_length;                   ///< 20 ms of samples.
   SILK_Indices indices;                 ///< The frame just parsed.
   int pulses[SILK_MAX_FRAME_LENGTH];    ///< Its excitation, signed.
+  /**
+   * The decoded output the long-term predictor reads back.
+   *
+   * Two subframes longer than it needs to be, because the re-whitening
+   * at the third subframe of an interpolated frame copies this frame's
+   * first half in beyond the end of the history.
+   */
+  int16_t out_buf[SILK_MAX_FRAME_LENGTH + 2 * SILK_MAX_SUBFRAME_LENGTH];
+  int32_t lpc_state_q14[SILK_MAX_LPC_ORDER]; ///< The synthesis filter's memory.
+  int32_t prev_gain_q16;                ///< What the state above is scaled by.
 } SILK_Channel;
 
 /**
@@ -382,6 +404,20 @@ int32_t gaud_silk_lpc_inverse_gain(const int16_t * lpc_q12, int order);
  */
 void gaud_silk_decode_pitch(int16_t lag_index, int8_t contour_index,
     int * lags, int fs_khz, int subframes);
+
+/**
+ * @brief Synthesise one frame's samples. Section 4.2.7.9 and 4.2.8.
+ *
+ * The excitation, then the long-term filter, then the short-term one,
+ * then the gain.
+ *
+ * @param channel The channel, whose pulses this reads and whose
+ *   filter memory and output history it carries forward.
+ * @param parameters What the indices became.
+ * @param out Receives @c frame_length samples.
+ */
+void gaud_silk_decode_core(SILK_Channel * channel,
+    const SILK_Parameters * parameters, int16_t * out);
 
 #ifdef __cplusplus
 }

@@ -1761,6 +1761,179 @@ TEST(OpusSilkParams, TheStabiliserKeepsEveryFrequencyInRange) {
   }
 }
 
+/**
+ * Eighteen thousand synthesised frames, against the reference.
+ *
+ * Five frames are chained per trial, because almost everything in
+ * section 4.2.8 is state: the short-term filter's memory, the gain the
+ * memory is scaled by, and twenty milliseconds of output the long-term
+ * predictor reads back. A sweep of independent frames would exercise
+ * none of it.
+ *
+ * Across six hundred trials at each of three sample rates and both
+ * frame lengths: 5,994 voiced frames, 11,524 that interpolate their
+ * coefficients, 15,139 whose gain changes between subframes - which
+ * is what makes the filter memory get rescaled - and 424,533 output
+ * samples that saturate, because one trial in eight is given a gain
+ * no encoder would choose.
+ *
+ * The digest covers every output sample, the filter memory and the
+ * gain after each frame. It was computed from this library and from
+ * Appendix A's own silk_decode_core over the same inputs, and the two
+ * agreed before it was written here.
+ */
+TEST(OpusSilkSynthesis, EighteenThousandChainedFramesMatchTheReference) {
+  uint64_t digest = 1469598103934665603ULL;
+  auto fold = [&digest](int64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (uint64_t)((value >> (8 * i)) & 0xFF);
+      digest *= 1099511628211ULL;
+    }
+  };
+  const int rates[3] = {8, 12, 16};
+  long frames = 0;
+  long voiced = 0;
+  long interpolated = 0;
+  long gain_changes = 0;
+  long saturated = 0;
+  SILK_Decoder decoder;
+  std::vector<int16_t> out(320);
+
+  for (int rate = 0; rate < 3; ++rate) {
+    for (int subframes = 2; subframes <= 4; subframes += 2) {
+      for (uint32_t trial = 0; trial < 600; ++trial) {
+        int fs = rates[rate];
+        int order = fs == 16 ? 16 : 10;
+        memset(&decoder, 0, sizeof decoder);
+        ASSERT_TRUE(gaud_silk_decoder_init(
+            &decoder, 1, fs, subframes == 2 ? 10 : 20));
+        SILK_Channel * channel = &decoder.channel[0];
+        for (int frame = 0; frame < 5; ++frame) {
+          SilkRandom random = {trial * 7919u
+              + (uint32_t)(fs * 131 + subframes * 17 + frame)};
+          SILK_Indices & indices = channel->indices;
+          indices.signal_type = (int8_t)(random.Next() % 3);
+          indices.quant_offset_type = (int8_t)(random.Next() % 2);
+          indices.nlsf[0] = (int8_t)(random.Next() % 32);
+          for (int i = 0; i < order; ++i) {
+            indices.nlsf[i + 1] = (int8_t)((int)(random.Next() % 9) - 4);
+          }
+          indices.nlsf_interp_q2 = (int8_t)(random.Next() % 5);
+          indices.seed = (int8_t)(random.Next() % 4);
+          // One trial in eight is given a gain no encoder would
+          // choose, so that the output saturates and the paths that
+          // only overflow can reach are covered.
+          bool loud = (trial % 8u) == 0u;
+          for (int k = 0; k < subframes; ++k) {
+            indices.gains[k] = (int8_t)(loud ? random.Next() % 41
+                                             : 2 + random.Next() % 5);
+          }
+          if (frame == 0) {
+            indices.gains[0] = (int8_t)(loud ? random.Next() % 64
+                                             : 10 + random.Next() % 12);
+          }
+          indices.lag_index = (int16_t)(random.Next() % (uint32_t)(16 * fs));
+          uint32_t contours = fs == 8 ? (subframes == 4 ? 11u : 3u)
+                                      : (subframes == 4 ? 34u : 12u);
+          indices.contour_index = (int8_t)(random.Next() % contours);
+          indices.per_index = (int8_t)(random.Next() % 3);
+          uint32_t book = indices.per_index == 0
+              ? 8u
+              : (indices.per_index == 1 ? 16u : 32u);
+          for (int k = 0; k < subframes; ++k) {
+            indices.ltp[k] = (int8_t)(random.Next() % book);
+          }
+          indices.ltp_scale_index = (int8_t)(random.Next() % 3);
+          for (int i = 0; i < channel->frame_length; ++i) {
+            uint32_t value = random.Next();
+            channel->pulses[i] =
+                (value % 5u) == 0u ? (int)((value >> 4) % 9u) - 4 : 0;
+          }
+
+          if (indices.signal_type == SILK_SIGNAL_VOICED) {
+            ++voiced;
+          }
+          if (indices.nlsf_interp_q2 < 4 && frame > 0) {
+            ++interpolated;
+          }
+          SILK_Parameters parameters;
+          gaud_silk_decode_parameters(channel, &parameters,
+              frame == 0 ? SILK_CODE_INDEPENDENT : SILK_CODE_CONDITIONAL);
+          bool changed = false;
+          for (int k = 1; k < subframes; ++k) {
+            if (parameters.gains_q16[k] != parameters.gains_q16[k - 1]) {
+              changed = true;
+            }
+          }
+          if (changed) {
+            ++gain_changes;
+          }
+          gaud_silk_decode_core(channel, &parameters, out.data());
+
+          for (int i = 0; i < channel->frame_length; ++i) {
+            fold(out[i]);
+            if (out[i] == 32767 || out[i] == -32768) {
+              ++saturated;
+            }
+          }
+          for (int i = 0; i < SILK_MAX_LPC_ORDER; ++i) {
+            fold(channel->lpc_state_q14[i]);
+          }
+          fold(channel->prev_gain_q16);
+          ++frames;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(frames, 18000);
+  EXPECT_EQ(digest, 13335394734812311911ULL);
+  EXPECT_EQ(voiced, 5994);
+  EXPECT_EQ(interpolated, 11524);
+  EXPECT_EQ(gain_changes, 15139);
+  EXPECT_EQ(saturated, 424533);
+}
+
+/**
+ * The interpolation factor a reset forces is written back, not local.
+ *
+ * Section 4.2.7.5.5's factor is read twice: once to decide whether to
+ * interpolate the first half of the frame's coefficients, and again by
+ * the synthesis, which rebuilds the long-term predictor's history
+ * halfway through a frame only when the frame interpolated. A frame
+ * following a reset is given a factor of four whatever it coded, and
+ * **that substitution has to reach the second reader as well**.
+ *
+ * Keeping it local is invisible for two subframes and then changes
+ * every sample: the comparison that found it had the first 106 samples
+ * of a 160-sample frame agreeing exactly and the rest wrong. This test
+ * pins the substitution directly.
+ */
+TEST(OpusSilkSynthesis, AResetOverridesTheInterpolationFactorEverywhere) {
+  SILK_Decoder decoder;
+  memset(&decoder, 0, sizeof decoder);
+  ASSERT_TRUE(gaud_silk_decoder_init(&decoder, 1, 16, 20));
+  SILK_Channel * channel = &decoder.channel[0];
+  ASSERT_TRUE(channel->first_after_reset);
+  channel->indices.signal_type = SILK_SIGNAL_VOICED;
+  channel->indices.nlsf_interp_q2 = 1;
+  SILK_Parameters parameters;
+  gaud_silk_decode_parameters(channel, &parameters, SILK_CODE_INDEPENDENT);
+  EXPECT_EQ(channel->indices.nlsf_interp_q2, 4);
+  // And the two halves of the frame then share one set of
+  // coefficients, which is the other half of what the factor means.
+  for (int i = 0; i < channel->lpc_order; ++i) {
+    EXPECT_EQ(parameters.lpc_q12[0][i], parameters.lpc_q12[1][i])
+        << "at " << i;
+  }
+  // A later frame keeps what it coded.
+  std::vector<int16_t> out(320);
+  gaud_silk_decode_core(channel, &parameters, out.data());
+  EXPECT_FALSE(channel->first_after_reset);
+  channel->indices.nlsf_interp_q2 = 1;
+  gaud_silk_decode_parameters(channel, &parameters, SILK_CODE_CONDITIONAL);
+  EXPECT_EQ(channel->indices.nlsf_interp_q2, 1);
+}
+
 namespace {
 
 /** A packet's first byte, section 3.1. */

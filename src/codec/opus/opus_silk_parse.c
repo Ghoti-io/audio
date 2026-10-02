@@ -132,6 +132,16 @@ bool gaud_silk_decoder_init(
     if (channel->fs_khz != fs_khz || channel->frame_length != frame_length) {
       channel->prev_signal_type = SILK_SIGNAL_INACTIVE;
       channel->prev_lag_index = 0;
+      // The synthesis state is in samples at the old rate and in
+      // units of the old gain, so none of it survives a change of
+      // either. The gain starts at one rather than zero because the
+      // first subframe divides by it.
+      channel->prev_gain_index = 0;
+      channel->prev_gain_q16 = 1 << 16;
+      channel->first_after_reset = true;
+      memset(channel->prev_nlsf_q15, 0, sizeof channel->prev_nlsf_q15);
+      memset(channel->lpc_state_q14, 0, sizeof channel->lpc_state_q14);
+      memset(channel->out_buf, 0, sizeof channel->out_buf);
     }
     channel->fs_khz = fs_khz;
     channel->nb_subfr = subframes;
@@ -139,6 +149,7 @@ bool gaud_silk_decoder_init(
     channel->subfr_length = subfr_length;
     channel->frame_length = frame_length;
     channel->shell_blocks = blocks;
+    channel->ltp_mem_length = SILK_LTP_MEM_MS * fs_khz;
     channel->frames_per_packet = frames;
     channel->frames_decoded = 0;
     channel->lbrr_flag = false;

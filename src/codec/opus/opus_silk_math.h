@@ -132,16 +132,24 @@ static inline int32_t gaud_silk_smlawb(int32_t a, int32_t b, int32_t c) {
   return gaud_silk_add32(a, gaud_silk_smulwb(b, c));
 }
 
-/** Thirty-two by thirty-two at the first's scale, in two steps. */
+/**
+ * Thirty-two by thirty-two at the first's scale, in two steps.
+ *
+ * The second step's product is formed unsigned because it genuinely
+ * overflows: a subframe gain can be large enough that the filter
+ * state times it leaves 32 bits, and the reference wraps there rather
+ * than saturating. Wrapping is what the format does; signed overflow
+ * is merely what C calls it.
+ */
 static inline int32_t gaud_silk_smulww(int32_t a, int32_t b) {
-  return gaud_silk_add32(
-      gaud_silk_smulwb(a, b), a * gaud_silk_rshift_round(b, 16));
+  return gaud_silk_add32(gaud_silk_smulwb(a, b),
+      (int32_t)((uint32_t)a * (uint32_t)gaud_silk_rshift_round(b, 16)));
 }
 
 /** @ref gaud_silk_smulww accumulated onto @p a. */
 static inline int32_t gaud_silk_smlaww(int32_t a, int32_t b, int32_t c) {
-  return gaud_silk_add32(
-      gaud_silk_smlawb(a, b, c), b * gaud_silk_rshift_round(c, 16));
+  return gaud_silk_add32(gaud_silk_smlawb(a, b, c),
+      (int32_t)((uint32_t)b * (uint32_t)gaud_silk_rshift_round(c, 16)));
 }
 
 /** The top 32 bits of a 64-bit product. */
@@ -209,6 +217,21 @@ int32_t gaud_silk_log2lin(int32_t log_q7);
  * @return The reciprocal, or zero when @p q asks for more than fits.
  */
 int32_t gaud_silk_inverse32_varq(int32_t value, int q);
+
+/**
+ * @brief `(numerator << q) / denominator`, to about 29 bits.
+ *
+ * RFC 6716's `silk_DIV32_varQ`. The residual it refines with is
+ * allowed to overflow - the reference says so, and the final value is
+ * small enough that two wraps cancel - so that step goes through an
+ * unsigned type here.
+ *
+ * @param numerator Any value.
+ * @param denominator Must not be zero.
+ * @param q The scale wanted, which must not be negative.
+ * @return The quotient, saturated if it does not fit.
+ */
+int32_t gaud_silk_div32_varq(int32_t numerator, int32_t denominator, int q);
 
 #ifdef __cplusplus
 }

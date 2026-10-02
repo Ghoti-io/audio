@@ -579,7 +579,18 @@ void gaud_silk_decode_parameters(
   // the factor of four means "do not interpolate at all". A frame
   // that follows a reset has nothing to interpolate from and is given
   // four regardless of what it coded.
-  int factor = channel->first_after_reset ? 4 : indices->nlsf_interp_q2;
+  //
+  // **That substitution is written back into the indices, not kept
+  // local**, because the synthesis reads the same field again: it
+  // re-derives the long-term predictor's history halfway through an
+  // interpolated frame, and only an interpolated one. Leaving the
+  // coded value in place makes a frame after a reset re-whiten when
+  // the reference does not, which changes every sample from the
+  // third subframe on while the first two still agree.
+  if (channel->first_after_reset) {
+    channel->indices.nlsf_interp_q2 = 4;
+  }
+  int factor = indices->nlsf_interp_q2;
   if (factor < 4) {
     int16_t first_q15[SILK_MAX_LPC_ORDER];
     for (int i = 0; i < order; ++i) {

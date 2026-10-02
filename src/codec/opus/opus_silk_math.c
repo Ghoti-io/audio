@@ -96,3 +96,33 @@ int32_t gaud_silk_inverse32_varq(int32_t value, int q) {
   // anyway.
   return shift < 32 ? result >> shift : 0;
 }
+
+int32_t gaud_silk_div32_varq(int32_t numerator, int32_t denominator, int q) {
+  int top = gaud_silk_clz32(
+                (uint32_t)(numerator > 0 ? numerator : -numerator))
+      - 1;
+  int bottom = gaud_silk_clz32(
+                   (uint32_t)(denominator > 0 ? denominator : -denominator))
+      - 1;
+  int32_t a = gaud_silk_shl32(numerator, (unsigned)top);
+  int32_t b = gaud_silk_shl32(denominator, (unsigned)bottom);
+  int32_t reciprocal = (int32_t)(0x1FFFFFFF / (b >> 16));
+  int32_t result = gaud_silk_smulwb(a, reciprocal);
+  // One Newton step. The reference notes that this subtraction may
+  // overflow and that it does not matter, because what is left is
+  // small; it is spelt unsigned so that it is defined rather than
+  // merely usual.
+  a = (int32_t)((uint32_t)a
+      - (uint32_t)gaud_silk_shl32(gaud_silk_smmul(b, result), 3));
+  result = gaud_silk_smlawb(result, a, reciprocal);
+  int shift = 29 + top - bottom - q;
+  if (shift < 0) {
+    unsigned by = (unsigned)(-shift);
+    if (by >= 32u) {
+      return result == 0 ? 0 : (result > 0 ? INT32_MAX : INT32_MIN);
+    }
+    return gaud_silk_shl32(
+        gaud_silk_limit(result, INT32_MIN >> by, INT32_MAX >> by), by);
+  }
+  return shift < 32 ? result >> shift : 0;
+}
