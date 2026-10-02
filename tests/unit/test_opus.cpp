@@ -40,12 +40,14 @@
 #include "../../src/codec/opus/opus_internal.h"
 #include "../../src/codec/opus/opus_range.h"
 #include "../../src/codec/opus/opus_celt.h"
+#include "../../src/codec/opus/opus_celt_math.h"
 #include "../../src/codec/opus/opus_tables.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -2163,6 +2165,415 @@ TEST(OpusPvq, TheEnumerationStartsAtAllPulsesInTheFirstDimension) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// CELT's fixed-point arithmetic, section 4.3's polynomial approximations.
+//
+// These check two different things, and neither on its own would do.
+//
+// A bound against the real function says the transcription is not nonsense:
+// a coefficient typed wrong, a shift in the wrong direction, a sign lost.
+// Every bound below is *measured* rather than chosen, and three of them -
+// the two for celt_rsqrt_norm and the one for celt_rcp - come out equal to
+// the figures RFC 6716's own source states in its comments, to every digit
+// it prints. That is a check on the transcription that the document itself
+// supplies and that costs nothing to make.
+//
+// But a bound cannot say the answer is *right*, because a better
+// approximation would pass it and still decode to noise: which polynomial is
+// part of the format. Only agreement with the reference, integer for
+// integer, says that. The library cannot link the reference, so that half
+// lives in a probe instead; notes/audio/opus.md records what it swept and
+// what it found, and the anchors below are its answers written down.
+
+// How far a Q-format integer is from the real value it approximates.
+double RelativeError(double got, double want) {
+  return want == 0.0 ? std::fabs(got) : std::fabs(got - want) / std::fabs(want);
+}
+
+TEST(OpusMath, IntegerSquareRootIsExactNotApproximate) {
+  // Unlike everything else in this file isqrt32 is not an approximation, so
+  // it can be checked against its definition rather than against a bound.
+  unsigned long long checked = 0;
+  for (unsigned long long v = 0; v < 70000ull; ++v) {
+    unsigned long long r = gaud_celt_isqrt32((uint32_t)v);
+    ASSERT_LE(r * r, v) << "at " << v;
+    ASSERT_GT((r + 1) * (r + 1), v) << "at " << v;
+    ++checked;
+  }
+  for (unsigned long long v = 1; v < 4294967296ull; v += 4093) {
+    unsigned long long r = gaud_celt_isqrt32((uint32_t)v);
+    ASSERT_LE(r * r, v) << "at " << v;
+    ASSERT_GT((r + 1) * (r + 1), v) << "at " << v;
+    ++checked;
+  }
+  // Both ends of the range, which the stride above steps over.
+  EXPECT_EQ(gaud_celt_isqrt32(0xFFFFFFFFu), 65535u);
+  EXPECT_EQ(gaud_celt_isqrt32(0u), 0u);
+  EXPECT_GT(checked, 1100000u);
+}
+
+TEST(OpusMath, ReciprocalSquareRootMeetsTheErrorTheRfcStates) {
+  // RFC 6716 celt/mathops.c states, of this function: "a maximum relative
+  // error of 1.04956E-4, a (relative) RMSE of 2.80979E-5, and a peak
+  // absolute error of 2.26591/16384". All three are reproduced here from
+  // the transcription, over every input in the stated range.
+  double worst = 0.0;
+  double worst_absolute = 0.0;
+  double sum_of_squares = 0.0;
+  unsigned long count = 0;
+  for (int32_t x = 16384; x < 65536; ++x) {
+    double want = 1.0 / std::sqrt((double)x / 65536.0);
+    double got = (double)gaud_celt_rsqrt_norm(x) / 16384.0;
+    double relative = RelativeError(got, want);
+    worst = std::max(worst, relative);
+    worst_absolute = std::max(worst_absolute, std::fabs(got - want) * 16384.0);
+    sum_of_squares += relative * relative;
+    ++count;
+  }
+  EXPECT_EQ(count, 49152u);
+  EXPECT_NEAR(worst, 1.04956e-4, 1e-9);
+  EXPECT_NEAR(std::sqrt(sum_of_squares / count), 2.80979e-5, 1e-10);
+  EXPECT_NEAR(worst_absolute, 2.26591, 1e-4);
+}
+
+TEST(OpusMath, ReciprocalMeetsTheErrorTheRfcStates) {
+  // "a maximum relative error of 7.05346E-5". The argument reaches the
+  // polynomial only through its 15-bit mantissa, so sweeping every mantissa
+  // at one exponent covers the approximation completely; the exponents
+  // either side confirm that the shift back is not where it goes wrong.
+  double worst = 0.0;
+  for (int exponent = 14; exponent <= 16; ++exponent) {
+    for (uint32_t mantissa = 0; mantissa < 32768u; ++mantissa) {
+      int32_t x = (int32_t)((1u << exponent)
+          | (exponent <= 15 ? (mantissa >> (15 - exponent))
+                            : (mantissa << (exponent - 15))));
+      double want = 32768.0 / (double)x;
+      double got = (double)gaud_celt_rcp(x) / 65536.0;
+      worst = std::max(worst, RelativeError(got, want));
+    }
+  }
+  EXPECT_NEAR(worst, 7.05346e-5, 1e-10);
+}
+
+TEST(OpusMath, SquareRootTracksTheRealOneAcrossEveryExponent) {
+  double worst_relative = 0.0;
+  double worst_absolute = 0.0;
+  unsigned long count = 0;
+  for (int exponent = 1; exponent < 31; ++exponent) {
+    for (uint32_t mantissa = 0; mantissa < 32768u; mantissa += 7u) {
+      int32_t x = (int32_t)((1u << exponent)
+          | (exponent <= 15 ? (mantissa >> (15 - exponent))
+                            : (mantissa << (exponent - 15))));
+      if (x <= 0) {
+        continue;
+      }
+      double want = std::sqrt((double)x);
+      double got = (double)gaud_celt_sqrt(x);
+      worst_absolute = std::max(worst_absolute, std::fabs(got - want));
+      if (want >= 256.0) {
+        worst_relative = std::max(worst_relative, RelativeError(got, want));
+      }
+      ++count;
+    }
+  }
+  EXPECT_GT(count, 140000u);
+  // Measured: 3.9086e-3 relative once the result has room, and never more
+  // than twelve units of the output's own scale anywhere.
+  EXPECT_LT(worst_relative, 3.91e-3);
+  EXPECT_LT(worst_absolute, 12.0);
+  EXPECT_EQ(gaud_celt_sqrt(0), 0);
+  EXPECT_EQ(gaud_celt_sqrt(65536), 256);
+}
+
+TEST(OpusMath, CosineIsExactOnTheQuarterTurnsAndCloseBetween) {
+  // The quarter turns are answered without the polynomial, which is not an
+  // optimisation: the polynomial does not land on 32767 or on 0, and the
+  // places it is asked for are the places a band collapses entirely.
+  EXPECT_EQ(gaud_celt_cos_norm(0), 32767);
+  EXPECT_EQ(gaud_celt_cos_norm(32768), 0);
+  EXPECT_EQ(gaud_celt_cos_norm(65536), -32767);
+  EXPECT_EQ(gaud_celt_cos_norm(98304), 0);
+  EXPECT_EQ(gaud_celt_cos_norm(131072), 32767);
+  // Four quarter turns is the period, and only the low 17 bits are read.
+  for (int32_t x = 0; x < 131072; x += 997) {
+    EXPECT_EQ(gaud_celt_cos_norm(x), gaud_celt_cos_norm(x + 131072)) << x;
+    EXPECT_EQ(gaud_celt_cos_norm(x), gaud_celt_cos_norm(x - 131072)) << x;
+  }
+  double worst = 0.0;
+  for (int32_t x = 0; x < 131072; ++x) {
+    double want = std::cos(3.14159265358979323846 * 0.5 * ((double)x / 32768.0))
+        * 32767.0;
+    worst = std::max(worst, std::fabs((double)gaud_celt_cos_norm(x) - want));
+  }
+  // Measured: 2.3537 of 32767, so about seven parts in a hundred thousand.
+  EXPECT_LT(worst, 2.36);
+}
+
+TEST(OpusMath, PowerOfTwoSaturatesAtBothEndsAndTracksBetween) {
+  EXPECT_EQ(gaud_celt_exp2(15 * 1024), 0x7F000000);
+  EXPECT_EQ(gaud_celt_exp2(-16 * 1024), 0);
+  double worst = 0.0;
+  for (int32_t x = 0; x <= 14 * 1024 + 1023; ++x) {
+    double want = std::pow(2.0, (double)x / 1024.0) * 65536.0;
+    worst = std::max(worst, RelativeError((double)gaud_celt_exp2((int16_t)x), want));
+  }
+  // Measured: 1.0781e-4 wherever the Q16 result has a whole bit to spare.
+  EXPECT_LT(worst, 1.08e-4);
+  // Below that the result runs out of Q16 bits long before the polynomial
+  // runs out of accuracy, so the bound has to carry both terms: the last
+  // integer, and the same relative error as above. Measured, the worst case
+  // reaches 0.9998 of that sum - the two never pile up.
+  for (int32_t x = -15 * 1024; x < 0; ++x) {
+    double want = std::pow(2.0, (double)x / 1024.0) * 65536.0;
+    EXPECT_LE(std::fabs((double)gaud_celt_exp2((int16_t)x) - want),
+        1.0 + want * 1.08e-4) << x;
+  }
+}
+
+TEST(OpusMath, TheBitExactCosineHoldsOnlyOverTheDomainItsCallerProduces) {
+  // This one is integer in RFC 6716's floating-point build too, because the
+  // number it returns decides the stereo split's bit allocation and section
+  // 4.3.3 requires both ends to reach the same division.
+  //
+  // Its argument is `itheta`, which bands.c forms as `itheta*16384/qn` with
+  // `qn` at most 256 and with zero and 16384 handled before the call. So the
+  // domain is 64 to 16320. Below 64 the squared argument rounds to zero, the
+  // polynomial returns 32767, and adding the final one wraps the 16-bit
+  // result to -32768. The reference does exactly this and guards it with an
+  // assertion; the behaviour is transcribed rather than repaired, and pinned
+  // here so that a later "fix" has to argue with a test.
+  EXPECT_EQ(gaud_celt_bitexact_cos(0), -32768);
+  EXPECT_EQ(gaud_celt_bitexact_cos(63), -32768);
+  EXPECT_EQ(gaud_celt_bitexact_cos(64), 32767);
+  double worst = 0.0;
+  for (int32_t x = 64; x <= 16320; ++x) {
+    double want = std::cos(3.14159265358979323846 * 0.5 * ((double)x / 16384.0))
+        * 32767.0;
+    worst = std::max(worst,
+        std::fabs((double)gaud_celt_bitexact_cos((int16_t)x) - want));
+  }
+  // Measured: 2.2970 of 32767 over the whole domain, 1.7193 over the 255
+  // values a `qn` of 256 can actually produce.
+  EXPECT_LT(worst, 2.30);
+}
+
+TEST(OpusMath, TheBitExactLogTangentTracksTheRealOne) {
+  double worst = 0.0;
+  unsigned long count = 0;
+  for (int32_t sine = 1; sine <= 32767; sine += 37) {
+    for (int32_t cosine = 1; cosine <= 32767; cosine += 311) {
+      double want = std::log2((double)sine / (double)cosine) * 2048.0;
+      double got = (double)gaud_celt_bitexact_log2tan(sine, cosine);
+      worst = std::max(worst, std::fabs(got - want));
+      ++count;
+    }
+  }
+  EXPECT_GT(count, 80000u);
+  // Measured: 34.54 in Q11, which is 0.0169 of a bit.
+  EXPECT_LT(worst, 34.6);
+  // It is odd in its arguments up to the rounding, which is what makes the
+  // split symmetric; a sign dropped anywhere in it would break this.
+  for (int32_t a = 1; a <= 32767; a += 1021) {
+    for (int32_t b = 1; b <= 32767; b += 2039) {
+      EXPECT_EQ(gaud_celt_bitexact_log2tan(a, b),
+          -gaud_celt_bitexact_log2tan(b, a)) << a << "," << b;
+    }
+  }
+}
+
+TEST(OpusMath, DivisionGoesThroughTheReciprocalAndInheritsItsError) {
+  // celt_div is not a division: it is celt_rcp followed by a Q31 multiply
+  // that drops the lowest partial product. Writing it as `a / b` would be
+  // more accurate and would decode differently, so the test is that it is
+  // close to the quotient without being equal to it.
+  //
+  // The domain matters and is narrow: `exp_rotation` is the only caller, it
+  // returns before dividing unless twice the pulse count is below the band
+  // width, and a band is at most 176 bins. Outside that the dropped partial
+  // products cost real accuracy - a quotient of 9 comes back as 7 - so a
+  // bound measured over a wider sweep would say something true about a
+  // function nothing calls that way.
+  unsigned long differed = 0;
+  unsigned long count = 0;
+  double worst = 0.0;
+  for (int32_t len = 1; len <= 176; ++len) {
+    for (int32_t k = 0; k <= 128; ++k) {
+      if (2 * k >= len) {
+        continue;
+      }
+      static const int32_t kFactor[3] = {15, 10, 5};
+      for (int f = 0; f < 3; ++f) {
+        int32_t b = len + kFactor[f] * k;
+        int32_t a = 32767 * len;
+        int32_t got = gaud_celt_div(a, b);
+        worst = std::max(worst, RelativeError((double)got, (double)a / (double)b));
+        if (got != a / b) {
+          ++differed;
+        }
+        ++count;
+      }
+    }
+  }
+  EXPECT_EQ(count, 23496u);
+  // Measured: 9.776e-4 at worst, and it disagrees with integer division on
+  // 22,176 of the 23,496 - so the test above is not passing by accident.
+  EXPECT_LT(worst, 9.78e-4);
+  EXPECT_GT(differed, 22000u);
+}
+
+TEST(OpusMath, SixteenBitAddAndSubtractWrapRatherThanSaturate) {
+  // The polynomials above hold their intermediate results in 16 bits and the
+  // reference's answer is the wrapped one, so these cannot widen even though
+  // widening would look like a repair. Only gaud_celt_bitexact_cos reaches
+  // the wrap in practice, and only outside the domain its caller produces;
+  // the sweep in notes/audio/opus.md is what establishes that.
+  EXPECT_EQ(gaud_celt_add16(32767, 1), -32768);
+  EXPECT_EQ(gaud_celt_add16(-32768, -1), 32767);
+  EXPECT_EQ(gaud_celt_sub16(32767, -1), -32768);
+  EXPECT_EQ(gaud_celt_sub16(-32768, 1), 32767);
+  // Only the low 16 bits of either argument are read.
+  EXPECT_EQ(gaud_celt_add16(0x12340001, 0x56780002), 3);
+  // And the shift that is defined for negatives goes both ways.
+  EXPECT_EQ(gaud_celt_vshr32(-1024, 4), -64);
+  EXPECT_EQ(gaud_celt_vshr32(-1024, -4), -16384);
+  EXPECT_EQ(gaud_celt_vshr32(-1, 0), -1);
+}
+
+TEST(OpusMath, TheQ31MultiplyDropsTheLowestPartialProduct) {
+  // MULT32_32_Q31 is three 16-bit products, not a 64-bit one. The difference
+  // is small and it is part of the format, so a replacement written as
+  // `(int64_t)a * b >> 31` has to disagree with this somewhere - and does.
+  unsigned long differed = 0;
+  unsigned long count = 0;
+  for (int32_t a = 1; a < 0x40000000; a += 7654321) {
+    for (int32_t b = 1; b < 0x40000000; b += 12345671) {
+      int32_t got = gaud_celt_mult32_32_q31(a, b);
+      int32_t exact = (int32_t)(((int64_t)a * (int64_t)b) >> 31);
+      // Measured: never more than three out, and out on 9,551 of 12,267.
+      EXPECT_LE(std::abs((long)got - (long)exact), 3L) << a << "," << b;
+      if (got != exact) {
+        ++differed;
+      }
+      ++count;
+    }
+  }
+  EXPECT_EQ(count, 12267u);
+  EXPECT_GT(differed, 9000u);
+}
+
+
+// The reference's answer over a whole domain, in sixty-four bits.
+//
+// The error bounds above cannot finish this job and it is worth being plain
+// about why. Seventeen single-digit mutations were applied to these
+// functions and run past both instruments: a probe that links RFC 6716's
+// own implementation caught all seventeen, and the bounds above caught
+// twelve. The five they missed are the ones that matter most to get right -
+// a coefficient one off in celt_rcp's first guess, which two Newton
+// iterations then wash out of the error figure while changing 31,194 of the
+// integers it returns; the same for celt_sqrt's last coefficient, celt_exp2's
+// second, and bitexact_log2tan's. An approximation's accuracy and an
+// approximation's identity are different properties, and the format cares
+// about the second.
+//
+// So these are the reference's outputs, folded over the domain with FNV-1a.
+// Every constant here was computed twice - once from this code and once
+// from RFC 6716 Appendix A's, built fixed-point - and the two agreed before
+// either was written down. notes/audio/opus.md says how to repeat that.
+uint64_t Fnv1a(uint64_t digest, int64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    digest ^= ((uint64_t)value >> (i * 8)) & 0xFFu;
+    digest *= 1099511628211ull;
+  }
+  return digest;
+}
+
+// A positive integer with the given exponent and 15-bit mantissa. Every
+// function here reaches its polynomial through exactly that, so sweeping
+// all of them at all exponents is the whole input space, not a sample.
+int32_t WithMantissa(int exponent, uint32_t mantissa) {
+  return (int32_t)((1u << exponent)
+      | (exponent <= 15 ? (mantissa >> (15 - exponent))
+                        : (mantissa << (exponent - 15))));
+}
+
+TEST(OpusMath, EveryFunctionReturnsTheReferencesIntegersAcrossItsDomain) {
+  const uint64_t kSeed = 1469598103934665603ull;
+  uint64_t digest;
+
+  digest = kSeed;
+  for (int32_t x = -32768; x <= 32767; ++x) {
+    digest = Fnv1a(digest, gaud_celt_exp2((int16_t)x));
+  }
+  EXPECT_EQ(digest, 0xA17C81A934A460F1ull) << "celt_exp2, all 65536 arguments";
+
+  digest = kSeed;
+  for (int32_t x = 16384; x < 65536; ++x) {
+    digest = Fnv1a(digest, gaud_celt_rsqrt_norm(x));
+  }
+  EXPECT_EQ(digest, 0xA7CA7C918F7A7E83ull) << "celt_rsqrt_norm, all 49152";
+
+  digest = kSeed;
+  for (int32_t x = 0; x < 131072; ++x) {
+    digest = Fnv1a(digest, gaud_celt_cos_norm(x));
+  }
+  EXPECT_EQ(digest, 0xECABEC1F67019D72ull) << "celt_cos_norm, all 131072";
+
+  digest = kSeed;
+  for (int32_t x = -32768; x <= 32767; ++x) {
+    digest = Fnv1a(digest, gaud_celt_bitexact_cos((int16_t)x));
+  }
+  EXPECT_EQ(digest, 0x0E954EBA88EF3CD3ull) << "bitexact_cos, all 65536";
+
+  digest = kSeed;
+  for (int exponent = 1; exponent < 31; ++exponent) {
+    for (uint32_t mantissa = 0; mantissa < 32768u; ++mantissa) {
+      digest = Fnv1a(digest, gaud_celt_rcp(WithMantissa(exponent, mantissa)));
+    }
+  }
+  EXPECT_EQ(digest, 0xD56CB0980F913075ull) << "celt_rcp, 30 x 32768 mantissas";
+
+  digest = kSeed;
+  for (int exponent = 1; exponent < 31; ++exponent) {
+    for (uint32_t mantissa = 0; mantissa < 32768u; ++mantissa) {
+      digest = Fnv1a(digest, gaud_celt_sqrt(WithMantissa(exponent, mantissa)));
+    }
+  }
+  EXPECT_EQ(digest, 0xF010CD98D833DCFCull) << "celt_sqrt, 30 x 32768 mantissas";
+
+  // Zero is the one argument the reference leaves undefined - it shifts by a
+  // negative count there - so the sweep folds in a zero for it, which is
+  // what this version returns anyway.
+  digest = kSeed;
+  for (uint64_t v = 0; v < 4294967296ull; v += 4093) {
+    digest = Fnv1a(digest, gaud_celt_isqrt32((uint32_t)v));
+  }
+  EXPECT_EQ(digest, 0xB07DD24B8AD1090Aull) << "isqrt32, 1049086 at stride 4093";
+
+  digest = kSeed;
+  for (int32_t sine = 1; sine <= 32767; sine += 37) {
+    for (int32_t cosine = 1; cosine <= 32767; cosine += 311) {
+      digest = Fnv1a(digest, gaud_celt_bitexact_log2tan(sine, cosine));
+    }
+  }
+  EXPECT_EQ(digest, 0x95F2E5859143AD57ull) << "bitexact_log2tan, 886 x 106";
+
+  digest = kSeed;
+  for (int32_t len = 1; len <= 176; ++len) {
+    for (int32_t k = 0; k <= 128; ++k) {
+      if (2 * k >= len) {
+        continue;
+      }
+      static const int32_t kFactor[3] = {15, 10, 5};
+      for (int f = 0; f < 3; ++f) {
+        digest = Fnv1a(digest, gaud_celt_div(32767 * len, len + kFactor[f] * k));
+      }
+    }
+  }
+  EXPECT_EQ(digest, 0x65C03D0BAF31E53Aull) << "celt_div, exp_rotation's 23496";
+}
+
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
