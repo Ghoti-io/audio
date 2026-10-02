@@ -3682,6 +3682,203 @@ TEST(OpusOutput, AntiCollapseFillsOnlyTheBlocksTheMaskCallsEmpty) {
 }
 
 
+// ---------------------------------------------------------------------------
+// The inverse MDCT, section 4.3.7, and the mixed-radix FFT under it.
+
+TEST(OpusMdct, TheInverseTransformMatchesTheReference) {
+  // The sweep uses only the (shift, stride) pairs compute_inv_mdcts
+  // forms: a long frame is one transform of the whole spectrum, and a
+  // transient frame is `1 << LM` interleaved short ones. Sweeping other
+  // pairs would test a transform the codec never performs.
+  uint64_t digest = 1469598103934665603ull;
+  unsigned long cases = 0;
+  std::vector<int32_t> in(2048);
+  std::vector<int32_t> out(8192);
+  for (int lm = 0; lm <= 3; ++lm) {
+    for (int transient = 0; transient <= 1; ++transient) {
+      int shift = transient ? 3 : 3 - lm;
+      int stride = transient ? (1 << lm) : 1;
+      int n = 1920 >> shift;
+      int half = n >> 1;
+      for (int amp = 0; amp < 4; ++amp) {
+        for (int rep = 0; rep < 16; ++rep) {
+          unsigned state = (unsigned)(shift * 7919 + stride * 104729
+              + amp * 31 + rep * 37);
+          int scale = amp == 0 ? 1 : amp == 1 ? 64 : amp == 2 ? 4096 : (1 << 20);
+          for (int i = 0; i < half * stride; ++i) {
+            state = state * 1103515245u + 12345u;
+            in[(size_t)i] = (int32_t)((int)(state >> 8) % (2 * scale + 1))
+                - scale;
+          }
+          // The output buffer is NOT cleared: the transform adds into
+          // the samples the previous frame left, which is the whole of
+          // the overlap-add. Zeroing it here would make "+=" and "="
+          // indistinguishable, and two mutations that swap them would
+          // survive - which is how that was found.
+          for (int i = 0; i < 8192; ++i) {
+            state = state * 1103515245u + 12345u;
+            out[(size_t)i] = (int32_t)((int)(state >> 9) % 2000001) - 1000000;
+          }
+          gaud_celt_imdct(in.data(), out.data() + 2048, gaud_opus_window120,
+              120u, shift, (uint32_t)stride);
+          // The written region is well inside the first half; folding
+          // that much covers it and everything either side of it.
+          for (int i = 0; i < 4096; ++i) {
+            digest = Fnv1a(digest, out[(size_t)i]);
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 512u);
+  EXPECT_EQ(digest, 0xA408711A57A4BFDEull);
+}
+
+TEST(OpusMdct, TheUnwindowedMiddleIsADirectInverseMdct) {
+  // The independent reading. Only the middle of the output is the
+  // transform standing alone - the two bands of `overlap` samples
+  // around it are windowed and added to the previous frame's tail - so
+  // that is the part a textbook inverse MDCT can be compared against.
+  //
+  // Up to one global scale, because the reference's scaling is spread
+  // across the pre-rotation, the butterflies and the windowing. What
+  // this catches is a twiddle indexed wrongly, a transposed butterfly,
+  // a bad de-shuffle: all of them destroy the correlation rather than
+  // changing a factor.
+  const int kOverlap = 120;
+  std::vector<int32_t> in(2048);
+  std::vector<int32_t> out(8192);
+  std::vector<double> want(2048);
+  unsigned checked = 0;
+  for (int shift = 0; shift <= 3; ++shift) {
+    int n = 1920 >> shift;
+    int half = n >> 1;
+    int quarter = n >> 2;
+    int low = half - quarter + kOverlap / 2;
+    int high = half + quarter - kOverlap / 2;
+    if (low >= high) {
+      // At the shortest transform the window covers everything, so
+      // there is no middle to look at. That is a fact about the
+      // geometry and is asserted rather than silently skipped.
+      EXPECT_EQ(shift, 3);
+      EXPECT_EQ(quarter, kOverlap / 2);
+      continue;
+    }
+    for (int rep = 0; rep < 4; ++rep) {
+      unsigned state = (unsigned)(shift * 7919 + rep * 104729);
+      for (int i = 0; i < half; ++i) {
+        state = state * 1103515245u + 12345u;
+        in[(size_t)i] = (int32_t)((int)(state >> 12) % 200001) - 100000;
+      }
+      std::fill(out.begin(), out.end(), (int32_t)0);
+      gaud_celt_imdct(in.data(), out.data() + 2048, gaud_opus_window120,
+          (uint32_t)kOverlap, shift, 1u);
+      for (int sample = 0; sample < n; ++sample) {
+        double sum = 0.0;
+        for (int k = 0; k < half; ++k) {
+          sum += in[(size_t)k]
+              * std::cos(3.14159265358979323846 / half
+                  * ((double)sample + 0.5 + half / 2.0) * ((double)k + 0.5));
+        }
+        want[(size_t)sample] = sum;
+      }
+      int base = 2048 - ((half - kOverlap) >> 1);
+      double xy = 0.0;
+      double xx = 0.0;
+      double yy = 0.0;
+      for (int sample = low; sample < high; ++sample) {
+        double got = (double)out[(size_t)(base + sample)];
+        xy += got * want[(size_t)sample];
+        xx += got * got;
+        yy += want[(size_t)sample] * want[(size_t)sample];
+      }
+      EXPECT_GT(xy / std::sqrt(xx * yy), 0.99999999)
+          << "shift " << shift << " rep " << rep;
+      ++checked;
+    }
+  }
+  EXPECT_EQ(checked, 12u);
+}
+
+TEST(OpusMdct, TheSineApproximationIsTheSameAtEveryTransformSize) {
+  // sin(x) is close enough to x at these sizes that one multiply stands
+  // in for a whole extra rotation, and the multiplier is
+  // (25736 + N/2) / N with integer division. Moving that constant by
+  // one is the only mutation of this file that no test catches, and it
+  // is inert rather than untested: the division absorbs it at all four
+  // sizes. Moving it by 64 is caught, which bounds what is pinned.
+  for (int shift = 0; shift <= 3; ++shift) {
+    int n = 1920 >> shift;
+    int half = n >> 1;
+    EXPECT_EQ((25736 + half) / n, (25737 + half) / n) << "n " << n;
+  }
+  // The four quotients themselves, so a change to the formula rather
+  // than to the constant is still caught here.
+  EXPECT_EQ((25736 + 960) / 1920, 13);
+  EXPECT_EQ((25736 + 480) / 960, 27);
+  EXPECT_EQ((25736 + 240) / 480, 54);
+  EXPECT_EQ((25736 + 120) / 240, 107);
+  // And 25800 is not absorbed, at the shortest size.
+  EXPECT_NE((25736 + 120) / 240, (25800 + 120) / 240);
+}
+
+TEST(OpusMdct, TheFftTablesCanBeUsedAtAll) {
+  // Three properties the generator also checks, kept here because the
+  // tables are committed and the generator only runs when asked: a
+  // factorisation that does not multiply to its size walks off the end
+  // of the array, and a bit-reversal table that is not a permutation
+  // either drops or duplicates an input.
+  static const int16_t * const kBitrev[4] = {
+      gaud_opus_fft_bitrev480, gaud_opus_fft_bitrev240,
+      gaud_opus_fft_bitrev120, gaud_opus_fft_bitrev60};
+  for (int level = 0; level < 4; ++level) {
+    int size = gaud_opus_fft_nfft[level];
+    EXPECT_EQ(size, 480 >> level);
+    int product = 1;
+    int radices = 0;
+    for (int pair = 0; pair < 8; ++pair) {
+      int radix = gaud_opus_fft_factors[level * 16 + 2 * pair];
+      if (radix == 0) {
+        break;
+      }
+      EXPECT_TRUE(radix == 2 || radix == 3 || radix == 4 || radix == 5)
+          << "level " << level << " radix " << radix;
+      product *= radix;
+      // The second of each pair is how many points remain below it.
+      EXPECT_EQ(gaud_opus_fft_factors[level * 16 + 2 * pair + 1],
+          size / product)
+          << "level " << level << " pair " << pair;
+      ++radices;
+    }
+    EXPECT_EQ(product, size) << "level " << level;
+    EXPECT_GT(radices, 2);
+    std::set<int> seen;
+    for (int i = 0; i < size; ++i) {
+      EXPECT_GE(kBitrev[level][i], 0);
+      EXPECT_LT(kBitrev[level][i], size);
+      seen.insert(kBitrev[level][i]);
+    }
+    EXPECT_EQ(seen.size(), (size_t)size) << "level " << level;
+  }
+  // The twiddles are a unit circle, at the scale the Q15 multiply wants.
+  for (int i = 0; i < 480; ++i) {
+    double r = gaud_opus_fft_twiddles48000_960[2 * i];
+    double im = gaud_opus_fft_twiddles48000_960[2 * i + 1];
+    double magnitude = std::sqrt(r * r + im * im);
+    EXPECT_GT(magnitude, 32766.0) << i;
+    EXPECT_LT(magnitude, 32771.0) << i;
+  }
+  // And the MDCT's are a quarter cosine, from one down to zero.
+  EXPECT_EQ(gaud_opus_mdct_twiddles960[0], 32767);
+  EXPECT_EQ(gaud_opus_mdct_twiddles960[480], 0);
+  for (int i = 1; i <= 480; ++i) {
+    EXPECT_LE(gaud_opus_mdct_twiddles960[i], gaud_opus_mdct_twiddles960[i - 1])
+        << i;
+  }
+}
+
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

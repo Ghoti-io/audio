@@ -683,6 +683,33 @@ void gaud_celt_denormalise_bands(const CELT_Mode * mode, const int16_t * x,
     int32_t * out, const int32_t * amplitude, uint32_t end,
     uint32_t channels);
 
+/**
+ * @brief The inverse MDCT, section 4.3.7.
+ *
+ * An inverse MDCT of `1920 >> shift` points: a rotation, a complex
+ * inverse FFT of a quarter the size, another rotation, and then the
+ * windowing that makes consecutive frames add back to the signal.
+ *
+ * **It adds into the first `overlap` samples rather than writing
+ * them.** That is the time-domain alias cancellation: the tail the
+ * previous frame left there is half of what the output should be, and
+ * this supplies the other half. A caller that clears the buffer first
+ * gets a frame of windowed nonsense.
+ *
+ * @param in The spectrum, `1920 >> shift >> 1` values at @p stride.
+ * @param out Receives the samples. Writing starts
+ *   `((N/2) - overlap) / 2` entries *before* this pointer, where N is
+ *   `1920 >> shift`, so the caller's buffer must have that much room
+ *   behind it.
+ * @param window The overlap window in Q15, @p overlap entries.
+ * @param overlap How many samples the frames share; 120 at 48 kHz.
+ * @param shift 0 for a 20 ms frame through 3 for 2.5 ms.
+ * @param stride How far apart @p in's values are; the short MDCTs of a
+ *   transient frame are interleaved in one array.
+ */
+void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
+    uint32_t overlap, int shift, uint32_t stride);
+
 #ifdef __cplusplus
 }
 #endif

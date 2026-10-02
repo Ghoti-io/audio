@@ -55,6 +55,7 @@ can assert the committed tables are what this script produces.
 
 import argparse
 import hashlib
+import math
 import os
 import re
 import subprocess
@@ -517,6 +518,16 @@ def extract(root, rfc_text):
             ("celt/quant_bands.c", "e_prob_model",
              "unsigned char", 4 * 2 * 42),
             ("celt/quant_bands.c", "eMeans", "int8_t", 25),
+            # The inverse MDCT's twiddles, and the FFT it is built on.
+            # 481 entries of a quarter cosine, and 480 complex twiddles
+            # written as 960 integers.
+            ("celt/static_modes_fixed.h", "mdct_twiddles960", "int16_t", 481),
+            ("celt/static_modes_fixed.h", "fft_twiddles48000_960",
+             "int16_t", 960),
+            ("celt/static_modes_fixed.h", "fft_bitrev480", "int16_t", 480),
+            ("celt/static_modes_fixed.h", "fft_bitrev240", "int16_t", 240),
+            ("celt/static_modes_fixed.h", "fft_bitrev120", "int16_t", 120),
+            ("celt/static_modes_fixed.h", "fft_bitrev60", "int16_t", 60),
     ):
         values = read_array(root, relative, name)
         # The reference's one camel-case array name; everything else here
@@ -551,13 +562,156 @@ def extract(root, rfc_text):
                 f"gen_opus_tables: the two spellings of {name} disagree: "
                 f"{integers} against {floats}")
         tables[name] = ("int16_t", integers)
+    # The four FFT configurations are struct initialisers rather than
+    # arrays, so they need their own reader. Each gives a transform size,
+    # a twiddle stride and a factorisation; the sizes are asserted
+    # against the frame sizes they belong to, because a factorisation
+    # read against the wrong size would still look like a list of
+    # integers.
+    modes = open(os.path.join(root, "celt/static_modes_fixed.h"),
+                 encoding="utf-8", errors="replace").read()
+    nffts = []
+    shifts = []
+    factors = []
+    for level in range(4):
+        found = re.search(
+            r"fft_state48000_960_%d\s*=\s*\{(.*?)\};" % level, modes, re.S)
+        if not found:
+            raise SystemExit(
+                f"gen_opus_tables: no fft_state48000_960_{level}")
+        body = re.sub(r"/\*.*?\*/", " ", found.group(1), flags=re.S)
+        head, _, rest = body.partition("{")
+        numbers = [int(v) for v in re.findall(r"-?\d+", head)]
+        if len(numbers) != 2:
+            raise SystemExit(
+                f"gen_opus_tables: fft_state48000_960_{level} starts with "
+                f"{numbers}, not a size and a shift")
+        inner = [int(v) for v in re.findall(r"-?\d+", rest.split("}")[0])]
+        if len(inner) != 16:
+            raise SystemExit(
+                f"gen_opus_tables: fft_state48000_960_{level} has "
+                f"{len(inner)} factors, not 16")
+        nffts.append(numbers[0])
+        shifts.append(numbers[1])
+        factors.extend(inner)
+    # 480 is the longest frame's N/4, and each shorter frame halves it.
+    if nffts != [480, 240, 120, 60]:
+        raise SystemExit(
+            f"gen_opus_tables: the FFT sizes are {nffts}, not the "
+            "480/240/120/60 the four frame sizes need")
+    if shifts != [-1, 1, 2, 3]:
+        raise SystemExit(f"gen_opus_tables: the FFT shifts are {shifts}")
+    for level, size in enumerate(nffts):
+        product = 1
+        for pair in range(8):
+            radix = factors[level * 16 + 2 * pair]
+            if radix == 0:
+                break
+            product *= radix
+        if product != size:
+            raise SystemExit(
+                f"gen_opus_tables: fft_state48000_960_{level}'s factors "
+                f"multiply to {product}, not its size {size}")
+    tables["fft_nfft"] = ("int16_t", nffts)
+    tables["fft_shift"] = ("int16_t", shifts)
+    tables["fft_factors"] = ("int16_t", factors)
+    print("gen_opus_tables: each FFT configuration's factors multiply to "
+          "its transform size")
+
     beta_intra = re.search(r"beta_intra\s*=\s*(\d+)\s*;", text)
     if not beta_intra:
         raise SystemExit("gen_opus_tables: no beta_intra")
     tables["beta_intra"] = ("int16_t", [int(beta_intra.group(1))])
     print("gen_opus_tables: the prediction coefficients agree between the "
           "fixed-point and floating-point spellings")
+    check_fft_tables(tables)
     return tables
+
+
+
+def celt_cos_norm(x):
+    """RFC 6716's fixed-point cosine, in Python, for checking a table.
+
+    A second transcription of celt/mathops.c's `celt_cos_norm`, written
+    here so that the MDCT twiddles can be checked against the formula
+    `clt_mdct_init` computes them with rather than only copied. Two
+    transcriptions agreeing is worth more than one being careful.
+    """
+
+    def s16(value):
+        value &= 0xFFFF
+        return value - 0x10000 if value >= 0x8000 else value
+
+    def frac_mul_p15(a, b):
+        return (16384 + s16(a) * s16(b)) >> 15
+
+    def cos_pi_2(x):
+        x2 = frac_mul_p15(x, x)
+        inner = 8277 + frac_mul_p15(-626, x2)
+        inner = -7651 + frac_mul_p15(x2, inner)
+        value = s16(32767 - x2) + frac_mul_p15(x2, inner)
+        return s16(1 + min(value, 32766))
+
+    x &= 0x0001FFFF
+    if x > 65536:
+        x = 131072 - x
+    if x & 0x00007FFF:
+        if x < 32768:
+            return cos_pi_2(s16(x))
+        return -cos_pi_2(s16(65536 - x))
+    if x & 0x0000FFFF:
+        return 0
+    if x & 0x0001FFFF:
+        return -32767
+    return 32767
+
+
+def check_fft_tables(tables):
+    """The MDCT and FFT twiddles against the formulas that make them."""
+    # clt_mdct_init: trig[i] = celt_cos_norm((i<<17 + N2) / N), N = 1920.
+    mdct = tables["mdct_twiddles960"][1]
+    for index, have in enumerate(mdct):
+        want = celt_cos_norm(((index << 17) + 960) // 1920)
+        if want != have:
+            raise SystemExit(
+                f"gen_opus_tables: mdct_twiddles960[{index}] is {have}, but "
+                f"the formula in clt_mdct_init gives {want}")
+    print(f"gen_opus_tables: all {len(mdct)} MDCT twiddles reproduce from "
+          "celt_cos_norm of the formula clt_mdct_init uses")
+
+    # The FFT twiddles are exp(-2*pi*i*k/480), and they are *not* a
+    # rounded real cosine - `floor(.5 + 32767*cos(phase))`, which is
+    # what kiss_fft's own KISS_FFT_COS would give, is wrong by up to two
+    # for a third of them. They are celt_cos_norm's output, in the units
+    # where 32768 is a quarter turn: a phase of 2*pi*k/480 is
+    # (k << 17) / 480, and the sine is the same a quarter turn along.
+    #
+    # That is worth having rather than a tolerance, because it says the
+    # tables and the arithmetic came from one place.
+    twiddles = tables["fft_twiddles48000_960"][1]
+    for index in range(len(twiddles) // 2):
+        phase = (index << 17) // 480
+        want_r = celt_cos_norm(phase)
+        want_i = celt_cos_norm(phase + 32768)
+        if (want_r, want_i) != (twiddles[2 * index], twiddles[2 * index + 1]):
+            raise SystemExit(
+                f"gen_opus_tables: fft_twiddles48000_960[{index}] is "
+                f"({twiddles[2*index]},{twiddles[2*index+1]}), but "
+                f"celt_cos_norm of ({phase}, {phase + 32768}) gives "
+                f"({want_r},{want_i})")
+    print(f"gen_opus_tables: all {len(twiddles)//2} FFT twiddles reproduce "
+          "from celt_cos_norm of their phase")
+
+    # Each bit-reversal table must be a permutation of its own range,
+    # which is the one property that makes it usable at all.
+    for size in (480, 240, 120, 60):
+        values = tables[f"fft_bitrev{size}"][1]
+        if sorted(values) != list(range(size)):
+            raise SystemExit(
+                f"gen_opus_tables: fft_bitrev{size} is not a permutation "
+                f"of 0..{size - 1}")
+    print("gen_opus_tables: each FFT bit-reversal table is a permutation of "
+          "its own range")
 
 
 def render(name, kind, values, per_line=12):
@@ -617,6 +771,15 @@ extern "C" {
         "beta_intra": "The same, for a frame coded without history.",
         "log2_frac_table": "Cost of coding one of k+1 values, in eighths of a bit.",
         "e_means": "The mean energy per band, in Q4 decibels; 21 used of 25.",
+        "mdct_twiddles960": "The inverse MDCT's rotation, a quarter cosine in Q15.",
+        "fft_twiddles48000_960": "The FFT's twiddles: 480 complex pairs in Q15.",
+        "fft_bitrev480": "Input permutation for the 480-point FFT.",
+        "fft_bitrev240": "Input permutation for the 240-point FFT.",
+        "fft_bitrev120": "Input permutation for the 120-point FFT.",
+        "fft_bitrev60": "Input permutation for the 60-point FFT.",
+        "fft_nfft": "Each frame size's FFT length.",
+        "fft_shift": "Each frame size's twiddle stride, as a shift.",
+        "fft_factors": "Each frame size's radix factorisation, 4 by 16.",
     }
     for name in tables:
         if name not in notes:

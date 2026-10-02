@@ -89,11 +89,38 @@ extern const unsigned char gaud_opus_e_prob_model[336];
 /** The mean energy per band, in Q4 decibels; 21 used of 25. */
 extern const int8_t gaud_opus_e_means[25];
 
+/** The inverse MDCT's rotation, a quarter cosine in Q15. */
+extern const int16_t gaud_opus_mdct_twiddles960[481];
+
+/** The FFT's twiddles: 480 complex pairs in Q15. */
+extern const int16_t gaud_opus_fft_twiddles48000_960[960];
+
+/** Input permutation for the 480-point FFT. */
+extern const int16_t gaud_opus_fft_bitrev480[480];
+
+/** Input permutation for the 240-point FFT. */
+extern const int16_t gaud_opus_fft_bitrev240[240];
+
+/** Input permutation for the 120-point FFT. */
+extern const int16_t gaud_opus_fft_bitrev120[120];
+
+/** Input permutation for the 60-point FFT. */
+extern const int16_t gaud_opus_fft_bitrev60[60];
+
 /** Coarse energy's time prediction, per frame size, Q15. */
 extern const int16_t gaud_opus_pred_coef[4];
 
 /** Coarse energy's frequency prediction, Q15. */
 extern const int16_t gaud_opus_beta_coef[4];
+
+/** Each frame size's FFT length. */
+extern const int16_t gaud_opus_fft_nfft[4];
+
+/** Each frame size's twiddle stride, as a shift. */
+extern const int16_t gaud_opus_fft_shift[4];
+
+/** Each frame size's radix factorisation, 4 by 16. */
+extern const int16_t gaud_opus_fft_factors[64];
 
 /** The same, for a frame coded without history. */
 extern const int16_t gaud_opus_beta_intra[1];
