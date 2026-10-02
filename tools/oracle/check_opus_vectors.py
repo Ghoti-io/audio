@@ -99,7 +99,7 @@ def run_probe(probe, paths):
             current = os.path.basename(parts[1]).replace(".bit", "")
             out[current] = {"packets": 0, "refused": 0, "samples": 0,
                             "configs": set(), "ranges": 0, "matched": 0,
-                            "truncated": False}
+                            "stale": 0, "absent": 0, "truncated": False}
         elif parts[0] == "packet" and current:
             entry = out[current]
             entry["packets"] += 1
@@ -109,9 +109,18 @@ def run_probe(probe, paths):
             fields = dict(zip(parts[2::2], parts[3::2]))
             entry["configs"].add(int(fields["config"]))
             entry["samples"] += int(fields["samples"])
-            if fields.get("range", "none") != "none":
+            # "none" is a packet in a mode that has no decoder yet.
+            # "stale" is a CELT packet in a stream that has already
+            # carried one of those, so the state it should have built
+            # on is missing - not a failure, and not a pass either.
+            state = fields.get("range", "none")
+            if state == "none":
+                entry["absent"] += 1
+            elif state == "stale":
+                entry["stale"] += 1
+            else:
                 entry["ranges"] += 1
-                if int(fields["range"]) == int(fields["want_range"]):
+                if int(state) == int(fields["want_range"]):
                     entry["matched"] += 1
         elif parts[0] == "truncated" and current:
             out[current]["truncated"] = True
@@ -141,6 +150,8 @@ def main(argv):
     total_samples = 0
     total_ranges = 0
     total_matched = 0
+    total_stale = 0
+    total_absent = 0
     seen_configs = set()
 
     print(f"check-opus-vectors: the codec declares {capabilities}")
@@ -155,7 +166,18 @@ def main(argv):
         total_samples += entry["samples"]
         total_ranges += entry["ranges"]
         total_matched += entry["matched"]
+        total_stale += entry["stale"]
+        total_absent += entry["absent"]
         seen_configs |= entry["configs"]
+
+        # Each vector's own count, so a regression says which stream it
+        # is in rather than only that the total moved.
+        want_matched = opus_vectors.CELT_RANGE_MATCHED.get(name)
+        if want_matched is not None and entry["matched"] != want_matched:
+            failures.append(
+                f"{name}: {entry['matched']} packets ended with the "
+                f"reference's range state, and {want_matched} did when "
+                "this was last measured")
 
         if entry["truncated"]:
             failures.append(f"{name}: the vector's own framing ran out")
@@ -218,6 +240,16 @@ def main(argv):
         else:
             print(f"check-opus-vectors: all {total_ranges} final range "
                   "decoder states match the reference exactly")
+        # The two categories that are not yet claimable, named so that
+        # the number above cannot be read as "all of them".
+        print(f"check-opus-vectors: {total_absent} packets are SILK or "
+              f"hybrid, which have no decoder; {total_stale} are CELT in a "
+              "stream that already carried one of those, so the state they "
+              "would build on is missing. Neither is compared.")
+        if total_ranges + total_stale + total_absent != total_packets:
+            failures.append(
+                "the three categories do not add up to the packet count, "
+                "so some packets are being counted twice or not at all")
 
     if failures:
         print("\n\033[0;31mcheck-opus-vectors: "

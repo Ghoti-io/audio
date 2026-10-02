@@ -49,6 +49,7 @@
  * needs this library's answer to leave the process.
  */
 
+#include "../../src/codec/opus/opus_celt.h"
 #include "../../src/codec/opus/opus_internal.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
@@ -111,7 +112,16 @@ int main(int argc, char ** argv) {
       codec && (codec->capabilities & GAUD_CAP_DECODE) ? "decode"
                                                        : "metadata-only");
 
+  CELT_Decoder * decoder = malloc(sizeof *decoder);
+  CELT_Scratch * scratch = malloc(sizeof *scratch);
+  int16_t * pcm = malloc(2u * 960u * sizeof *pcm);
+  if (!decoder || !scratch || !pcm) {
+    fprintf(stderr, "opus_probe: out of memory\n");
+    return 2;
+  }
+
   for (int arg = 1; arg < argc; ++arg) {
+    bool seen_other_mode = false;
     size_t size = 0;
     unsigned char * data = slurp(argv[arg], &size);
     if (!data) {
@@ -119,6 +129,13 @@ int main(int argc, char ** argv) {
       return 2;
     }
     printf("file\t%s\n", argv[arg]);
+    /*
+     * Each vector is its own stream, so the CELT state restarts here.
+     * It is NOT restarted per packet: the envelope, the overlap and the
+     * post-filter's history all carry, and a decoder that forgot them
+     * would still produce plausible audio and the wrong range state.
+     */
+    gaud_celt_decoder_init(decoder, 2u, 1);
     size_t at = 0;
     uint64_t index = 0;
     uint64_t samples = 0;
@@ -141,15 +158,61 @@ int main(int argc, char ** argv) {
         /*
          * `range` is the final range decoder state once every symbol of
          * every frame in the packet has been read, which is what the
-         * vector states. There is no decoder yet, so this reports the
-         * absence rather than a zero that could be mistaken for an
-         * answer - a gate comparing against 0 would otherwise look like
-         * it was comparing something.
+         * vector states. CELT packets have it; the other two modes do
+         * not yet, and say "none" rather than a zero that a gate could
+         * mistake for an answer.
+         *
+         * A CELT packet in a stream that has carried SILK or hybrid
+         * packets cannot match either, because the state those left is
+         * missing - so the mode of every packet so far is tracked, and
+         * such a packet reports "stale" rather than a failure. That
+         * distinction is the difference between "not written yet" and
+         * "written and wrong".
          */
+        char range_text[32];
+        if (packet.toc.mode != OPUS_MODE_CELT) {
+          seen_other_mode = true;
+          snprintf(range_text, sizeof range_text, "none");
+        } else if (seen_other_mode) {
+          snprintf(range_text, sizeof range_text, "stale");
+        } else {
+          unsigned lm = 0;
+          while (lm < 3u && (120u << lm) < packet.toc.frame_size) {
+            ++lm;
+          }
+          if ((120u << lm) != packet.toc.frame_size) {
+            /* A SILK-only frame size; not reachable for a CELT TOC. */
+            snprintf(range_text, sizeof range_text, "none");
+          } else {
+            /*
+             * The band range is not a property of CELT but of the Opus
+             * packet around it: the TOC's bandwidth decides where the
+             * spectrum stops, and a decoder that always codes all 21
+             * bands reads the right symbols only for a fullband packet.
+             * src/opus_decoder.c in Appendix A is where this mapping
+             * lives; leaving it out made 3,122 packets of one vector
+             * disagree while two other vectors matched completely.
+             */
+            static const uint32_t kEndBand[5] = {13u, 17u, 17u, 19u, 21u};
+            decoder->start = 0u;
+            decoder->end = kEndBand[packet.toc.bandwidth < 5u
+                    ? packet.toc.bandwidth
+                    : 4u];
+            for (uint32_t frame = 0; frame < packet.count; ++frame) {
+              OPUS_Range range;
+              gaud_opus_range_init(
+                  &range, packet.frame[frame], packet.length[frame]);
+              gaud_celt_decode_frame(decoder, &range, packet.length[frame],
+                  packet.toc.stereo ? 2u : 1u, lm, pcm, scratch);
+            }
+            snprintf(range_text, sizeof range_text, "%" PRIu32, decoder->rng);
+          }
+        }
         printf("packet\t%" PRIu64 "\tconfig\t%u\tstereo\t%d\tframes\t%u"
-               "\tsamples\t%u\twant_range\t%" PRIu32 "\trange\tnone\n",
+               "\tsamples\t%u\twant_range\t%" PRIu32 "\trange\t%s\n",
             index, (unsigned)(data[at] >> 3),
-            packet.toc.stereo ? 1 : 0, packet.count, duration, want_range);
+            packet.toc.stereo ? 1 : 0, packet.count, duration, want_range,
+            range_text);
       }
       at += length;
       ++index;
@@ -157,5 +220,8 @@ int main(int argc, char ** argv) {
     printf("total\t%" PRIu64 "\t%" PRIu64 "\n", index, samples);
     free(data);
   }
+  free(decoder);
+  free(scratch);
+  free(pcm);
   return 0;
 }

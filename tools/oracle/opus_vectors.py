@@ -111,6 +111,25 @@ FILE_SHA256 = {
 # of contents byte of every packet. Recorded so that a gate can say which
 # part of the format a failure is in, and so that the claim "all 32
 # configurations are covered" is checkable rather than asserted.
+# How many packets of each vector end with the final range decoder state
+# RFC 6716 section 6 requires, as measured. Absent names contribute none.
+#
+# This is not a target to reach but a ratchet: it is the number that
+# holds today, and a change in either direction is a finding. Going down
+# is a regression; going up means a mode was implemented and nobody
+# updated the figure, which is worth saying out loud rather than
+# silently passing.
+#
+# Everything missing from it is a SILK or hybrid packet, or a CELT packet
+# in a stream that has already carried one - there is no SILK decoder yet
+# to leave the state those need.
+CELT_RANGE_MATCHED = {
+    "testvector01": 2147,
+    "testvector07": 4186,
+    "testvector10": 965,
+    "testvector11": 553,
+}
+
 CONFIGS = {
     "testvector01": [28, 29, 30, 31],
     "testvector02": [0, 1, 2, 3],
