@@ -111,13 +111,12 @@ def run_probe(probe, paths):
             entry["configs"].add(int(fields["config"]))
             entry["samples"] += int(fields["samples"])
             # "none" is a packet in a mode that has no decoder yet.
-            # "stale" is a CELT packet in a stream that has already
-            # carried one of those, so the state it should have built
-            # on is missing. "redundant" is a SILK packet with room
-            # after its frames for the mode-switch handover, which
-            # reads one more symbol and folds a second decoder's range
-            # into the answer. None of the three is a failure, and
-            # none is a pass either.
+            # "redundant" is a packet carrying the mode-switch
+            # handover, which reads a second CELT frame with a range
+            # decoder of its own and folds its final state into the
+            # answer. "stale" is a CELT packet whose decoder state was
+            # last set by one of those. None of the three is a
+            # failure, and none is a pass either.
             state = fields.get("range", "none")
             if state == "none":
                 entry["absent"] += 1
@@ -251,12 +250,11 @@ def main(argv):
                   "decoder states match the reference exactly")
         # The categories that are not yet claimable, named so that the
         # number above cannot be read as "all of them".
-        print(f"check-opus-vectors: {total_absent} packets are hybrid, "
-              f"which has no decoder; {total_stale} are CELT in a stream "
-              "that already carried another mode, so the state they would "
-              f"build on is missing; {total_redundant} are SILK with room "
-              "for a mode-switch handover this does not read yet. None of "
-              "the three is compared.")
+        print(f"check-opus-vectors: {total_redundant} packets carry a "
+              "mode-switch handover, which is not decoded yet; "
+              f"{total_stale} are CELT packets whose decoder state one of "
+              f"those last set; {total_absent} are in no mode at all. None "
+              "of the three is compared.")
         if (total_ranges + total_stale + total_absent + total_redundant
                 != total_packets):
             failures.append(

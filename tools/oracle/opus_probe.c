@@ -123,7 +123,9 @@ int main(int argc, char ** argv) {
   }
 
   for (int arg = 1; arg < argc; ++arg) {
-    bool seen_other_mode = false;
+    int prev_mode = -1;
+    bool prev_redundancy = false;
+    bool celt_poisoned = false;
     size_t size = 0;
     unsigned char * data = slurp(argv[arg], &size);
     if (!data) {
@@ -161,18 +163,30 @@ int main(int argc, char ** argv) {
         /*
          * `range` is the final range decoder state once every symbol of
          * every frame in the packet has been read, which is what the
-         * vector states. CELT packets have it; the other two modes do
-         * not yet, and say "none" rather than a zero that a gate could
-         * mistake for an answer.
+         * vector states. A packet whose state cannot be claimed says so
+         * in words rather than printing a zero a gate could mistake for
+         * an answer: "redundant" for a packet carrying a mode-switch
+         * handover, which is not decoded yet, and "stale" for a CELT
+         * packet whose state was last set by one of those.
          *
-         * A CELT packet in a stream that has carried SILK or hybrid
-         * packets cannot match either, because the state those left is
-         * missing - so the mode of every packet so far is tracked, and
-         * such a packet reports "stale" rather than a failure. That
-         * distinction is the difference between "not written yet" and
-         * "written and wrong".
+         * src/opus_decoder.c resets the CELT decoder whenever the mode
+         * changes and the previous packet carried no handover, so that
+         * reset is modelled here: it is what makes a CELT packet after
+         * an ordinary mode change comparable rather than permanently
+         * suspect. In these vectors it does not happen to rescue any,
+         * because the handover is exactly what the encoder uses when it
+         * switches - but the alternative was to call every CELT packet
+         * after any SILK one stale, which would have been a weaker
+         * claim resting on a false reason.
          */
         char range_text[32];
+        if ((int)packet.toc.mode != prev_mode && prev_mode >= 0
+            && !prev_redundancy) {
+          gaud_celt_decoder_init(decoder, 2u, 1);
+          celt_poisoned = false;
+        }
+        prev_mode = (int)packet.toc.mode;
+        prev_redundancy = false;
         if (packet.toc.mode == OPUS_MODE_SILK) {
           /*
            * SILK's parse is the half section 6 is strict about, and it
@@ -183,7 +197,6 @@ int main(int argc, char ** argv) {
            * compared even in a stream whose earlier packets were a
            * mode this probe cannot decode.
            */
-          seen_other_mode = true;
           static const int kSilkRate[3] = {8, 12, 16};
           int rate = kSilkRate[packet.toc.bandwidth < 3u
                   ? packet.toc.bandwidth
@@ -216,15 +229,71 @@ int main(int argc, char ** argv) {
               }
             }
             if (redundant) {
+              prev_redundancy = true;
+              celt_poisoned = true;
+              snprintf(range_text, sizeof range_text, "redundant");
+            } else {
+              snprintf(range_text, sizeof range_text, "%" PRIu32, rng);
+            }
+          }
+        } else if (packet.toc.mode == OPUS_MODE_HYBRID) {
+          /*
+           * Hybrid is SILK below 8 kHz and CELT above it, in one range
+           * decoder: the SILK half first, at 16 kHz, then a flag, then
+           * CELT starting at band 17. Nothing new is needed for it -
+           * which is the point of running it here, because if either
+           * half were subtly wrong about where it stops the other
+           * would read the wrong symbols immediately.
+           */
+          int duration_ms = (int)(packet.toc.frame_size / 48u);
+          int channels = packet.toc.stereo ? 2 : 1;
+          unsigned lm = 0;
+          while (lm < 3u && (120u << lm) < packet.toc.frame_size) {
+            ++lm;
+          }
+          if (!gaud_silk_decoder_init(silk, channels, 16, duration_ms)
+              || (120u << lm) != packet.toc.frame_size) {
+            snprintf(range_text, sizeof range_text, "none");
+          } else {
+            static const uint32_t kEndBand[5] = {13u, 17u, 17u, 19u, 21u};
+            bool redundant = false;
+            uint32_t rng = 0;
+            for (uint32_t frame = 0; frame < packet.count; ++frame) {
+              OPUS_Range range;
+              uint32_t len = packet.length[frame];
+              gaud_opus_range_init(&range, packet.frame[frame], len);
+              gaud_silk_parse_packet(silk, &range);
+              /*
+               * src/opus_decoder.c looks for a mode-switch handover
+               * here, and only spends the flag when there is room for
+               * one. A packet that has room is left uncompared: the
+               * handover folds a second CELT decoder's final range
+               * into the answer, and that is not written yet.
+               */
+              if (gaud_opus_tell(&range) + 37u <= 8u * len
+                  && gaud_opus_dec_bit_logp(&range, 12)) {
+                redundant = true;
+                break;
+              }
+              decoder->start = 17u;
+              decoder->end = kEndBand[packet.toc.bandwidth < 5u
+                      ? packet.toc.bandwidth
+                      : 4u];
+              gaud_celt_decode_frame(decoder, &range, len,
+                  packet.toc.stereo ? 2u : 1u, lm, pcm, scratch);
+              rng = decoder->rng;
+            }
+            if (redundant) {
+              prev_redundancy = true;
+              celt_poisoned = true;
               snprintf(range_text, sizeof range_text, "redundant");
             } else {
               snprintf(range_text, sizeof range_text, "%" PRIu32, rng);
             }
           }
         } else if (packet.toc.mode != OPUS_MODE_CELT) {
-          seen_other_mode = true;
           snprintf(range_text, sizeof range_text, "none");
-        } else if (seen_other_mode) {
+        } else if (celt_poisoned) {
           snprintf(range_text, sizeof range_text, "stale");
         } else {
           unsigned lm = 0;

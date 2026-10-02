@@ -118,12 +118,14 @@ RANGE_MATCHED = {
     "testvector02": 1185,
     "testvector03": 998,
     "testvector04": 1265,
+    "testvector05": 2037,
+    "testvector06": 1876,
     "testvector07": 4186,
     "testvector08": 4,
     "testvector09": 4,
-    "testvector10": 965,
+    "testvector10": 1263,
     "testvector11": 553,
-    "testvector12": 1056,
+    "testvector12": 1320,
 }
 
 CONFIGS = {
