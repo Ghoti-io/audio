@@ -3879,6 +3879,238 @@ TEST(OpusMdct, TheFftTablesCanBeUsedAtAll) {
 }
 
 
+// ---------------------------------------------------------------------------
+// After the transform: the post-filter and the de-emphasis, sections
+// 4.3.7.1 and 4.3.7.2. Both are stated completely in the prose - nine
+// filter taps as decimals and one alpha_p - so the constants here are
+// checkable against the document and not only against Appendix A.
+
+TEST(OpusPost, ThePostFilterAndDeemphasisMatchTheReference) {
+  static const int kPeriod[4] = {15, 100, 511, 1022};
+  // G = 3*(int_gain+1)/32 for a three-bit int_gain, which in Q15 is
+  // 3072*(i+1); zero is the post-filter switched off. Using values no
+  // encoder can produce is not a harmless widening - it made a mutation
+  // of the first tap survive, because the real gains are all multiples
+  // of 3072 and the ones invented for the first sweep were not.
+  static const int16_t kGain[9] = {
+      0, 3072, 6144, 9216, 12288, 15360, 18432, 21504, 24576};
+  uint64_t digest = 1469598103934665603ull;
+  unsigned long combs = 0;
+  unsigned long deemphs = 0;
+  std::vector<int32_t> buffer(4096);
+  for (int tapset_old = 0; tapset_old < 3; ++tapset_old) {
+    for (int tapset = 0; tapset < 3; ++tapset) {
+      for (int p = 0; p < 4; ++p) {
+        for (int g = 0; g < 9; ++g) {
+          for (int rep = 0; rep < 6; ++rep) {
+            unsigned state = (unsigned)(tapset_old * 7919 + tapset * 104729
+                + p * 31 + g * 17 + rep * 37);
+            for (int i = 0; i < 4096; ++i) {
+              state = state * 1103515245u + 12345u;
+              buffer[(size_t)i] = (int32_t)((int)(state >> 6) % 4000001)
+                  - 2000000;
+            }
+            // In place, with the same pointer twice, because that is
+            // what makes the filter recursive - section 4.3.7.1 says
+            // the past value used must be the interpolated one.
+            gaud_celt_comb_filter(buffer.data() + 2048, buffer.data() + 2048,
+                kPeriod[p], kPeriod[(p + 1) & 3], 960, kGain[g],
+                kGain[(g + 4) % 9], (unsigned)tapset_old, (unsigned)tapset,
+                gaud_opus_window120, 120u);
+            for (int i = 0; i < 4096; ++i) {
+              digest = Fnv1a(digest, buffer[(size_t)i]);
+            }
+            ++combs;
+          }
+        }
+      }
+    }
+  }
+  std::vector<int32_t> left(2048);
+  std::vector<int32_t> right(2048);
+  std::vector<int16_t> pcm(8192);
+  for (int channels = 1; channels <= 2; ++channels) {
+    for (int downsample = 1; downsample <= 3; ++downsample) {
+      for (int rep = 0; rep < 24; ++rep) {
+        int32_t memory[2];
+        const int32_t * in[2] = {left.data(), right.data()};
+        unsigned state = (unsigned)(channels * 7919 + downsample * 104729
+            + rep * 37);
+        for (int i = 0; i < 960; ++i) {
+          state = state * 1103515245u + 12345u;
+          left[(size_t)i] = (int32_t)((int)(state >> 4) % 200000001)
+              - 100000000;
+          state = state * 1103515245u + 12345u;
+          right[(size_t)i] = (int32_t)((int)(state >> 4) % 200000001)
+              - 100000000;
+        }
+        // The filter state is not zero at a frame boundary, and a
+        // decoder that resets it clicks every 20 ms.
+        state = state * 1103515245u + 12345u;
+        memory[0] = (int32_t)((int)(state >> 8) % 2000001) - 1000000;
+        state = state * 1103515245u + 12345u;
+        memory[1] = (int32_t)((int)(state >> 8) % 2000001) - 1000000;
+        std::fill(pcm.begin(), pcm.end(), (int16_t)0);
+        gaud_celt_deemphasis(in, pcm.data(), 960, (uint32_t)channels,
+            downsample, memory);
+        for (int i = 0; i < 8192; ++i) {
+          digest = Fnv1a(digest, pcm[(size_t)i]);
+        }
+        digest = Fnv1a(Fnv1a(digest, memory[0]), memory[1]);
+        ++deemphs;
+      }
+    }
+  }
+  EXPECT_EQ(combs, 1944u);
+  EXPECT_EQ(deemphs, 144u);
+  EXPECT_EQ(digest, 0x66783792AC037076ull);
+}
+
+TEST(OpusPost, TheTapsAreTheDecimalsTheProsePrints) {
+  // Section 4.3.7.1 prints all nine, and 4.3.7.2 prints alpha_p. Each
+  // Q15 integer divided by 32768 is exactly that decimal, which is a
+  // check the document supplies on its own appendix - and the kind
+  // that is easy to leave unmade because the two live 150 pages apart.
+  struct Tap {
+    int16_t fixed;
+    double printed;
+  };
+  static const Tap kTaps[9] = {
+      {10048, 0.3066406250}, {7112, 0.2170410156}, {4248, 0.1296386719},
+      {15200, 0.4638671875}, {8784, 0.2680664062}, {0, 0.0},
+      {26208, 0.7998046875}, {3280, 0.1000976562}, {0, 0.0},
+  };
+  for (const Tap & tap : kTaps) {
+    EXPECT_EQ(tap.fixed, (int16_t)std::llround(tap.printed * 32768.0))
+        << tap.printed;
+    // The prose prints ten decimal places and the Q15 value needs
+    // twelve, so the check is agreement to the last printed place -
+    // not equality. It cannot be "correctly rounded" either, because
+    // the document is not consistent about it: 4248/32768 is
+    // 0.129638671875 and it prints 0.1296386719, rounded up, while
+    // 8784/32768 is 0.26806640625 and it prints 0.2680664062, rounded
+    // down. Both are within one unit of the last place, which is what
+    // this asserts.
+    double exact = (double)tap.fixed / 32768.0;
+    EXPECT_LE(std::fabs(exact - tap.printed), 1e-10) << tap.fixed;
+  }
+  EXPECT_DOUBLE_EQ(27853.0 / 32768.0, 0.850006103515625);
+  // Which 4.3.7.2 prints to the same precision.
+  EXPECT_LE(std::fabs(27853.0 / 32768.0 - 0.8500061035), 1e-10);
+}
+
+TEST(OpusPost, TheFirstTapOfEachSetIsNotPinnedToOneUnit) {
+  // Three of the nine taps cannot be checked to the last bit by any
+  // legal input, and it is worth saying which and why rather than
+  // leaving three mutations marked "not caught".
+  //
+  // The gain is always 3072*(i+1), and the tap is applied as
+  // (gain * tap) >> 15. For the three leading taps no multiple of 3072
+  // in range makes that product cross an integer boundary when the tap
+  // moves by one, so the ULP is invisible. The second and third taps of
+  // each set are not so lucky, and are pinned.
+  static const int16_t kTaps[3][3] = {
+      {10048, 7112, 4248}, {15200, 8784, 0}, {26208, 3280, 0}};
+  for (int set = 0; set < 3; ++set) {
+    bool leading_visible = false;
+    for (int i = 0; i < 8; ++i) {
+      int32_t gain = 3072 * (i + 1);
+      if (((gain * kTaps[set][0]) >> 15) != ((gain * (kTaps[set][0] + 1)) >> 15)) {
+        leading_visible = true;
+      }
+    }
+    EXPECT_FALSE(leading_visible) << "set " << set;
+  }
+  // The tap after it is visible, at some gain - so this is a property
+  // of those three constants and not of the arithmetic in general.
+  unsigned visible = 0;
+  for (int set = 0; set < 3; ++set) {
+    for (int i = 0; i < 8; ++i) {
+      int32_t gain = 3072 * (i + 1);
+      if (((gain * kTaps[set][1]) >> 15) != ((gain * (kTaps[set][1] + 1)) >> 15)) {
+        ++visible;
+      }
+    }
+  }
+  EXPECT_GT(visible, 3u);
+}
+
+TEST(OpusPost, AGainOfZeroLeavesTheSignalAlone) {
+  // The post-filter is switched off by a gain of zero, and "off" has to
+  // mean the identity rather than something very close to it - every
+  // frame runs through this whether the filter is on or not.
+  std::vector<int32_t> buffer(4096);
+  std::vector<int32_t> before(4096);
+  unsigned state = 999u;
+  for (int i = 0; i < 4096; ++i) {
+    state = state * 1103515245u + 12345u;
+    buffer[(size_t)i] = (int32_t)((int)(state >> 6) % 4000001) - 2000000;
+  }
+  before = buffer;
+  gaud_celt_comb_filter(buffer.data() + 2048, buffer.data() + 2048, 511, 1022,
+      960, 0, 0, 2u, 1u, gaud_opus_window120, 120u);
+  EXPECT_EQ(buffer, before);
+  // And a nonzero gain does not, so the test above is not vacuous.
+  gaud_celt_comb_filter(buffer.data() + 2048, buffer.data() + 2048, 511, 1022,
+      960, 24576, 24576, 2u, 1u, gaud_opus_window120, 120u);
+  EXPECT_NE(buffer, before);
+}
+
+TEST(OpusPost, DeemphasisIsTheOnePoleItSaysItIs) {
+  // The independent reading: section 4.3.7.2 says the filter is
+  // 1/(1 - alpha_p * z^-1) with alpha_p = 0.8500061035, so running that
+  // recursion in double and comparing is a check on the whole thing -
+  // the coefficient, the scaling, and the state carried between frames.
+  const int kSamples = 960;
+  std::vector<int32_t> channel((size_t)kSamples);
+  std::vector<int16_t> pcm((size_t)kSamples);
+  double worst = 0.0;
+  unsigned long compared = 0;
+  unsigned long clipped = 0;
+  for (int rep = 0; rep < 40; ++rep) {
+    const int32_t * in[1] = {channel.data()};
+    int32_t memory[1] = {0};
+    unsigned state = (unsigned)(rep * 104729 + 12345);
+    // Half the sweep is loud enough to clip, which is the only way the
+    // clamp gets exercised at all - but not so loud that the 32-bit
+    // accumulator bursts. There is a window between the two, because
+    // the clamp is at 2^27 and the accumulator at 2^31; outside it a
+    // sweep is testing undefined behaviour rather than the filter, and
+    // the first version of this test was.
+    int scale = rep < 20 ? 20000000 : 100000000;
+    for (int i = 0; i < kSamples; ++i) {
+      state = state * 1103515245u + 12345u;
+      channel[(size_t)i] = (int32_t)((int)(state >> 4) % (2 * scale + 1))
+          - scale;
+    }
+    gaud_celt_deemphasis(in, pcm.data(), kSamples, 1u, 1, memory);
+    double accumulator = 0.0;
+    for (int i = 0; i < kSamples; ++i) {
+      double sum = (double)channel[(size_t)i] + accumulator;
+      accumulator = 0.850006103515625 * sum;
+      // The synthesis carries twelve bits of headroom.
+      double want = sum / 4096.0;
+      if (want > 32767.0 || want < -32768.0) {
+        // Clear of the rail by more than the rounding, so the clamp
+        // must have fired; right at it either answer is correct.
+        if (want > 32768.0 || want < -32769.0) {
+          EXPECT_TRUE(pcm[(size_t)i] == 32767 || pcm[(size_t)i] == -32768)
+              << "rep " << rep << " sample " << i << " want " << want;
+        }
+        ++clipped;
+        continue;
+      }
+      worst = std::max(worst, std::fabs((double)pcm[(size_t)i] - want));
+      ++compared;
+    }
+  }
+  EXPECT_GT(compared, 19000u);
+  EXPECT_GT(clipped, 1000u);
+  // Measured: 0.5007, which is the rounding of the final shift.
+  EXPECT_LT(worst, 0.501);
+}
+
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

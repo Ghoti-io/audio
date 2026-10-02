@@ -710,6 +710,69 @@ void gaud_celt_denormalise_bands(const CELT_Mode * mode, const int16_t * x,
 void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
     uint32_t overlap, int shift, uint32_t stride);
 
+/** The longest post-filter period, and so the history it needs. */
+#define CELT_COMB_MAX_PERIOD 1024
+
+/** The shortest; a period below this is not representable. */
+#define CELT_COMB_MIN_PERIOD 15
+
+/**
+ * @brief The post-filter, section 4.3.7.1.
+ *
+ * A three-tap comb filter at the pitch period, which puts back the
+ * harmonic structure the transform coder blurs. The decoder runs it
+ * **in place**, with @p out and @p in the same pointer, and the prose
+ * says why: "values of y(n) be interpolated one at a time such that the
+ * past value of y(n) used is interpolated". The filter is recursive,
+ * and separating the arrays would quietly make it not be.
+ *
+ * Over the first @p overlap samples the old period and gain fade into
+ * the new ones, weighted by the square of the MDCT window, so that a
+ * change of pitch between frames does not click.
+ *
+ * @param out Receives the result; may be @p in.
+ * @param in The samples, with at least `period + 2` of history before
+ *   the pointer for whichever period is larger.
+ * @param period_old The previous frame's period.
+ * @param period The new one.
+ * @param n How many samples to filter.
+ * @param gain_old The previous frame's gain in Q15.
+ * @param gain The new one.
+ * @param tapset_old The previous frame's tap set, 0 to 2.
+ * @param tapset The new one.
+ * @param window The MDCT overlap window in Q15.
+ * @param overlap How many samples the fade takes.
+ */
+void gaud_celt_comb_filter(int32_t * out, const int32_t * in,
+    int period_old, int period, int n, int16_t gain_old, int16_t gain,
+    unsigned tapset_old, unsigned tapset, const int16_t * window,
+    uint32_t overlap);
+
+/**
+ * @brief De-emphasis and conversion to samples, section 4.3.7.2.
+ *
+ * The encoder pre-emphasised, so this undoes it: a one-pole filter at
+ * `alpha_p = 0.8500061035`, which is 27853 in Q15. The state carries
+ * between frames, so a decoder that drops it clicks at every boundary.
+ *
+ * **The accumulator is 32 bits and the input has to stay inside it.**
+ * The filter's running sum is clamped to 16 bits on the way out, at
+ * `2^27` in the synthesis scale, but the sum itself is not - and a
+ * one-pole at 0.85 has a gain of nearly seven at DC. Anything the
+ * transform produces is far below that, and RFC 6716 accumulates in 32
+ * bits too, but the margin is about four bits rather than unlimited.
+ * A sweep that feeds this white noise above about `1.2e8` finds it.
+ *
+ * @param in One pointer per channel into the synthesis buffer.
+ * @param pcm Receives interleaved 16-bit samples.
+ * @param n How many samples per channel.
+ * @param channels 1 or 2.
+ * @param downsample Keep one sample in this many; 1 at 48 kHz.
+ * @param memory One filter state per channel, carried across frames.
+ */
+void gaud_celt_deemphasis(const int32_t * const * in, int16_t * pcm, int n,
+    uint32_t channels, int downsample, int32_t * memory);
+
 #ifdef __cplusplus
 }
 #endif
