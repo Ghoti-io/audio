@@ -38,11 +38,13 @@
  */
 
 #include "../../src/codec/opus/opus_internal.h"
+#include "../../src/codec/opus/opus_range.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -516,6 +518,377 @@ TEST(OpusProbe, OggIsFiveFormatsAndTheProbeDecidesWhich) {
     Loaded loaded;
     ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
     EXPECT_STREQ(gaud_doc_codec_name(loaded.doc), one.codec) << one.name;
+  }
+}
+
+/* ------------------------------------------ RFC 6716 section 4.1:
+                                                 the range decoder */
+
+/**
+ * The range decoder, tested against the specification's own equivalences.
+ *
+ * A decoder with no encoder beside it and no reference data has almost
+ * nothing to be tested against, and the usual answer - a round trip -
+ * would score this library's reading against this library's writing.
+ * RFC 6716 section 4.1.3 supplies something better. It gives three
+ * decoding methods and says each is *exactly equivalent* to the general
+ * two-step form, as an arithmetic claim rather than an approximation.
+ * That is a second engine for nothing: drive both forms from one byte
+ * stream and they must agree on the symbol and on every bit of the
+ * resulting state, forever.
+ *
+ * ::OPUS_Range is copyable by value, which is what makes the comparison
+ * exact rather than statistical - the two readings start from literally
+ * the same state, not from an equivalent one.
+ *
+ * Section 4.1.6 supplies a second: `ec_tell()` is guaranteed to equal
+ * `ceil(ec_tell_frac()/8)`, computed by two different routines, so every
+ * decode below checks it.
+ *
+ * What none of this can see is a faithful transcription of the *wrong*
+ * specification - all four routines reading one byte stream agree if the
+ * renormalisation is wrong in the same way for all of them. Only the
+ * conformance vectors settle that, and they arrive with the decoders
+ * that can consume them.
+ */
+
+namespace {
+
+/**
+ * A deterministic byte stream. A fixed generator rather than a random
+ * one: a failure here must reproduce from the test name alone.
+ */
+std::vector<unsigned char> RangeBytes(uint32_t seed, size_t count) {
+  std::vector<unsigned char> out(count);
+  uint32_t state = seed * 2654435761u + 1u;
+  for (size_t i = 0; i < count; ++i) {
+    state = state * 1103515245u + 12345u;
+    out[i] = (unsigned char)(state >> 16);
+  }
+  return out;
+}
+
+/**
+ * Whether two decoders are in the same state.
+ *
+ * ::OPUS_Range::ext is deliberately not compared. It is scratch between
+ * ::gaud_opus_decode and ::gaud_opus_dec_update rather than state, and
+ * the icdf and bit-logp paths never set it - so comparing it would make
+ * the equivalences these tests exist to check look false.
+ */
+::testing::AssertionResult SameState(
+    const OPUS_Range & a, const OPUS_Range & b) {
+  if (a.val == b.val && a.rng == b.rng && a.rem == b.rem
+      && a.offset == b.offset && a.end_offset == b.end_offset
+      && a.end_window == b.end_window && a.end_bits == b.end_bits
+      && a.total_bits == b.total_bits && a.error == b.error) {
+    return ::testing::AssertionSuccess();
+  }
+  return ::testing::AssertionFailure()
+      << "val " << a.val << "/" << b.val << " rng " << a.rng << "/" << b.rng
+      << " rem " << a.rem << "/" << b.rem << " off " << a.offset << "/"
+      << b.offset << " end " << a.end_offset << "/" << b.end_offset
+      << " win " << a.end_window << "/" << b.end_window << " nbits "
+      << a.end_bits << "/" << b.end_bits << " total " << a.total_bits << "/"
+      << b.total_bits;
+}
+
+/** Section 4.1.6: `ec_tell` is `ceil(ec_tell_frac()/8)`. */
+void CheckTell(const OPUS_Range & range) {
+  uint32_t frac = gaud_opus_tell_frac(&range);
+  EXPECT_EQ(gaud_opus_tell(&range), (frac + 7u) / 8u);
+}
+
+} // namespace
+
+TEST(OpusRange, IlogCountsBits) {
+  EXPECT_EQ(gaud_opus_ilog(0u), 0u);
+  EXPECT_EQ(gaud_opus_ilog(1u), 1u);
+  EXPECT_EQ(gaud_opus_ilog(2u), 2u);
+  EXPECT_EQ(gaud_opus_ilog(3u), 2u);
+  EXPECT_EQ(gaud_opus_ilog(255u), 8u);
+  EXPECT_EQ(gaud_opus_ilog(256u), 9u);
+  EXPECT_EQ(gaud_opus_ilog(0x7FFFFFFFu), 31u);
+  EXPECT_EQ(gaud_opus_ilog(0xFFFFFFFFu), 32u);
+}
+
+/**
+ * Section 4.1.1 and 4.1.6.1, worked by hand.
+ *
+ * `rng` starts at 128 and renormalisation runs until it exceeds 2**23,
+ * which from 2**7 takes three byte-sized shifts to 2**31. So `rng` is
+ * exactly 2**31, `total_bits` is 9 + 24 = 33, `ilog(2**31)` is 32, and
+ * a decoder that has read nothing reports one bit used - the bit the
+ * encoder keeps to terminate the stream.
+ */
+TEST(OpusRange, FreshDecoderReportsOneBit) {
+  std::vector<unsigned char> data = RangeBytes(1u, 64);
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data.data(), data.size());
+  EXPECT_EQ(range.rng, 1u << 31);
+  EXPECT_EQ(range.total_bits, 33u);
+  EXPECT_EQ(gaud_opus_tell(&range), 1u);
+  EXPECT_EQ(gaud_opus_tell_frac(&range), 8u);
+  EXPECT_EQ(range.offset, 4u);
+  CheckTell(range);
+}
+
+/** The first byte's low bit is kept, and its top seven set `val`. */
+TEST(OpusRange, InitialisationConsumesSevenBits) {
+  for (unsigned first = 0; first < 256u; ++first) {
+    unsigned char data[8];
+    memset(data, 0, sizeof(data));
+    data[0] = (unsigned char)first;
+    OPUS_Range range;
+    gaud_opus_range_init(&range, data, sizeof(data));
+    /* Renormalisation has run, so `val` is no longer 127-(b0>>1); what
+     * stays visible is that the three zero bytes after it contributed
+     * 255 each, and that the leftover bit of the first byte arrived as
+     * the high bit of the first renormalisation's symbol. */
+    uint32_t expect = 127u - (first >> 1);
+    for (int i = 0; i < 3; ++i) {
+      unsigned sym = (i == 0) ? ((first & 1u) << 7) : 0u;
+      expect = ((expect << 8) + (255u - sym)) & 0x7FFFFFFFu;
+    }
+    EXPECT_EQ(range.val, expect) << "first byte " << first;
+  }
+}
+
+/** Section 4.1.3.1: `ec_decode_bin(ftb)` is `ec_decode(1 << ftb)`. */
+TEST(OpusRange, DecodeBinMatchesDecode) {
+  for (uint32_t seed = 1; seed <= 24u; ++seed) {
+    std::vector<unsigned char> data = RangeBytes(seed, 96);
+    OPUS_Range fast;
+    gaud_opus_range_init(&fast, data.data(), data.size());
+    OPUS_Range slow = fast;
+    for (unsigned step = 0; step < 150u; ++step) {
+      unsigned ftb = 1u + (step % 15u);
+      uint32_t ft = 1u << ftb;
+      uint32_t a = gaud_opus_decode_bin(&fast, ftb);
+      uint32_t b = gaud_opus_decode(&slow, ft);
+      ASSERT_EQ(a, b) << "seed " << seed << " step " << step;
+      ASSERT_LT(a, ft);
+      /* Consume it as the one-wide symbol at the value just read, so
+       * the stream advances somewhere neither always first nor last. */
+      gaud_opus_dec_update(&fast, a, a + 1u, ft);
+      gaud_opus_dec_update(&slow, a, a + 1u, ft);
+      ASSERT_TRUE(SameState(fast, slow))
+          << "seed " << seed << " step " << step;
+      CheckTell(fast);
+    }
+  }
+}
+
+/**
+ * Section 4.1.3.3: `ec_dec_icdf` is the general form with the tuples the
+ * table encodes.
+ *
+ * The table is walked the way the specification describes - the first
+ * entry where `fs < (1 << ftb) - icdf[k]` - rather than the way the
+ * implementation does it, so the two are not one loop written twice.
+ */
+TEST(OpusRange, DecIcdfMatchesDecode) {
+  /* Three real shapes: skewed towards zero, uniform, and skewed away. */
+  static const unsigned char skewed[] = {128, 192, 224, 240, 248, 252, 0};
+  static const unsigned char uniform[] = {192, 128, 64, 0};
+  static const unsigned char tail[] = {248, 240, 224, 192, 128, 0};
+  struct Context {
+    const unsigned char * icdf;
+    unsigned ftb;
+  };
+  const Context contexts[] = {{skewed, 8}, {uniform, 8}, {tail, 8}};
+
+  for (uint32_t seed = 1; seed <= 16u; ++seed) {
+    for (const Context & context : contexts) {
+      std::vector<unsigned char> data = RangeBytes(seed, 96);
+      OPUS_Range fast;
+      gaud_opus_range_init(&fast, data.data(), data.size());
+      OPUS_Range slow = fast;
+      for (unsigned step = 0; step < 120u; ++step) {
+        uint32_t ft = 1u << context.ftb;
+        int a = gaud_opus_dec_icdf(&fast, context.icdf, context.ftb);
+        uint32_t fs = gaud_opus_decode(&slow, ft);
+        int k = 0;
+        while (fs >= ft - context.icdf[k]) {
+          ++k;
+        }
+        uint32_t fl = k == 0 ? 0u : ft - context.icdf[k - 1];
+        uint32_t fh = ft - context.icdf[k];
+        gaud_opus_dec_update(&slow, fl, fh, ft);
+        ASSERT_EQ(a, k) << "seed " << seed << " step " << step;
+        ASSERT_TRUE(SameState(fast, slow))
+            << "seed " << seed << " step " << step;
+        CheckTell(fast);
+      }
+    }
+  }
+}
+
+/** Section 4.1.3.2: `ec_dec_bit_logp` is the general form too. */
+TEST(OpusRange, DecBitLogpMatchesDecode) {
+  for (uint32_t seed = 1; seed <= 16u; ++seed) {
+    for (unsigned logp = 1u; logp <= 14u; ++logp) {
+      std::vector<unsigned char> data = RangeBytes(seed * 31u + logp, 96);
+      OPUS_Range fast;
+      gaud_opus_range_init(&fast, data.data(), data.size());
+      OPUS_Range slow = fast;
+      for (unsigned step = 0; step < 80u; ++step) {
+        uint32_t ft = 1u << logp;
+        int a = gaud_opus_dec_bit_logp(&fast, logp);
+        uint32_t fs = gaud_opus_decode(&slow, ft);
+        int k = fs < ft - 1u ? 0 : 1;
+        if (k == 0) {
+          gaud_opus_dec_update(&slow, 0u, ft - 1u, ft);
+        } else {
+          gaud_opus_dec_update(&slow, ft - 1u, ft, ft);
+        }
+        ASSERT_EQ(a, k) << "seed " << seed << " logp " << logp;
+        ASSERT_TRUE(SameState(fast, slow))
+            << "seed " << seed << " logp " << logp;
+        CheckTell(fast);
+      }
+    }
+  }
+}
+
+/**
+ * Section 4.1.4: raw bits come from the last byte downwards, least
+ * significant bit first.
+ *
+ * Asserted on concrete bytes rather than by symmetry with a writer:
+ * `0xB4` is `1011 0100`, so the first four bits read are `0100` and the
+ * next four are `1011`. The two nibbles differ and neither is a
+ * palindrome, so a reversed bit order and a swapped nibble order both
+ * fail here rather than cancelling.
+ */
+TEST(OpusRange, RawBitsComeFromTheEnd) {
+  unsigned char data[8] = {0, 0, 0, 0, 0x11, 0x22, 0x33, 0xB4};
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data, sizeof(data));
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 4u), 0x4u);
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 4u), 0xBu);
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0x33u);
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0x22u);
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0x11u);
+}
+
+/** Raw bits past the start of the buffer read as zero, not as garbage. */
+TEST(OpusRange, RawBitsRunOutAsZero) {
+  unsigned char data[1] = {0xFF};
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data, sizeof(data));
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0xFFu);
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0u);
+  }
+}
+
+/**
+ * Section 4.1.2.1: an exhausted frame keeps decoding on zero bytes.
+ *
+ * Not a tolerance - the encoder relies on it in order to stop writing
+ * early. What is asserted is that this terminates and stays in range;
+ * that it reads nothing outside the buffer is what `make test-asan`
+ * adds to it.
+ */
+TEST(OpusRange, ExhaustedFrameKeepsDecoding) {
+  unsigned char data[2] = {0x5A, 0xA5};
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data, sizeof(data));
+  for (unsigned step = 0; step < 500u; ++step) {
+    uint32_t value = gaud_opus_decode(&range, 11u);
+    ASSERT_LT(value, 11u);
+    gaud_opus_dec_update(&range, value, value + 1u, 11u);
+    CheckTell(range);
+  }
+  EXPECT_FALSE(range.error);
+}
+
+/** An empty frame is allowed, and decodes as though it were zeros. */
+TEST(OpusRange, EmptyFrameDecodes) {
+  OPUS_Range range;
+  gaud_opus_range_init(&range, nullptr, 0u);
+  EXPECT_EQ(gaud_opus_tell(&range), 1u);
+  for (unsigned step = 0; step < 32u; ++step) {
+    uint32_t value = gaud_opus_decode(&range, 4u);
+    ASSERT_LT(value, 4u);
+    gaud_opus_dec_update(&range, value, value + 1u, 4u);
+  }
+  EXPECT_EQ(gaud_opus_dec_bits(&range, 8u), 0u);
+}
+
+/** Section 4.1.5, the eight-bits-or-fewer path: every value is in range. */
+TEST(OpusRange, DecUintSmallStaysInRange) {
+  for (uint32_t ft = 2u; ft <= 256u; ++ft) {
+    std::vector<unsigned char> data = RangeBytes(ft, 64);
+    OPUS_Range range;
+    gaud_opus_range_init(&range, data.data(), data.size());
+    for (unsigned step = 0; step < 24u; ++step) {
+      uint32_t value = gaud_opus_dec_uint(&range, ft);
+      ASSERT_LT(value, ft) << "ft " << ft;
+      /* Below the split there are no raw bits, so nothing can go out of
+       * range and the error flag must stay clear. */
+      ASSERT_FALSE(range.error) << "ft " << ft;
+    }
+  }
+}
+
+/**
+ * Section 4.1.5's named error, put in a position to fail - and the
+ * condition under which it cannot be.
+ *
+ * Above eight bits the value is a coded symbol for the top bits and raw
+ * bits for the rest, with no redundancy between the halves, so a stream
+ * that is not a real frame can produce a value larger than the caller
+ * asked for. **Whether it can depends on `ft`.** Writing `F = ft - 1`
+ * and `b` for the raw bits below the split, the largest value the two
+ * halves can combine to is `F` with its low `b` bits all set; that
+ * exceeds `F` exactly when they were not already set.
+ *
+ * The first draft of this test swept `ft = 1000`. `F` is 999, the split
+ * leaves two raw bits, and 999 ends in `11` - so the overflow was
+ * arithmetically impossible and six thousand draws found nothing. Both
+ * values are kept: one proves the arm runs, the other proves the bound
+ * is a bound rather than an accident of the inputs tried.
+ */
+TEST(OpusRange, DecUintLargeOverflowsOnlyWhenItCan) {
+  struct Case {
+    uint32_t ft;      /* What the caller asks for. */
+    bool reachable;   /* Whether `F`'s low raw bits leave room. */
+  };
+  /* 1024 is 0b100_0000_0000: three raw bits below the split, none set.
+   * 999 is 0b11_1110_0111: two raw bits below the split, both set. */
+  const Case cases[] = {{1025u, true}, {1000u, false}};
+
+  for (const Case & one : cases) {
+    unsigned saturated = 0;
+    unsigned trials = 0;
+    for (uint32_t seed = 1u; seed <= 400u; ++seed) {
+      std::vector<unsigned char> data = RangeBytes(seed, 48);
+      OPUS_Range range;
+      gaud_opus_range_init(&range, data.data(), data.size());
+      for (unsigned step = 0; step < 16u; ++step) {
+        bool before = range.error;
+        uint32_t value = gaud_opus_dec_uint(&range, one.ft);
+        ++trials;
+        ASSERT_LT(value, one.ft) << "ft " << one.ft;
+        if (!before && range.error) {
+          ++saturated;
+          ASSERT_EQ(value, one.ft - 1u) << "ft " << one.ft;
+        }
+      }
+    }
+    if (one.reachable) {
+      EXPECT_GT(saturated, 0u)
+          << "ft " << one.ft << ": swept " << trials
+          << " draws and never left the range, so the saturating arm is "
+             "untested";
+    } else {
+      EXPECT_EQ(saturated, 0u)
+          << "ft " << one.ft
+          << ": the two halves cannot combine above this bound, so "
+             "reaching it means the split is wrong";
+    }
   }
 }
 
