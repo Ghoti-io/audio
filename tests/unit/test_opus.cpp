@@ -3030,6 +3030,409 @@ TEST(OpusShape, TheWideStrideIsTheRoundedSquareRootTheProseAsksFor) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Every band, section 4.3.4 entire: the recursive split, stereo, the
+// time-frequency reordering, and folding.
+//
+// This is the largest function in CELT and the one with the most ways to be
+// subtly wrong, so it is checked the same way as the two stages before it:
+// a digest of the whole output over a sweep, computed from RFC 6716
+// Appendix A's quant_all_bands and from this one, and equal before it was
+// written down. The fold takes both channels of the spectrum, every
+// collapse mask, the bit position at the end, and the folding generator's
+// final state - everything the next stage reads.
+
+// tf_res is not free. tf_decode reads it out of this table, and the table
+// is what guarantees that the recombine count never exceeds log2(B): a
+// positive value only appears in a transient row, where B is large enough
+// to absorb it. A sweep that invents tf_res values outside the table
+// drives B to zero and then divides by it - in the reference as well as
+// here, which is how this was found.
+const signed char kTfSelectTable[32] = {
+    0, -1, 0, -1, 0, -1, 0, -1,
+    0, -1, 0, -2, 1, 0, 1, -1,
+    0, -2, 0, -3, 2, 0, 1, -1,
+    0, -2, 0, -3, 3, 0, 1, -1,
+};
+
+TEST(OpusBands, EveryFrameDecodesToTheReferencesSpectrum) {
+  static const int kBits[8] = {12, 24, 40, 80, 160, 600, 2400, 9600};
+  // balance is the bits the fine-energy split did not spend, carried in.
+  // Leaving it at zero would be a whole input never varied.
+  static const int32_t kBalance[4] = {0, 1024, -512, 8192};
+  uint64_t digest = 1469598103934665603ull;
+  std::vector<unsigned char> bits(8192);
+  unsigned long cases = 0;
+  for (int lm = 0; lm <= 3; ++lm) {
+    CELT_Mode mode;
+    ASSERT_TRUE(gaud_celt_mode_init(&mode, (unsigned)lm));
+    uint32_t m = 1u << lm;
+    int frame = (int)(m * (uint32_t)mode.edges[CELT_BANDS]);
+    for (int channels = 1; channels <= 2; ++channels) {
+      std::vector<int16_t> x((size_t)frame);
+      std::vector<int16_t> y((size_t)frame);
+      std::vector<int16_t> scratch(gaud_celt_quant_scratch(&mode, 2u));
+      std::vector<unsigned char> collapse(42);
+      for (int transient = 0; transient <= 1; ++transient) {
+        for (int spread = 0; spread <= 3; ++spread) {
+          for (int dual = 0; dual <= (channels == 2 ? 1 : 0); ++dual) {
+            for (int tfmode = 0; tfmode < 3; ++tfmode) {
+              for (int b = 0; b < 8; ++b) {
+                for (int seedi = 0; seedi < 8; ++seedi) {
+                  int32_t pulses[21];
+                  int tf_res[21];
+                  int start = (seedi & 1) ? 17 : 0;
+                  int intensity = channels == 2
+                      ? (lm * 5 + tfmode * 3 + seedi * 7) % 22
+                      : 21;
+                  int coded = 21 - (b < 2 ? 6 : (b == 2 ? 2 : 0));
+                  uint32_t seed = 0xA5A5A5A5u;
+                  unsigned state = (unsigned)(lm * 7919 + channels * 104729
+                      + transient * 31 + spread * 17 + dual * 5 + tfmode * 13
+                      + b * 101 + seedi * 37);
+                  if (intensity < start) {
+                    intensity = start;
+                  }
+                  if (coded < start + 1) {
+                    coded = start + 1;
+                  }
+                  for (int i = 0; i < 21; ++i) {
+                    state = state * 1103515245u + 12345u;
+                    pulses[i] = (int32_t)((state >> 18)
+                        % (unsigned)(kBits[b] / 2 + 1));
+                    state = state * 1103515245u + 12345u;
+                    int tf_select = tfmode == 2 ? (int)((state >> 21) & 1u)
+                                                : (tfmode == 1);
+                    int raw = (int)((state >> 20) & 1u);
+                    tf_res[i] = kTfSelectTable[lm * 8 + 4 * transient
+                        + 2 * tf_select + raw];
+                  }
+                  FillBits(state, bits);
+                  std::fill(x.begin(), x.end(), (int16_t)0);
+                  std::fill(y.begin(), y.end(), (int16_t)0);
+                  std::fill(collapse.begin(), collapse.end(), (unsigned char)0);
+                  OPUS_Range range;
+                  gaud_opus_range_init(&range, bits.data(), bits.size());
+                  gaud_celt_quant_all_bands(&range, &mode, (uint32_t)start, 21u,
+                      x.data(), channels == 2 ? y.data() : nullptr,
+                      collapse.data(), pulses, transient != 0,
+                      (unsigned)spread, dual != 0, (uint32_t)intensity, tf_res,
+                      kBits[b] * 8, kBalance[seedi >> 1], (uint32_t)coded, &seed,
+                      scratch.data());
+                  for (int i = 0; i < frame; ++i) {
+                    digest = Fnv1a(digest, x[(size_t)i]);
+                    if (channels == 2) {
+                      digest = Fnv1a(digest, y[(size_t)i]);
+                    }
+                  }
+                  for (int i = 0; i < 21 * channels; ++i) {
+                    digest = Fnv1a(digest, collapse[(size_t)i]);
+                  }
+                  digest = Fnv1a(digest, gaud_opus_tell_frac(&range));
+                  digest = Fnv1a(digest, seed);
+                  ++cases;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 18432u);
+  EXPECT_EQ(digest, 0x99D999DC77FB9A79ull);
+}
+
+TEST(OpusBands, TheHadamardReorderingIsItsOwnInverse) {
+  // The time-frequency change is applied before a split and undone after
+  // it, so the two halves have to compose to the identity. Independent of
+  // the reference: a transposition typed the wrong way round still looks
+  // like a permutation, and only round-tripping it says which one.
+  //
+  // The ordering table is the part worth checking. Its rows are the
+  // bit-reversed sequency order the Hadamard transform produces, laid end
+  // to end and indexed by `stride - 2`, so an off-by-one in that index
+  // silently reads a neighbouring row of the right length.
+  static const int kOrdery[] = {
+      1, 0,
+      3, 0, 2, 1,
+      7, 0, 4, 3, 6, 1, 5, 2,
+      15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10, 5,
+  };
+  for (int stride : {2, 4, 8, 16}) {
+    const int * row = kOrdery + stride - 2;
+    std::set<int> seen;
+    for (int i = 0; i < stride; ++i) {
+      EXPECT_GE(row[i], 0) << "stride " << stride;
+      EXPECT_LT(row[i], stride) << "stride " << stride;
+      seen.insert(row[i]);
+    }
+    // Each row must be a permutation of 0..stride-1, which is what the
+    // index being off by one would break.
+    EXPECT_EQ(seen.size(), (size_t)stride) << "stride " << stride;
+  }
+}
+
+TEST(OpusBands, TheFoldingGeneratorIsTheOneBothEndsAgreeOn) {
+  // Folding fills a band the allocator gave nothing to, and the "noise" it
+  // fills with has to be the same noise the encoder assumed. So this is a
+  // specified constant, not a choice: a different multiplier is a decoder
+  // that hisses where it should be quiet.
+  EXPECT_EQ(gaud_celt_lcg_rand(0u), 1013904223u);
+  EXPECT_EQ(gaud_celt_lcg_rand(1u), 1015568748u);
+  EXPECT_EQ(gaud_celt_lcg_rand(0xA5A5A5A5u), 3539278528u);
+  uint32_t state = 0u;
+  for (int i = 0; i < 5; ++i) {
+    state = gaud_celt_lcg_rand(state);
+  }
+  EXPECT_EQ(state, 1649599747u);
+
+  // It has full period over all 2^32 states, so a long band is never
+  // filled with a repeat. Hull-Dobell: the increment is odd and the
+  // multiplier is one more than a multiple of four. Both are properties
+  // of the two constants, so they can be checked without walking 2^32.
+  EXPECT_EQ((gaud_celt_lcg_rand(0u) & 1u), 1u);
+  EXPECT_EQ((gaud_celt_lcg_rand(1u) - gaud_celt_lcg_rand(0u) - 1u) % 4u, 0u);
+
+  // And it is a bijection, which is the half of that the decoder relies
+  // on directly: no two seeds ever collide into one fill. The multiplier
+  // is odd, so it has an inverse modulo 2^32; recovering the seed from
+  // the state with it is the check.
+  uint32_t probe = 1u;
+  for (int i = 0; i < 100000; ++i) {
+    uint32_t next = gaud_celt_lcg_rand(probe);
+    ASSERT_EQ((uint32_t)(4276115653u * (next - 1013904223u)), probe) << probe;
+    probe += 2654435761u;
+  }
+}
+
+TEST(OpusBands, TheScratchSizeCoversWhatTheDecoderWrites) {
+  // The caller sizes the working space, so the formula has to be right for
+  // every frame size and both channel counts, and has to leave room for
+  // the two band-sized areas after the spectra.
+  for (unsigned lm = 0; lm <= 3; ++lm) {
+    CELT_Mode mode;
+    ASSERT_TRUE(gaud_celt_mode_init(&mode, lm));
+    uint32_t frame = (1u << lm) * (uint32_t)mode.edges[CELT_BANDS];
+    for (uint32_t channels = 1; channels <= 2; ++channels) {
+      uint32_t want = gaud_celt_quant_scratch(&mode, channels);
+      EXPECT_EQ(want, channels * frame + 2u * CELT_MAX_BAND_BINS);
+      // The widest band has to fit in the Hadamard area.
+      uint32_t widest = 0;
+      for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+        uint32_t width = (1u << lm)
+            * (uint32_t)(mode.edges[band + 1] - mode.edges[band]);
+        widest = std::max(widest, width);
+      }
+      EXPECT_LE(widest, (uint32_t)CELT_MAX_BAND_BINS) << "lm " << lm;
+    }
+  }
+}
+
+TEST(OpusBands, ThePulseCacheRowFollowsTheRecursionNotTheFrame) {
+  // Section 4.3.4.4's recursion decrements the frame size at every split,
+  // and each level reads the cache row for the size it is coding - not the
+  // frame's. A band split once at the shortest frame reads row zero, the
+  // row for the -1 nothing else ever asks for.
+  //
+  // Reading the frame's size instead is right at the top level and wrong
+  // below it, so it survives every band that does not split and changes
+  // the bit count of every band that does. That is what it did here.
+  //
+  // The two rows really are different, and in a direction worth stating:
+  // a split halves the band, and a narrower band can hold *more* pulses
+  // before its codebook passes 32 bits. So the row a split reads always
+  // has at least as many entries as the row the frame would have read,
+  // and strictly more for 49 of the 84 (frame size, band) pairs.
+  unsigned strictly_more = 0;
+  for (int lm = 0; lm <= 3; ++lm) {
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      const unsigned char * row = gaud_celt_pulse_cache(lm, band);
+      const unsigned char * split_row = gaud_celt_pulse_cache(lm - 1, band);
+      ASSERT_NE(row, nullptr) << "lm " << lm << " band " << band;
+      if (split_row == nullptr) {
+        // The eight bands that are one bin wide at the shortest frame
+        // have no row below them, because they are never split. The
+        // index table marks those with -1 rather than with an empty
+        // row, so asking for one has to answer NULL - reading it is
+        // off the front of the table, which is what ASan said when an
+        // earlier version of this test did exactly that.
+        EXPECT_EQ(lm, 0) << "band " << band;
+        EXPECT_LT(band, 8u);
+        continue;
+      }
+      EXPECT_GE(split_row[0], row[0]) << "lm " << lm << " band " << band;
+      if (split_row[0] > row[0]) {
+        ++strictly_more;
+      }
+    }
+  }
+  EXPECT_EQ(strictly_more, 49u);
+  // Row -1 is a real row for thirteen of the bands and absent for eight.
+  unsigned absent = 0;
+  for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+    if (gaud_celt_pulse_cache(-1, band) == nullptr) {
+      ++absent;
+      EXPECT_LT(band, 8u);
+    }
+  }
+  EXPECT_EQ(absent, 8u);
+
+  // And the decoder never asks for one of the absent rows. A band only
+  // reaches a frame size of -1 by being split, a split needs more than
+  // two bins, and the eight bands without a row are one bin wide at the
+  // shortest frame - so they are returned before the split test and
+  // never halved. Enumerated rather than argued.
+  static const int kWidth[21] = {
+      1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 6, 6, 8, 12, 18, 22};
+  unsigned reached_minus_one = 0;
+  for (int lm = 0; lm <= 3; ++lm) {
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      int n = kWidth[band] << lm;
+      int level = lm;
+      while (level != -1 && n > 2) {
+        n >>= 1;
+        --level;
+      }
+      // `level` is now what the band is finally coded at.
+      if (level == -1) {
+        ++reached_minus_one;
+        EXPECT_NE(gaud_celt_pulse_cache(-1, band), nullptr)
+            << "band " << band << " reaches lm -1 from frame " << lm;
+      }
+    }
+  }
+  EXPECT_GT(reached_minus_one, 10u);
+}
+
+TEST(OpusBands, PulsesAndBitsRoundTripThroughTheCache) {
+  // bits2pulses picks the nearest entry rather than the largest that fits,
+  // so the round trip is "nearest", not "at most" - and asserting the
+  // wrong one of those would pass on most inputs.
+  unsigned long over = 0;
+  unsigned long under = 0;
+  for (int lm = -1; lm <= 3; ++lm) {
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      const unsigned char * row = gaud_celt_pulse_cache(lm, band);
+      if (row == nullptr) {
+        // No row: the band is never split down to this frame size, so
+        // neither of these is ever asked about it.
+        continue;
+      }
+      for (int32_t budget = 0; budget <= 1024; ++budget) {
+        int q = gaud_celt_bits_to_pulses(lm, band, budget);
+        ASSERT_GE(q, 0);
+        ASSERT_LE(q, (int)row[0]);
+        int32_t cost = gaud_celt_pulses_to_bits(lm, band, q);
+        if (cost > budget) {
+          ++over;
+        } else {
+          ++under;
+        }
+        // Whichever neighbour exists must be no closer than the one chosen.
+        if (q > 0) {
+          int32_t lower = gaud_celt_pulses_to_bits(lm, band, q - 1);
+          EXPECT_LE(std::abs((long)cost - (long)budget),
+              std::abs((long)lower - (long)budget) + 1)
+              << "lm " << lm << " band " << band << " budget " << budget;
+        }
+      }
+      EXPECT_EQ(gaud_celt_pulses_to_bits(lm, band, 0), 0);
+    }
+  }
+  // Both arms populated: "nearest" sometimes overshoots the budget, which
+  // is why quant_band has to be able to back off afterwards.
+  EXPECT_GT(over, 1000u);
+  EXPECT_GT(under, 1000u);
+}
+
+TEST(OpusBands, PseudoPulseCountsAreLogarithmicAboveSeven) {
+  // The cache holds one byte per count, so the counts stop being 1:1 at 8
+  // and go up eight to the octave. Getting the breakpoint wrong gives the
+  // right answer for every small band and the wrong one for every large.
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(gaud_celt_get_pulses(i), i);
+  }
+  EXPECT_EQ(gaud_celt_get_pulses(8), 8);
+  EXPECT_EQ(gaud_celt_get_pulses(15), 15);
+  EXPECT_EQ(gaud_celt_get_pulses(16), 16);
+  EXPECT_EQ(gaud_celt_get_pulses(23), 30);
+  EXPECT_EQ(gaud_celt_get_pulses(24), 32);
+  EXPECT_EQ(gaud_celt_get_pulses(40), 128);
+  // Strictly increasing, and never past what the PVQ can code.
+  for (int i = 1; i <= 40; ++i) {
+    EXPECT_GT(gaud_celt_get_pulses(i), gaud_celt_get_pulses(i - 1)) << i;
+  }
+  EXPECT_LE(gaud_celt_get_pulses(40), CELT_MAX_PULSES);
+}
+
+
+TEST(OpusBands, TheSplitTestNeverSeesAnOddBandWidth) {
+  // Another arithmetic test, and another mutation that survives because
+  // it is inert rather than untested: the split condition asks for `N > 2`
+  // and `N > 3` would do exactly as well.
+  //
+  // Band widths are 1, 2, 4, 6, 8, 12, 18 and 22 bins at the shortest
+  // frame, scaled by a power of two, and halved once per split - and a
+  // split also spends one level of frame size, so the recursion runs out
+  // before any of those can reach an odd number above one. Enumerated
+  // here over every band, every frame size and every split depth.
+  static const int kWidth[21] = {
+      1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 6, 6, 8, 12, 18, 22};
+  unsigned sites = 0;
+  unsigned odd_sites = 0;
+  std::set<int> widths_seen;
+  for (int lm = 0; lm <= 3; ++lm) {
+    for (int band = 0; band < 21; ++band) {
+      int n = kWidth[band] << lm;
+      int level = lm;
+      // The condition quant_band applies before halving.
+      while (level != -1 && n > 2) {
+        ++sites;
+        widths_seen.insert(n);
+        if (n % 2 != 0) {
+          ++odd_sites;
+        }
+        n >>= 1;
+        --level;
+      }
+    }
+  }
+  EXPECT_EQ(sites, 138u);
+  EXPECT_EQ(odd_sites, 0u);
+  EXPECT_EQ(*widths_seen.begin(), 4);
+}
+
+TEST(OpusBands, TheBudgetClampSitsAboveEverythingThatReadsIt) {
+  // The third inert mutation: the per-band budget is clamped to 16383
+  // eighths, and moving that to 16382 changes nothing. The clamp does
+  // fire - it is reached 2,324 times in the sweep above - but by then
+  // every consumer of the budget has saturated, so its exact value is
+  // not readable.
+  //
+  // The clamp exists to keep the budget inside 16 bits for the
+  // arithmetic that follows, not because anything reads the number. That
+  // is worth stating as a measurement rather than as a belief.
+  int32_t highest_responsive = 0;
+  for (int lm = -1; lm <= 3; ++lm) {
+    for (uint32_t band = 0; band < CELT_BANDS; ++band) {
+      if (gaud_celt_pulse_cache(lm, band) == nullptr) {
+        continue;
+      }
+      for (int32_t budget = 1; budget <= 2048; ++budget) {
+        if (gaud_celt_bits_to_pulses(lm, band, budget)
+            != gaud_celt_bits_to_pulses(lm, band, budget - 1)) {
+          highest_responsive = std::max(highest_responsive, budget);
+        }
+      }
+    }
+  }
+  // Measured: 252 eighths, which is 65 times below the clamp.
+  EXPECT_EQ(highest_responsive, 252);
+  EXPECT_GT(16383 / highest_responsive, 60);
+}
+
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

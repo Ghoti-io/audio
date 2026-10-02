@@ -462,6 +462,154 @@ void gaud_celt_renormalise_vector(int16_t * x, uint32_t n, int16_t gain);
 unsigned gaud_celt_alg_unquant(int16_t * x, uint32_t n, uint32_t k,
     unsigned spread, uint32_t blocks, OPUS_Range * range, int16_t gain);
 
+/** Steps in the binary search over the pulse cache: 2**6 is 64 codes. */
+#define CELT_LOG_MAX_PSEUDO 6
+
+/**
+ * @brief The cache row for one band at one frame size.
+ *
+ * Entry zero is how many pulse counts the row holds; entry `q` is the
+ * cost in eighths of a bit, less one, of coding `q` pseudo-pulses in
+ * that band. The table is generated from the appendix rather than
+ * computed, because what it holds is the *reference's* rounding of a
+ * logarithm and not the logarithm.
+ *
+ * **The row is chosen by @p lm, not by `mode->lm`.** Section 4.3.4.4's
+ * recursion decrements the frame size at every split, and each level
+ * must read the row for the size it is actually coding - a band split
+ * once at the shortest frame reads row zero, which is the row for the
+ * `-1` that nothing else ever asks for. Reading `mode->lm` here instead
+ * gives the right answer at the top level and the wrong one below it.
+ *
+ * **Eight (frame size, band) pairs have no row at all**, and the index
+ * table marks them with -1: the bands that are one bin wide at the
+ * shortest frame cannot be split, so nothing ever asks what a split of
+ * one of them would cost. RFC 6716 adds that -1 to the base pointer
+ * and relies on never dereferencing the result; this returns NULL
+ * instead, which is the same thing without forming a pointer outside
+ * the array. A caller that would have read garbage now crashes, and
+ * ::gaud_celt_quant_all_bands is shown by test never to get there.
+ *
+ * @param lm The frame size at this level of the recursion, -1 upwards.
+ * @param band Which band.
+ * @return Its row, or NULL where there is none.
+ */
+const unsigned char * gaud_celt_pulse_cache(int lm, uint32_t band);
+
+/**
+ * @brief Turn a pseudo-pulse count into the real one.
+ *
+ * Above seven the counts are spaced logarithmically, eight to a octave,
+ * so that one byte of cache covers up to ::CELT_MAX_PULSES.
+ *
+ * @param index The pseudo-pulse count.
+ * @return How many pulses that is.
+ */
+static inline int gaud_celt_get_pulses(int index) {
+  return index < 8 ? index : (8 + (index & 7)) << ((index >> 3) - 1);
+}
+
+/**
+ * @brief The pseudo-pulse count whose cost is closest to @p bits.
+ *
+ * A binary search of fixed depth over the cache row, then one
+ * comparison to pick whichever neighbour is nearer. Fixed depth rather
+ * than a loop with a test so that it runs in constant time, which the
+ * reference wanted for a different reason than this library does.
+ *
+ * @param lm The frame size at this level of the recursion.
+ * @param band Which band.
+ * @param bits The budget, in eighths of a bit.
+ * @return The pseudo-pulse count.
+ */
+int gaud_celt_bits_to_pulses(int lm, uint32_t band, int32_t bits);
+
+/**
+ * @brief What @p pulses pseudo-pulses actually cost.
+ *
+ * @param lm The frame size at this level of the recursion.
+ * @param band Which band.
+ * @param pulses The pseudo-pulse count.
+ * @return Its cost in eighths of a bit; zero for zero.
+ */
+int32_t gaud_celt_pulses_to_bits(int lm, uint32_t band, int pulses);
+
+/**
+ * @brief How much scratch ::gaud_celt_quant_all_bands needs, in entries.
+ *
+ * The normalised spectrum for each channel - which later bands fold
+ * from, so it has to outlive the band that produced it - then two
+ * band-sized areas: one for the Hadamard reorderings and one for the
+ * copy of a fold source that is about to be transformed.
+ *
+ * @param mode The frame size.
+ * @param channels 1 or 2.
+ * @return How many `int16_t` the scratch must hold.
+ */
+static inline uint32_t gaud_celt_quant_scratch(
+    const CELT_Mode * mode, uint32_t channels) {
+  return channels * ((1u << mode->lm) * (uint32_t)mode->edges[CELT_BANDS])
+      + 2u * CELT_MAX_BAND_BINS;
+}
+
+/** How far the split's resolution is biased, in eighths of a bit. */
+#define CELT_QTHETA_OFFSET 4
+
+/** The same, for the two-phase stereo case where N is 2. */
+#define CELT_QTHETA_OFFSET_TWOPHASE 16
+
+/**
+ * @brief The folding generator, RFC 6716's `celt_lcg_rand`.
+ *
+ * A band with no pulses is filled either with a copy of a lower band or,
+ * when there is no lower band to copy, with noise from this. Both ends
+ * run the same sequence from the same seed, so the "noise" is agreed on.
+ *
+ * @param seed The state.
+ * @return The next state.
+ */
+static inline uint32_t gaud_celt_lcg_rand(uint32_t seed) {
+  return 1664525u * seed + 1013904223u;
+}
+
+/**
+ * @brief Decode every band's shape, section 4.3.4 entire.
+ *
+ * The recursion of section 4.3.4.4 on top of the single-band coder:
+ * each band is split until its codebook fits in 32 bits, with a gain
+ * parameter coded at each split saying how the energy divides, and
+ * stereo handled by the same mechanism with the two channels as the two
+ * halves. Around that sits the time-frequency resolution change of
+ * section 4.3.4.5, applied as Hadamard rotations before the split and
+ * undone after it, and the folding that fills bands the allocator gave
+ * nothing to.
+ *
+ * @param range The range decoder.
+ * @param mode The frame size.
+ * @param start First band to decode.
+ * @param end One past the last.
+ * @param x Receives the first channel, @p mode->size entries.
+ * @param y Receives the second, or NULL for mono.
+ * @param collapse Receives one mask per band per channel, for §4.3.5.
+ * @param pulses The allocation, in eighths of a bit per band.
+ * @param short_blocks Whether the frame is transient.
+ * @param spread One of the ::CELT_SPREAD_NONE values.
+ * @param dual_stereo Whether the channels are coded separately.
+ * @param intensity The first band coded as intensity stereo.
+ * @param tf_res One resolution flag per band.
+ * @param total_bits The frame's budget in eighths of a bit.
+ * @param balance Bits carried in from the fine-energy split.
+ * @param coded_bands How many bands the allocator decided to code.
+ * @param seed The folding generator's state, advanced in place.
+ * @param scratch Working space, ::gaud_celt_quant_scratch entries.
+ */
+void gaud_celt_quant_all_bands(OPUS_Range * range, const CELT_Mode * mode,
+    uint32_t start, uint32_t end, int16_t * x, int16_t * y,
+    unsigned char * collapse, const int32_t * pulses, bool short_blocks,
+    unsigned spread, bool dual_stereo, uint32_t intensity, const int * tf_res,
+    int32_t total_bits, int32_t balance, uint32_t coded_bands, uint32_t * seed,
+    int16_t * scratch);
+
 #ifdef __cplusplus
 }
 #endif

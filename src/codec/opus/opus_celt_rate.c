@@ -68,6 +68,7 @@
  */
 
 #include "opus_celt.h"
+#include <stddef.h>
 #include <string.h>
 
 /** Steps in the fine interpolation between two table rows: 2**6. */
@@ -561,4 +562,38 @@ uint32_t gaud_celt_compute_allocation(OPUS_Range * range,
       bits2, thresh, cap, total, out_balance, skip_rsv, intensity,
       intensity_rsv, dual_stereo, dual_stereo_rsv, pulses, ebits,
       fine_priority, channels);
+}
+
+const unsigned char * gaud_celt_pulse_cache(int lm, uint32_t band) {
+  // The index is by frame size and then by band, with one extra row at
+  // the front for the -1 that a split hands down.
+  int16_t index = gaud_opus_cache_index50[(uint32_t)(lm + 1) * CELT_BANDS
+      + band];
+  return index < 0 ? NULL : gaud_opus_cache_bits50 + index;
+}
+
+int gaud_celt_bits_to_pulses(int lm, uint32_t band, int32_t bits) {
+  const unsigned char * cache = gaud_celt_pulse_cache(lm, band);
+  int low = 0;
+  int high = cache[0];
+  --bits;
+  for (int i = 0; i < CELT_LOG_MAX_PSEUDO; ++i) {
+    int mid = (low + high + 1) >> 1;
+    if ((int32_t)cache[mid] >= bits) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  // Whichever of the two the search closed on is nearer. The low end
+  // reads as -1 rather than 0 because coding nothing costs nothing.
+  return bits - (low == 0 ? -1 : (int32_t)cache[low])
+          <= (int32_t)cache[high] - bits
+      ? low
+      : high;
+}
+
+int32_t gaud_celt_pulses_to_bits(int lm, uint32_t band, int pulses) {
+  const unsigned char * cache = gaud_celt_pulse_cache(lm, band);
+  return pulses == 0 ? 0 : (int32_t)cache[pulses] + 1;
 }
