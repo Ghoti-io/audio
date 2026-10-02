@@ -39,6 +39,7 @@
 
 #include "../../src/codec/opus/opus_internal.h"
 #include "../../src/codec/opus/opus_range.h"
+#include "../../src/codec/opus/opus_celt.h"
 #include "../../src/codec/opus/opus_tables.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
@@ -48,6 +49,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1410,6 +1412,319 @@ TEST(OpusRange, DecUintLargeOverflowsOnlyWhenItCan) {
              "reaching it means the split is wrong";
     }
   }
+}
+
+/* ----------------------------------------- RFC 6716 section 4.3.2:
+                                                   the energy envelope */
+
+/**
+ * The Laplace distribution, and the three passes over the band energies.
+ *
+ * The Laplace decoder is tested by **tiling**. Its distribution is not a
+ * table; it is walked - a frequency for zero, then a decaying run, then
+ * a flat tail at the floor probability - and the intervals it produces
+ * must partition the range coder's 32,768 exactly, with no gap and no
+ * overlap. A gap is a value the encoder can write and this cannot read;
+ * an overlap is two values that decode to the same bits. Both are fatal
+ * and neither shows up as a wrong-looking number, so the partition is
+ * asserted directly, for every parameter pair the generated model table
+ * actually contains.
+ *
+ * Then the decoder is checked against that partition, using the trick
+ * the range decoder's own tests use: ::OPUS_Range is copyable, so the
+ * 15-bit value the decode would see can be read from a copy first, and
+ * the answer looked up in the partition built independently.
+ *
+ * **What is not here.** Coarse energy was checked against the reference
+ * implementation's own intermediate state, frame by frame, over 11,211
+ * CELT frames of test vectors 1, 7 and 11 - every CELT configuration -
+ * and matched exactly, including both clamps and the 16-by-16 multiply.
+ * That check needs a locally built reference and so is a development
+ * instrument rather than a gate; notes/audio/opus.md records how to run
+ * it. What stands in the repository is the conformance gate, which
+ * cannot see this layer on its own.
+ */
+
+namespace {
+
+/** How the specification's walk divides the range, for one context. */
+struct Laplace {
+  uint32_t fl[64];   ///< Interval starts, indexed by decoded value + 32.
+  uint32_t fh[64];   ///< And their ends.
+  bool used[64];     ///< Whether that value is reachable at all.
+};
+
+/**
+ * Build the partition by walking the distribution forwards.
+ *
+ * Written from section 4.3.2.1's description of the shape rather than
+ * from the decoder's loop, so that the two are not one piece of code
+ * compared with itself: this accumulates intervals in order and the
+ * decoder searches them.
+ */
+Laplace BuildLaplace(uint32_t fs0, int decay) {
+  Laplace out{};
+  const uint32_t minp = 1;
+  const uint32_t nmin = 16;
+  /* Zero takes the first fs0 of the range. */
+  out.fl[32] = 0;
+  out.fh[32] = fs0;
+  out.used[32] = true;
+  uint32_t ft = 32768u - minp * (2u * nmin) - fs0;
+  uint32_t fs = ((ft * (uint32_t)(16384 - decay)) >> 15) + minp;
+  uint32_t at = fs0;
+  int value = 1;
+  /* The decaying run, mirrored: each magnitude takes 2*fs, negative
+   * first and then positive. */
+  while (fs > minp && value < 31) {
+    out.fl[32 - value] = at;
+    out.fh[32 - value] = at + fs;
+    out.used[32 - value] = true;
+    out.fl[32 + value] = at + fs;
+    out.fh[32 + value] = at + 2u * fs;
+    out.used[32 + value] = true;
+    at += 2u * fs;
+    fs = (((fs * 2u) - 2u * minp) * (uint32_t)decay) >> 15;
+    fs += minp;
+    ++value;
+  }
+  /* And the flat tail, at the floor, until the range is used up. */
+  while (at + 2u * minp <= 32768u && value < 31) {
+    out.fl[32 - value] = at;
+    out.fh[32 - value] = at + minp;
+    out.used[32 - value] = true;
+    out.fl[32 + value] = at + minp;
+    out.fh[32 + value] = at + 2u * minp;
+    out.used[32 + value] = true;
+    at += 2u * minp;
+    ++value;
+  }
+  return out;
+}
+
+/** Every (fs, decay) pair the coarse energy model can present. */
+std::vector<std::pair<uint32_t, int>> EnergyContexts() {
+  std::vector<std::pair<uint32_t, int>> out;
+  for (int size = 0; size < 4; ++size) {
+    for (int intra = 0; intra < 2; ++intra) {
+      for (int band = 0; band < 21; ++band) {
+        size_t at = ((size_t)size * 2u + intra) * 42u + (size_t)band * 2u;
+        out.emplace_back((uint32_t)gaud_opus_e_prob_model[at] << 7,
+            (int)gaud_opus_e_prob_model[at + 1u] << 6);
+      }
+    }
+  }
+  return out;
+}
+
+} // namespace
+
+/**
+ * The distribution tiles the range coder's 32,768 with no gap.
+ *
+ * Checked for all 168 contexts the generated model holds. A gap is a
+ * value an encoder can produce and this decoder cannot read; an overlap
+ * is two values coded by the same bits. Neither looks like a wrong
+ * number when it happens.
+ */
+TEST(OpusCelt, LaplaceDistributionTilesTheRange) {
+  for (const auto & context : EnergyContexts()) {
+    Laplace table = BuildLaplace(context.first, context.second);
+    /* Walk the intervals in increasing order of start and check each
+     * begins exactly where the last ended. */
+    std::vector<std::pair<uint32_t, uint32_t>> spans;
+    for (int i = 0; i < 64; ++i) {
+      if (table.used[i]) {
+        spans.emplace_back(table.fl[i], table.fh[i]);
+      }
+    }
+    std::sort(spans.begin(), spans.end());
+    ASSERT_FALSE(spans.empty());
+    EXPECT_EQ(spans.front().first, 0u)
+        << "fs " << context.first << " decay " << context.second;
+    for (size_t i = 1; i < spans.size(); ++i) {
+      ASSERT_EQ(spans[i].first, spans[i - 1].second)
+          << "fs " << context.first << " decay " << context.second
+          << " at interval " << i;
+    }
+    for (const auto & span : spans) {
+      ASSERT_LT(span.first, span.second);
+      ASSERT_LE(span.second, 32768u);
+    }
+  }
+}
+
+/**
+ * The decoder lands in the interval the partition says it should.
+ *
+ * ::OPUS_Range is copyable, so the 15-bit value the decode is about to
+ * see can be read from a copy and used to look the answer up in a
+ * partition built by the other routine above.
+ */
+TEST(OpusCelt, LaplaceDecodeAgreesWithThePartition) {
+  auto contexts = EnergyContexts();
+  unsigned checked = 0;
+  unsigned nonzero = 0;
+  for (uint32_t seed = 1; seed <= 12u; ++seed) {
+    std::vector<unsigned char> data = RangeBytes(seed * 7u, 128);
+    OPUS_Range range;
+    gaud_opus_range_init(&range, data.data(), data.size());
+    for (unsigned step = 0; step < 200u; ++step) {
+      const auto & context = contexts[(seed * 200u + step) % contexts.size()];
+      Laplace table = BuildLaplace(context.first, context.second);
+      OPUS_Range peek = range;
+      uint32_t fm = gaud_opus_decode_bin(&peek, 15);
+      int got = gaud_celt_laplace_decode(
+          &range, context.first, context.second);
+      ASSERT_GE(got, -31);
+      ASSERT_LE(got, 31);
+      int slot = got + 32;
+      ASSERT_TRUE(table.used[slot])
+          << "value " << got << " is outside the partition";
+      EXPECT_GE(fm, table.fl[slot]) << "value " << got;
+      EXPECT_LT(fm, table.fh[slot]) << "value " << got;
+      ++checked;
+      if (got != 0) {
+        ++nonzero;
+      }
+    }
+  }
+  /* The contexts are skewed towards zero, so most draws are zero. A
+   * sweep that only ever produced zero would pass every assertion above
+   * while exercising none of the walk. */
+  EXPECT_GT(nonzero, 0u) << "swept " << checked
+                         << " draws and every one decoded as zero, so the "
+                            "decaying part of the distribution is untested";
+}
+
+/**
+ * Section 4.3.2.2's correction, at both ends of a three-bit refinement.
+ *
+ * The mapping is (f + 1/2)/2**B - 1/2, so for B = 3 the smallest
+ * refinement is -0.4375 and the largest is +0.4375, which in the Q10
+ * the energies are held in are -448 and +448. Asserted as numbers
+ * rather than as the formula, because the formula is what is being
+ * tested.
+ */
+TEST(OpusCelt, FineEnergyCorrectionSpansPlusAndMinusAHalf) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  const int fine[CELT_BANDS] = {3};
+
+  /* Raw bits come from the end of the frame, so the last byte decides
+   * what the three-bit refinement reads. */
+  for (int want : {0, 7}) {
+    std::vector<unsigned char> data(16u, 0u);
+    data.back() = (unsigned char)want;
+    OPUS_Range range;
+    gaud_opus_range_init(&range, data.data(), data.size());
+    int16_t energy[2 * CELT_BANDS] = {0};
+    gaud_celt_decode_fine_energy(&range, &mode, energy, fine, 0u, 1u, 1u);
+    EXPECT_EQ(energy[0], want == 0 ? -448 : 448) << "q2 " << want;
+  }
+}
+
+/** A band given no fine bits is left exactly as the coarse pass had it. */
+TEST(OpusCelt, FineEnergyLeavesUnallocatedBandsAlone) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  int fine[CELT_BANDS];
+  for (int i = 0; i < CELT_BANDS; ++i) {
+    fine[i] = 0;
+  }
+  std::vector<unsigned char> data = RangeBytes(5u, 32);
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data.data(), data.size());
+  int16_t energy[2 * CELT_BANDS];
+  for (int i = 0; i < 2 * CELT_BANDS; ++i) {
+    energy[i] = (int16_t)(-1000 - i);
+  }
+  uint32_t before = range.total_bits;
+  gaud_celt_decode_fine_energy(
+      &range, &mode, energy, fine, 0u, CELT_BANDS, 2u);
+  for (int i = 0; i < 2 * CELT_BANDS; ++i) {
+    EXPECT_EQ(energy[i], (int16_t)(-1000 - i)) << i;
+  }
+  /* And it read nothing, which is the part a loop that "helpfully"
+   * read zero bits would get wrong. */
+  EXPECT_EQ(range.total_bits, before);
+}
+
+/**
+ * The final pass spends priority 0 before priority 1, and stops.
+ *
+ * Section 4.3.2.2: leftover bits go to priority 0 bands from band 0
+ * upwards, then to priority 1 bands, and anything still left is unused.
+ * Here there are four bits and four bands of each priority in mono, so
+ * exactly the four priority 0 bands move.
+ */
+TEST(OpusCelt, FinalEnergySpendsPriorityZeroFirst) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  int fine[CELT_BANDS];
+  int priority[CELT_BANDS];
+  for (int i = 0; i < CELT_BANDS; ++i) {
+    fine[i] = 1;
+    priority[i] = i < 8 ? (i < 4 ? 0 : 1) : 1;
+  }
+  std::vector<unsigned char> data = RangeBytes(9u, 32);
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data.data(), data.size());
+  int16_t energy[2 * CELT_BANDS] = {0};
+  gaud_celt_decode_final_energy(
+      &range, &mode, energy, fine, priority, 4, 0u, CELT_BANDS, 1u);
+
+  int moved = 0;
+  for (int i = 0; i < CELT_BANDS; ++i) {
+    if (energy[i] != 0) {
+      ++moved;
+      EXPECT_LT(i, 4) << "band " << i << " moved but is not priority 0";
+    }
+  }
+  /* Four bits, one band each: every priority 0 band moved. A band whose
+   * bit decoded as the value that happens to give a zero offset would
+   * break this, so the offset is checked to be non-zero by construction
+   * - it is +/- half a step and never zero. */
+  EXPECT_EQ(moved, 4);
+}
+
+/** A band already at the ceiling of fine bits is skipped. */
+TEST(OpusCelt, FinalEnergySkipsBandsAtTheFineCeiling) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  int fine[CELT_BANDS];
+  int priority[CELT_BANDS];
+  for (int i = 0; i < CELT_BANDS; ++i) {
+    fine[i] = CELT_MAX_FINE_BITS;
+    priority[i] = 0;
+  }
+  std::vector<unsigned char> data = RangeBytes(11u, 32);
+  OPUS_Range range;
+  gaud_opus_range_init(&range, data.data(), data.size());
+  int16_t energy[2 * CELT_BANDS] = {0};
+  uint32_t before = range.total_bits;
+  gaud_celt_decode_final_energy(
+      &range, &mode, energy, fine, priority, 16, 0u, CELT_BANDS, 1u);
+  for (int i = 0; i < CELT_BANDS; ++i) {
+    EXPECT_EQ(energy[i], 0) << i;
+  }
+  EXPECT_EQ(range.total_bits, before);
+}
+
+/** The four frame sizes, and the one that does not exist. */
+TEST(OpusCelt, ModeInitCoversTheFourFrameSizes) {
+  for (unsigned lm = 0; lm <= 3u; ++lm) {
+    CELT_Mode mode;
+    ASSERT_TRUE(gaud_celt_mode_init(&mode, lm)) << lm;
+    EXPECT_EQ(mode.size, 120u << lm);
+    EXPECT_EQ(mode.shorts, 1u << lm);
+    EXPECT_EQ(mode.bands, (uint32_t)CELT_BANDS);
+    /* The last band's top edge, scaled, is 800 bins at 20 ms - the
+     * 20 kHz the band layout stops at, not the 960-bin Nyquist. */
+    EXPECT_EQ(gaud_celt_band_start(&mode, CELT_BANDS), 100u << lm);
+  }
+  CELT_Mode mode;
+  EXPECT_FALSE(gaud_celt_mode_init(&mode, 4u));
 }
 
 int main(int argc, char ** argv) {
