@@ -59,6 +59,9 @@ extern const int16_t gaud_opus_window120[120];
 /** Allocation in 1/32 bit per sample, 11 by 21. */
 extern const unsigned char gaud_opus_band_allocation[231];
 
+/** Cost of coding one of k+1 values, in eighths of a bit. */
+extern const unsigned char gaud_opus_log2_frac_table[24];
+
 /** Time-frequency resolution changes, 4 by 8. */
 extern const int8_t gaud_opus_tf_select_table[32];
 

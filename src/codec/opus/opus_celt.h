@@ -174,6 +174,93 @@ static inline int32_t gaud_celt_max32(int32_t a, int32_t b) {
 }
 
 /**
+ * @brief The per-band ceiling on allocation, section 4.3.3.
+ *
+ * Read from the generated cache, which is indexed by frame size and
+ * channel count together - eight combinations of 21 bands.
+ *
+ * @param mode The frame size.
+ * @param cap Receives one ceiling per band, in eighths of a bit.
+ * @param channels 1 or 2.
+ */
+void gaud_celt_init_caps(
+    const CELT_Mode * mode, int32_t * cap, uint32_t channels);
+
+/**
+ * @brief Read the per-band time-frequency resolution flags.
+ *
+ * Section 4.3.1. One flag per band, each toggling the resolution
+ * relative to the band before, and then a select flag that chooses
+ * between two rows of the change table - **read only when the two rows
+ * would give different answers**, which is the easiest bit in the
+ * frame to read when it is not there.
+ *
+ * @param range The range decoder.
+ * @param mode The frame size.
+ * @param start First band.
+ * @param end One past the last.
+ * @param transient Whether the frame set the transient flag.
+ * @param tf_res Receives the resolution change for each band.
+ */
+void gaud_celt_tf_decode(OPUS_Range * range, const CELT_Mode * mode,
+    uint32_t start, uint32_t end, bool transient, int * tf_res);
+
+/**
+ * @brief Read the band boosts, section 4.3.3's "band boost".
+ *
+ * One of the three transmitted adjustments to the implicit allocation.
+ * Each band may be boosted repeatedly, and the probability of a boost
+ * rises once any band has had one, so the cost of boosting several
+ * neighbours is much less than the first.
+ *
+ * @param range The range decoder.
+ * @param mode The frame size.
+ * @param start First band.
+ * @param end One past the last.
+ * @param channels 1 or 2.
+ * @param cap The per-band ceilings; a boost cannot exceed one.
+ * @param total_bits The budget, in eighths of a bit.
+ * @param offsets Receives each band's boost.
+ * @return What is left of the budget.
+ */
+int32_t gaud_celt_decode_boosts(OPUS_Range * range, const CELT_Mode * mode,
+    uint32_t start, uint32_t end, uint32_t channels, const int32_t * cap,
+    int32_t total_bits, int32_t * offsets);
+
+/**
+ * @brief Work out how many bits every band gets, section 4.3.3.
+ *
+ * The one computation in this codec that has to be exactly right for
+ * reasons that are not about quality: its result decides how many
+ * symbols are read next, so an allocator one eighth of a bit out
+ * desynchronises the range decoder rather than degrading a band.
+ *
+ * @param range The range decoder; this reads the skip, intensity and
+ *   dual stereo decisions from it.
+ * @param mode The frame size.
+ * @param start First band.
+ * @param end One past the last.
+ * @param offsets The boosts.
+ * @param cap The per-band ceilings.
+ * @param alloc_trim The tilt, 0 to 10.
+ * @param intensity Receives the first intensity-coded band.
+ * @param dual_stereo Receives whether joint coding is off.
+ * @param total The budget, in eighths of a bit.
+ * @param out_balance Receives bits left over for the shape coder.
+ * @param pulses Receives each band's shape allowance.
+ * @param ebits Receives each band's fine energy bits.
+ * @param fine_priority Receives which bands want leftover bits first.
+ * @param channels 1 or 2.
+ * @return How many bands are coded; the rest are skipped.
+ */
+uint32_t gaud_celt_compute_allocation(OPUS_Range * range,
+    const CELT_Mode * mode, uint32_t start, uint32_t end,
+    const int32_t * offsets, const int32_t * cap, int alloc_trim,
+    uint32_t * intensity, bool * dual_stereo, int32_t total,
+    int32_t * out_balance, int32_t * pulses, int * ebits,
+    int * fine_priority, uint32_t channels);
+
+/**
  * @brief Decode one Laplace-distributed value.
  *
  * Section 4.3.2.1 codes the coarse energy's prediction error this way.

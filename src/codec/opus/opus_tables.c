@@ -88,6 +88,12 @@ const unsigned char gaud_opus_band_allocation[231] = {
     148, 129, 104,
 };
 
+/** Cost of coding one of k+1 values, in eighths of a bit. */
+const unsigned char gaud_opus_log2_frac_table[24] = {
+    0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29,
+    30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37,
+};
+
 /** Time-frequency resolution changes, 4 by 8. */
 const int8_t gaud_opus_tf_select_table[32] = {
     0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -2,

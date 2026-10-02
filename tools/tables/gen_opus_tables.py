@@ -481,6 +481,26 @@ def extract(root, rfc_text):
           "Appendix A and Table 57 of the prose")
     tables["band_allocation"] = ("unsigned char", allocation)
 
+    # --- the uniform-coding cost table, which log2_frac reproduces ----
+    log2_frac_table = read_array(root, "celt/rate.c", "LOG2_FRAC_TABLE")
+    if len(log2_frac_table) != 24:
+        raise SystemExit(
+            f"gen_opus_tables: LOG2_FRAC_TABLE has "
+            f"{len(log2_frac_table)} entries, not 24")
+    for index, value in enumerate(log2_frac_table):
+        # Entry k is what it costs to code one of k+1 equally likely
+        # values, in eighths of a bit - so it is log2_frac of k+1, with
+        # the same conservative rounding the allocator relies on.
+        want = log2_frac(index + 1, 3)
+        if want != value:
+            raise SystemExit(
+                f"gen_opus_tables: LOG2_FRAC_TABLE[{index}] is {value} in "
+                f"Appendix A and {want} from log2_frac({index + 1}). One "
+                "of the two is misread.")
+    print("gen_opus_tables: the uniform-coding costs reproduce from "
+          "log2_frac")
+    tables["log2_frac_table"] = ("unsigned char", log2_frac_table)
+
     # --- extracted, with no second reading available -------------------
     # These have no formula and are not printed in the prose. The check
     # available is their shape, which is asserted rather than assumed.
@@ -591,6 +611,7 @@ extern "C" {
         "pred_coef": "Coarse energy's time prediction, per frame size, Q15.",
         "beta_coef": "Coarse energy's frequency prediction, Q15.",
         "beta_intra": "The same, for a frame coded without history.",
+        "log2_frac_table": "Cost of coding one of k+1 values, in eighths of a bit.",
     }
     for name in tables:
         if name not in notes:

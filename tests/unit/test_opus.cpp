@@ -1727,6 +1727,244 @@ TEST(OpusCelt, ModeInitCoversTheFourFrameSizes) {
   EXPECT_FALSE(gaud_celt_mode_init(&mode, 4u));
 }
 
+/* ----------------------------------------- RFC 6716 section 4.3.3:
+                                                    the bit allocation */
+
+/**
+ * The allocator, and the invariant that catches the mistake it invites.
+ *
+ * Section 4.3.3 says the allocation "MUST be recovered exactly" and
+ * that any deviation "will result in corrupted output". It is also the
+ * piece with the least to check it offline: almost every number in it
+ * is a step in one computation whose only external meaning is that the
+ * range decoder stays in step. So the decisive verification is against
+ * the reference implementation's own intermediate state, over 11,211
+ * CELT frames of test vectors 1, 7 and 11 - all sixteen CELT
+ * configurations, both channel counts, all four frame sizes - where
+ * everything matches: the coded band count, the intensity and dual
+ * stereo decisions, the balance, and all 21 of the pulses, fine-energy
+ * bits and priorities. notes/audio/opus.md says how to reproduce it.
+ *
+ * What stands here is the structural half, and one test chosen because
+ * it would have caught the defect this file actually had.
+ *
+ * **The allocator works in two units.** The band edges are in 2.5 ms
+ * bins and a frame of `1 << lm` short MDCTs has that many times more.
+ * The caps and the boost quanta want the real count; nearly everything
+ * else wants the unscaled one and applies the scaling a line later.
+ * Writing it all in scaled units applies the shift twice, which is
+ * silent at `lm = 0` and multiplies the allocation eightfold at
+ * `lm = 3`. It does not overflow or bust the budget - the allocator
+ * compensates by *skipping bands*. So the test is that at a constant
+ * number of bits per sample every band stays coded, whatever the frame
+ * size, which with the doubled shift drops from 21 bands to 16.
+ */
+
+namespace {
+
+/** Run the allocator once on a fabricated budget. */
+struct Allocation {
+  uint32_t coded;
+  int32_t pulses[CELT_BANDS];
+  int fine[CELT_BANDS];
+  int priority[CELT_BANDS];
+  int32_t cap[CELT_BANDS];
+  int32_t budget;
+  uint32_t intensity;
+  bool dual;
+  int32_t balance;
+};
+
+Allocation Allocate(unsigned lm, uint32_t channels, size_t bytes,
+    int trim = 5) {
+  CELT_Mode mode;
+  EXPECT_TRUE(gaud_celt_mode_init(&mode, lm));
+  static std::vector<unsigned char> buffer;
+  buffer.assign(bytes, 0xA5u);
+  OPUS_Range range;
+  gaud_opus_range_init(&range, buffer.data(), buffer.size());
+  Allocation out{};
+  gaud_celt_init_caps(&mode, out.cap, channels);
+  int32_t offsets[CELT_BANDS] = {0};
+  out.budget = ((int32_t)bytes * 8 << CELT_BITRES) - 1;
+  out.coded = gaud_celt_compute_allocation(&range, &mode, 0u, CELT_BANDS,
+      offsets, out.cap, trim, &out.intensity, &out.dual, out.budget,
+      &out.balance, out.pulses, out.fine, out.priority, channels);
+  return out;
+}
+
+} // namespace
+
+/**
+ * At a constant rate per sample, every band stays coded at every frame
+ * size - which is the unit confusion's tell.
+ */
+TEST(OpusAllocate, EveryBandStaysCodedAcrossFrameSizes) {
+  for (unsigned lm = 0; lm <= 3u; ++lm) {
+    for (uint32_t channels = 1; channels <= 2u; ++channels) {
+      /* 64 bytes per 2.5 ms per channel: a high but ordinary rate. */
+      size_t bytes = (size_t)(64u << lm) * channels;
+      Allocation one = Allocate(lm, channels, bytes);
+      EXPECT_EQ(one.coded, (uint32_t)CELT_BANDS)
+          << "lm " << lm << " channels " << channels
+          << ": bands were skipped at a rate that should reach all of "
+             "them, which is what applying the frame-size shift twice "
+             "looks like";
+    }
+  }
+}
+
+/** And it never hands out more than it was given. */
+TEST(OpusAllocate, NeverExceedsItsBudget) {
+  for (unsigned lm = 0; lm <= 3u; ++lm) {
+    for (uint32_t channels = 1; channels <= 2u; ++channels) {
+      for (size_t scale : {8u, 32u, 64u, 128u}) {
+        size_t bytes = (size_t)(scale << lm) * channels;
+        Allocation one = Allocate(lm, channels, bytes);
+        int32_t spent = 0;
+        for (int j = 0; j < CELT_BANDS; ++j) {
+          spent += one.pulses[j];
+          spent += (int32_t)channels * one.fine[j] << CELT_BITRES;
+        }
+        EXPECT_LE(spent, one.budget)
+            << "lm " << lm << " channels " << channels << " bytes "
+            << bytes;
+      }
+    }
+  }
+}
+
+/**
+ * No band exceeds its ceiling, and no band gets a negative share.
+ *
+ * The rates swept here reach the format's 1,275-byte limit on purpose,
+ * so that the eight-bit ceiling on fine energy is approached rather
+ * than merely asserted; the count of bands that reach it is checked so
+ * that this cannot quietly become a sweep of rates too low to test it.
+ *
+ * **The clamp that enforces that ceiling is nevertheless unreachable**,
+ * and the comment in opus_celt_rate.c says so with the measurement.
+ * Reaching the ceiling and being clamped to it are different things:
+ * an earlier bound already holds the value at eight.
+ */
+TEST(OpusAllocate, RespectsTheCapsAndTheFineCeiling) {
+  int at_ceiling_total = 0;
+  for (unsigned lm = 0; lm <= 3u; ++lm) {
+    for (uint32_t channels = 1; channels <= 2u; ++channels) {
+      for (size_t scale : {8u, 64u, 96u, 160u}) {
+        size_t bytes = (size_t)(scale << lm) * channels;
+        if (bytes > OPUS_MAX_FRAME_BYTES) {
+          bytes = OPUS_MAX_FRAME_BYTES;
+        }
+        Allocation one = Allocate(lm, channels, bytes);
+        for (int j = 0; j < CELT_BANDS; ++j) {
+          EXPECT_GE(one.pulses[j], 0) << "lm " << lm << " band " << j;
+          EXPECT_LE(one.pulses[j], one.cap[j]) << "lm " << lm
+                                               << " band " << j;
+          EXPECT_GE(one.fine[j], 0) << "lm " << lm << " band " << j;
+          EXPECT_LE(one.fine[j], CELT_MAX_FINE_BITS)
+              << "lm " << lm << " band " << j;
+          EXPECT_TRUE(one.priority[j] == 0 || one.priority[j] == 1)
+              << "lm " << lm << " band " << j;
+          if (one.fine[j] == CELT_MAX_FINE_BITS) {
+            ++at_ceiling_total;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_GT(at_ceiling_total, 0)
+      << "no band in the whole sweep reached the eight-bit fine energy "
+         "ceiling, so the bound on it was asserted and never tested";
+}
+
+/** A budget of nothing allocates nothing and reads nothing. */
+TEST(OpusAllocate, AnEmptyBudgetAllocatesNothing) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 3u));
+  unsigned char buffer[4] = {0, 0, 0, 0};
+  OPUS_Range range;
+  gaud_opus_range_init(&range, buffer, sizeof(buffer));
+  int32_t cap[CELT_BANDS];
+  gaud_celt_init_caps(&mode, cap, 1u);
+  int32_t offsets[CELT_BANDS] = {0};
+  int32_t pulses[CELT_BANDS];
+  int fine[CELT_BANDS];
+  int priority[CELT_BANDS];
+  uint32_t intensity = 0;
+  bool dual = false;
+  int32_t balance = 0;
+  uint32_t coded = gaud_celt_compute_allocation(&range, &mode, 0u,
+      CELT_BANDS, offsets, cap, 5, &intensity, &dual, 0, &balance, pulses,
+      fine, priority, 1u);
+  EXPECT_GT(coded, 0u);
+  for (int j = 0; j < CELT_BANDS; ++j) {
+    EXPECT_EQ(pulses[j], 0) << j;
+    EXPECT_EQ(fine[j], 0) << j;
+  }
+}
+
+/**
+ * The time-frequency flags only ever take the two values the table row
+ * holds.
+ *
+ * Section 4.3.1 maps each band's flag through `tf_select_table`, and
+ * the row is chosen by frame size, the transient flag and the select
+ * bit. So whatever the data, every band's answer must come from one of
+ * the two entries the chosen row offers - a mis-indexed table produces
+ * values from the wrong row, which still look like plausible small
+ * integers.
+ */
+TEST(OpusCelt, TfDecodeOnlyProducesValuesFromItsRow) {
+  for (unsigned lm = 0; lm <= 3u; ++lm) {
+    CELT_Mode mode;
+    ASSERT_TRUE(gaud_celt_mode_init(&mode, lm));
+    for (int transient = 0; transient < 2; ++transient) {
+      for (uint32_t seed = 1; seed <= 20u; ++seed) {
+        std::vector<unsigned char> data = RangeBytes(seed * 13u + lm, 64);
+        OPUS_Range range;
+        gaud_opus_range_init(&range, data.data(), data.size());
+        int tf_res[CELT_BANDS];
+        gaud_celt_tf_decode(
+            &range, &mode, 0u, CELT_BANDS, transient != 0, tf_res);
+        size_t row = (size_t)lm * 8u + 4u * (size_t)transient;
+        for (int j = 0; j < CELT_BANDS; ++j) {
+          bool from_row = false;
+          for (int select = 0; select < 2; ++select) {
+            for (int flag = 0; flag < 2; ++flag) {
+              if (tf_res[j]
+                  == gaud_opus_tf_select_table[row + 2u * select + flag]) {
+                from_row = true;
+              }
+            }
+          }
+          EXPECT_TRUE(from_row)
+              << "lm " << lm << " transient " << transient << " band " << j
+              << " gave " << tf_res[j] << ", which is in no entry of its row";
+        }
+      }
+    }
+  }
+}
+
+/** At the shortest frame size the resolution never changes. */
+TEST(OpusCelt, TfDecodeIsFlatAtTheShortestFrame) {
+  CELT_Mode mode;
+  ASSERT_TRUE(gaud_celt_mode_init(&mode, 0u));
+  for (uint32_t seed = 1; seed <= 20u; ++seed) {
+    std::vector<unsigned char> data = RangeBytes(seed * 17u, 64);
+    OPUS_Range range;
+    gaud_opus_range_init(&range, data.data(), data.size());
+    int tf_res[CELT_BANDS];
+    gaud_celt_tf_decode(&range, &mode, 0u, CELT_BANDS, false, tf_res);
+    /* Row 0 of the table is {0,-1,0,-1,...}: with one short MDCT there
+     * is no finer resolution to move to, only a coarser one. */
+    for (int j = 0; j < CELT_BANDS; ++j) {
+      EXPECT_TRUE(tf_res[j] == 0 || tf_res[j] == -1) << j;
+    }
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
