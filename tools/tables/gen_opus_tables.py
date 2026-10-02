@@ -298,6 +298,59 @@ def log2_frac(value, frac):
     return (length - 1) << frac
 
 
+
+def table_57(rfc_text):
+    """Table 57 of the prose: the static allocation, band by band.
+
+    The prose prints the same 231 numbers the appendix holds, transposed
+    - rows are bands and columns are the eleven quality steps, where the
+    array in modes.c is quality-major. So this is a second reading of
+    the most important table in the allocator, and it is parsed rather
+    than transcribed because 231 numbers typed by hand is 231 chances to
+    introduce the error this check exists to find.
+
+    The table is found by its caption, read backwards, and its shape is
+    asserted: a parse that silently picked up the wrong block of pipe
+    characters would otherwise look like a disagreement in the data.
+    """
+    lines = rfc_text.decode("ascii", "replace").splitlines()
+    caption = None
+    for index, line in enumerate(lines):
+        if "Table 57: CELT Static Allocation Table" in line:
+            caption = index
+            break
+    if caption is None:
+        raise SystemExit(
+            "gen_opus_tables: the RFC text has no Table 57 caption, so the "
+            "prose cannot be used to check the allocation table.")
+    # The table spans a page break, so the scan cannot stop at the first
+    # line that is not a row: it has to step over the RFC's running
+    # header and footer. It collects 22 rows of eleven numbers - the
+    # column headings and 21 bands - and stops when it has them.
+    rows = []
+    for line in reversed(lines[:caption]):
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        numbers = [int(v) for v in re.findall(r"-?\d+", stripped)]
+        if len(numbers) == 11:
+            rows.append(numbers)
+            if len(rows) == 22:
+                break
+    rows.reverse()
+    # The first such row is the column heading 0..10, which is not data.
+    if not rows or rows[0] != list(range(11)):
+        raise SystemExit(
+            "gen_opus_tables: Table 57 does not begin with its column "
+            f"headings; got {rows[0] if rows else None}. The parse has "
+            "found the wrong block.")
+    rows = rows[1:]
+    if len(rows) != 21:
+        raise SystemExit(
+            f"gen_opus_tables: Table 57 parsed as {len(rows)} bands, not 21")
+    return rows
+
+
 def main(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--rfc", default=os.path.join(
@@ -309,7 +362,7 @@ def main(argv):
     rfc_text = fetch_rfc(args.rfc, args.url)
     with tempfile.TemporaryDirectory() as work:
         root = reference_source(rfc_text, work)
-        tables = extract(root)
+        tables = extract(root, rfc_text)
     # The return value is the verdict. An earlier draft called emit() and
     # returned 0 regardless, so `--check` printed "is not what this script
     # produces" and exited successfully - a gate that says the right thing
@@ -317,7 +370,7 @@ def main(argv):
     return emit(tables, args.check)
 
 
-def extract(root):
+def extract(root, rfc_text):
     """Every table, extracted or computed, each checked where it can be."""
     tables = {}
 
@@ -407,11 +460,31 @@ def extract(root):
           "one")
     tables["window120"] = ("int16_t", window)
 
+    # --- the allocation table, checked against Table 57 ---------------
+    allocation = read_array(root, "celt/modes.c", "band_allocation")
+    if len(allocation) != 11 * 21:
+        raise SystemExit(
+            f"gen_opus_tables: band_allocation has {len(allocation)} "
+            "entries, not 231")
+    prose = table_57(rfc_text)
+    for band in range(21):
+        for quality in range(11):
+            want = prose[band][quality]
+            got = allocation[quality * 21 + band]
+            if want != got:
+                raise SystemExit(
+                    f"gen_opus_tables: allocation for band {band} at "
+                    f"quality {quality} is {got} in Appendix A and {want} "
+                    "in Table 57 of the prose. The two readings of the "
+                    "allocation table disagree; do not pick one.")
+    print("gen_opus_tables: all 231 allocation entries agree between "
+          "Appendix A and Table 57 of the prose")
+    tables["band_allocation"] = ("unsigned char", allocation)
+
     # --- extracted, with no second reading available -------------------
     # These have no formula and are not printed in the prose. The check
     # available is their shape, which is asserted rather than assumed.
     for relative, name, kind, expect in (
-            ("celt/modes.c", "band_allocation", "unsigned char", 11 * 21),
             ("celt/celt.c", "tf_select_table", "int8_t", 4 * 8),
             ("celt/celt.c", "trim_icdf", "unsigned char", 11),
             ("celt/celt.c", "spread_icdf", "unsigned char", 4),
