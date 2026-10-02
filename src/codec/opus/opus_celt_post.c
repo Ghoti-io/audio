@@ -56,9 +56,9 @@
  * @return Their product, in the second factor's scale.
  */
 static inline int32_t mult16_32_q15(int32_t twiddle, int32_t value) {
-  return gaud_celt_shl32(gaud_celt_mult16_16(twiddle, value >> 16), 1)
-      + (((int32_t)(int16_t)twiddle * (int32_t)(uint16_t)(uint32_t)value)
-          >> 15);
+  return gaud_celt_add32(
+      gaud_celt_shl32(gaud_celt_mult16_16(twiddle, value >> 16), 1),
+      ((int32_t)(int16_t)twiddle * (int32_t)(uint16_t)(uint32_t)value) >> 15);
 }
 
 /**
@@ -89,28 +89,42 @@ void gaud_celt_comb_filter(int32_t * out, const int32_t * in,
     // rather than the pitch jumping between frames.
     int16_t f = (int16_t)gaud_celt_mult16_16_q15(window[i], window[i]);
     int16_t inverse = (int16_t)(CELT_Q15ONE - f);
-    out[i] = in[i]
-        + mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old0), in[i - period_old])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old1),
-              in[i - period_old - 1])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old1),
-              in[i - period_old + 1])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old2),
-              in[i - period_old - 2])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old2),
-              in[i - period_old + 2])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(f, new0), in[i - period])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(f, new1), in[i - period - 1])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(f, new1), in[i - period + 1])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(f, new2), in[i - period - 2])
-        + mult16_32_q15(gaud_celt_mult16_16_q15(f, new2), in[i - period + 2]);
+    int32_t sum = in[i];
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old0),
+            in[i - period_old]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old1),
+            in[i - period_old - 1]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old1),
+            in[i - period_old + 1]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old2),
+            in[i - period_old - 2]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(inverse, old2),
+            in[i - period_old + 2]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(f, new0), in[i - period]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(f, new1), in[i - period - 1]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(f, new1), in[i - period + 1]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(f, new2), in[i - period - 2]));
+    sum = gaud_celt_add32(sum,
+        mult16_32_q15(gaud_celt_mult16_16_q15(f, new2), in[i - period + 2]));
+    out[i] = sum;
   }
   for (int i = (int)overlap; i < n; ++i) {
-    out[i] = in[i] + mult16_32_q15(new0, in[i - period])
-        + mult16_32_q15(new1, in[i - period - 1])
-        + mult16_32_q15(new1, in[i - period + 1])
-        + mult16_32_q15(new2, in[i - period - 2])
-        + mult16_32_q15(new2, in[i - period + 2]);
+    int32_t sum = in[i];
+    sum = gaud_celt_add32(sum, mult16_32_q15(new0, in[i - period]));
+    sum = gaud_celt_add32(sum, mult16_32_q15(new1, in[i - period - 1]));
+    sum = gaud_celt_add32(sum, mult16_32_q15(new1, in[i - period + 1]));
+    sum = gaud_celt_add32(sum, mult16_32_q15(new2, in[i - period - 2]));
+    sum = gaud_celt_add32(sum, mult16_32_q15(new2, in[i - period + 2]));
+    out[i] = sum;
   }
 }
 
@@ -128,9 +142,10 @@ void gaud_celt_deemphasis(const int32_t * const * in, int16_t * pcm, int n,
     int32_t state = memory[c];
     int count = 0;
     for (int j = 0; j < n; ++j) {
-      int32_t sum = source[j] + state;
+      int32_t sum = gaud_celt_add32(source[j], state);
       int32_t sample;
-      state = mult16_32_q15(kCoef0, sum) - mult16_32_q15(kCoef1, source[j]);
+      state = gaud_celt_sub32(
+          mult16_32_q15(kCoef0, sum), mult16_32_q15(kCoef1, source[j]));
       sample = gaud_celt_shl32(mult16_32_q15(kCoef3, sum), 2);
       // Back from the 12-bit headroom the synthesis carries, clamped
       // rather than wrapped: a loud frame that overflows should be

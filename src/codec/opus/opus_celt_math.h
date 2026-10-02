@@ -128,6 +128,36 @@ static inline int32_t gaud_celt_vshr32(int32_t value, int shift) {
 }
 
 /**
+ * @brief Add as 32 bits, wrapping.
+ *
+ * RFC 6716's `ADD32` is a plain `+` on `opus_int32`, and the transform
+ * does overflow it: a bitstream that decodes to an extreme energy
+ * drives the FFT's accumulators past 2^31, and the reference wraps
+ * there on every two's-complement machine. Signed overflow is
+ * undefined behaviour rather than merely implementation-defined, so
+ * these go through an unsigned type - which computes the same answer
+ * the reference computes, and lets the sanitizer gate stay on.
+ *
+ * @param a First addend.
+ * @param b Second addend.
+ * @return Their sum, wrapped to 32 bits.
+ */
+static inline int32_t gaud_celt_add32(int32_t a, int32_t b) {
+  return (int32_t)((uint32_t)a + (uint32_t)b);
+}
+
+/**
+ * @brief Subtract as 32 bits, wrapping.
+ *
+ * @param a The minuend.
+ * @param b The subtrahend.
+ * @return Their difference, wrapped to 32 bits.
+ */
+static inline int32_t gaud_celt_sub32(int32_t a, int32_t b) {
+  return (int32_t)((uint32_t)a - (uint32_t)b);
+}
+
+/**
  * @brief Multiply two 16-bit values into 32 bits.
  *
  * @param a First factor; only its low 16 bits are read.

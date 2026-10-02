@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -4108,6 +4109,143 @@ TEST(OpusPost, DeemphasisIsTheOnePoleItSaysItIs) {
   EXPECT_GT(clipped, 1000u);
   // Measured: 0.5007, which is the rounding of the final shift.
   EXPECT_LT(worst, 0.501);
+}
+
+
+// ---------------------------------------------------------------------------
+// One CELT frame end to end: section 4.3 in the order the bits arrive.
+
+TEST(OpusCeltFrame, EveryFrameMatchesTheReferenceDecoder) {
+  // The whole of CELT against the whole of RFC 6716's celt_decode_with_ec,
+  // over frames of every size and length, six in a row each so that the
+  // state carried between them is exercised: the energy envelope and its
+  // two frames of history, the transform's overlap, the post-filter's
+  // thousand samples of synthesis, and the de-emphasis pole.
+  //
+  // The digest folds the samples **and the range decoder's final state**.
+  // That second one is what RFC 6716 section 6 compares to decide whether
+  // a decoder is conformant, and it is exact: no tolerance, no averaging.
+  //
+  // The bytes are pseudo-random rather than encoded audio. A range decoder
+  // is defined on every input - a lossy stream's decoder has to be - so
+  // this is a legitimate differential, and it reaches the error paths that
+  // real packets do not. Real packets are checked separately, against the
+  // conformance vectors; notes/audio/opus.md has that result.
+  static const int kLength[10] = {2, 3, 5, 8, 13, 40, 120, 300, 700, 1275};
+  auto decoder = std::make_unique<CELT_Decoder>();
+  auto scratch = std::make_unique<CELT_Scratch>();
+  std::vector<int16_t> pcm(2 * 960);
+  std::vector<unsigned char> data(1500);
+  uint64_t digest = 1469598103934665603ull;
+  unsigned long frames = 0;
+  for (int channels = 1; channels <= 2; ++channels) {
+    for (unsigned lm = 0; lm <= 3; ++lm) {
+      int n = 120 << lm;
+      for (int li = 0; li < 10; ++li) {
+        int length = kLength[li];
+        for (int seq = 0; seq < 8; ++seq) {
+          unsigned state = (unsigned)(channels * 7919 + (int)lm * 104729
+              + length * 31 + seq * 37);
+          gaud_celt_decoder_init(decoder.get(), (uint32_t)channels, 1);
+          for (int frame = 0; frame < 6; ++frame) {
+            OPUS_Range range;
+            for (int i = 0; i < length; ++i) {
+              state = state * 1103515245u + 12345u;
+              data[(size_t)i] = (unsigned char)(state >> 16);
+            }
+            std::fill(pcm.begin(), pcm.end(), (int16_t)0);
+            gaud_opus_range_init(&range, data.data(), (size_t)length);
+            gaud_celt_decode_frame(decoder.get(), &range, (uint32_t)length,
+                (uint32_t)channels, lm, pcm.data(), scratch.get());
+            for (int i = 0; i < channels * n; ++i) {
+              digest = Fnv1a(digest, pcm[(size_t)i]);
+            }
+            digest = Fnv1a(digest, decoder->rng);
+            ++frames;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(frames, 3840u);
+  EXPECT_EQ(digest, 0x941FBB211A1FD30Aull);
+}
+
+TEST(OpusCeltFrame, AFreshDecoderIsNotAZeroedOne) {
+  // The two history envelopes start at the quietest value the format
+  // has, not at zero. A first frame has no history, and "silent before"
+  // is the reading that keeps anti-collapse from firing on it - zero
+  // would mean "as loud as the mean", which is the opposite.
+  auto decoder = std::make_unique<CELT_Decoder>();
+  std::memset(decoder.get(), 0xA5, sizeof(CELT_Decoder));
+  gaud_celt_decoder_init(decoder.get(), 2u, 1);
+  for (uint32_t i = 0; i < 2u * CELT_BANDS; ++i) {
+    EXPECT_EQ(decoder->old_log_e[i], -(28 << CELT_DB_SHIFT)) << i;
+    EXPECT_EQ(decoder->old_log_e2[i], -(28 << CELT_DB_SHIFT)) << i;
+    EXPECT_EQ(decoder->old_band_e[i], 0) << i;
+    EXPECT_EQ(decoder->background_log_e[i], 0) << i;
+  }
+  EXPECT_EQ(decoder->channels, 2u);
+  EXPECT_EQ(decoder->downsample, 1);
+  EXPECT_EQ(decoder->start, 0u);
+  EXPECT_EQ(decoder->end, CELT_BANDS);
+  EXPECT_EQ(decoder->rng, 0u);
+  for (uint32_t i = 0; i < CELT_DECODE_HISTORY + CELT_OVERLAP; ++i) {
+    ASSERT_EQ(decoder->decode_mem[0][i], 0) << i;
+    ASSERT_EQ(decoder->decode_mem[1][i], 0) << i;
+  }
+}
+
+TEST(OpusCeltFrame, AFrameSizeTheFormatDoesNotHaveIsRefused) {
+  // lm above 3 is not a frame size; the mode cannot be built for it and
+  // the frame has to be refused rather than decoded into whatever the
+  // tables hold past their end.
+  auto decoder = std::make_unique<CELT_Decoder>();
+  auto scratch = std::make_unique<CELT_Scratch>();
+  std::vector<int16_t> pcm(2 * 960);
+  std::vector<unsigned char> data(64, 0x5Au);
+  OPUS_Range range;
+  gaud_celt_decoder_init(decoder.get(), 1u, 1);
+  gaud_opus_range_init(&range, data.data(), data.size());
+  EXPECT_EQ(gaud_celt_decode_frame(decoder.get(), &range, 64u, 1u, 4u,
+                pcm.data(), scratch.get()),
+      GAUD_ERR_CORRUPT);
+  // And the four it does have are all accepted.
+  for (unsigned lm = 0; lm <= 3; ++lm) {
+    gaud_celt_decoder_init(decoder.get(), 1u, 1);
+    gaud_opus_range_init(&range, data.data(), data.size());
+    EXPECT_EQ(gaud_celt_decode_frame(decoder.get(), &range, 64u, 1u, lm,
+                  pcm.data(), scratch.get()),
+        GAUD_OK)
+        << "lm " << lm;
+  }
+}
+
+TEST(OpusCeltFrame, TheRangeStateMovesAndDependsOnTheBytes) {
+  // The conformance test is on this number, so it is worth one direct
+  // check that it is a function of the packet rather than, say, always
+  // the same - a decoder that read nothing would still fill in samples.
+  auto decoder = std::make_unique<CELT_Decoder>();
+  auto scratch = std::make_unique<CELT_Scratch>();
+  std::vector<int16_t> pcm(2 * 960);
+  std::vector<unsigned char> data(80);
+  std::set<uint32_t> states;
+  for (int seed = 0; seed < 64; ++seed) {
+    unsigned state = (unsigned)(seed * 104729 + 7);
+    OPUS_Range range;
+    for (size_t i = 0; i < data.size(); ++i) {
+      state = state * 1103515245u + 12345u;
+      data[i] = (unsigned char)(state >> 16);
+    }
+    gaud_celt_decoder_init(decoder.get(), 2u, 1);
+    gaud_opus_range_init(&range, data.data(), data.size());
+    ASSERT_EQ(gaud_celt_decode_frame(decoder.get(), &range, 80u, 2u, 3u,
+                  pcm.data(), scratch.get()),
+        GAUD_OK);
+    EXPECT_NE(decoder->rng, 0u) << seed;
+    states.insert(decoder->rng);
+  }
+  EXPECT_GT(states.size(), 50u);
 }
 
 

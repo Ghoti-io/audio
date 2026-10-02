@@ -74,10 +74,9 @@ typedef struct {
  * @return Their product, back in the first factor's scale.
  */
 static inline int32_t s_mul(int32_t value, int32_t twiddle) {
-  return gaud_celt_shl32(
-             gaud_celt_mult16_16(twiddle, value >> 16), 1)
-      + (((int32_t)(int16_t)twiddle * (int32_t)(uint16_t)(uint32_t)value)
-          >> 15);
+  return gaud_celt_add32(
+      gaud_celt_shl32(gaud_celt_mult16_16(twiddle, value >> 16), 1),
+      ((int32_t)(int16_t)twiddle * (int32_t)(uint16_t)(uint32_t)value) >> 15);
 }
 
 /**
@@ -92,8 +91,8 @@ static inline int32_t s_mul(int32_t value, int32_t twiddle) {
  */
 static inline void mul_conj(CELT_Complex * out, CELT_Complex a,
     int32_t twiddle_r, int32_t twiddle_i) {
-  int32_t real = s_mul(a.r, twiddle_r) + s_mul(a.i, twiddle_i);
-  int32_t imaginary = s_mul(a.i, twiddle_r) - s_mul(a.r, twiddle_i);
+  int32_t real = gaud_celt_add32(s_mul(a.r, twiddle_r), s_mul(a.i, twiddle_i));
+  int32_t imaginary = gaud_celt_sub32(s_mul(a.i, twiddle_r), s_mul(a.r, twiddle_i));
   out->r = real;
   out->i = imaginary;
 }
@@ -174,10 +173,10 @@ static void bfly2(CELT_Complex * out, size_t stride, int m, int n, int mm) {
       CELT_Complex t;
       mul_conj(&t, *second, TWIDDLE_R(twiddle), TWIDDLE_I(twiddle));
       twiddle += stride;
-      second->r = first->r - t.r;
-      second->i = first->i - t.i;
-      first->r += t.r;
-      first->i += t.i;
+      second->r = gaud_celt_sub32(first->r, t.r);
+      second->i = gaud_celt_sub32(first->i, t.i);
+      first->r = gaud_celt_add32(first->r, t.r);
+      first->i = gaud_celt_add32(first->i, t.i);
       ++second;
       ++first;
     }
@@ -211,25 +210,25 @@ static void bfly4(CELT_Complex * out, size_t stride, int m, int n, int mm) {
       mul_conj(&s0, f[m], TWIDDLE_R(t1), TWIDDLE_I(t1));
       mul_conj(&s1, f[m2], TWIDDLE_R(t2), TWIDDLE_I(t2));
       mul_conj(&s2, f[m3], TWIDDLE_R(t3), TWIDDLE_I(t3));
-      s5.r = f->r - s1.r;
-      s5.i = f->i - s1.i;
-      f->r += s1.r;
-      f->i += s1.i;
-      s3.r = s0.r + s2.r;
-      s3.i = s0.i + s2.i;
-      s4.r = s0.r - s2.r;
-      s4.i = s0.i - s2.i;
-      f[m2].r = f->r - s3.r;
-      f[m2].i = f->i - s3.i;
+      s5.r = gaud_celt_sub32(f->r, s1.r);
+      s5.i = gaud_celt_sub32(f->i, s1.i);
+      f->r = gaud_celt_add32(f->r, s1.r);
+      f->i = gaud_celt_add32(f->i, s1.i);
+      s3.r = gaud_celt_add32(s0.r, s2.r);
+      s3.i = gaud_celt_add32(s0.i, s2.i);
+      s4.r = gaud_celt_sub32(s0.r, s2.r);
+      s4.i = gaud_celt_sub32(s0.i, s2.i);
+      f[m2].r = gaud_celt_sub32(f->r, s3.r);
+      f[m2].i = gaud_celt_sub32(f->i, s3.i);
       t1 += stride;
       t2 += stride * 2u;
       t3 += stride * 3u;
-      f->r += s3.r;
-      f->i += s3.i;
-      f[m].r = s5.r - s4.i;
-      f[m].i = s5.i + s4.r;
-      f[m3].r = s5.r + s4.i;
-      f[m3].i = s5.i - s4.r;
+      f->r = gaud_celt_add32(f->r, s3.r);
+      f->i = gaud_celt_add32(f->i, s3.i);
+      f[m].r = gaud_celt_sub32(s5.r, s4.i);
+      f[m].i = gaud_celt_add32(s5.i, s4.r);
+      f[m3].r = gaud_celt_add32(s5.r, s4.i);
+      f[m3].i = gaud_celt_sub32(s5.i, s4.r);
       ++f;
     }
   }
@@ -260,22 +259,22 @@ static void bfly3(CELT_Complex * out, size_t stride, int m, int n, int mm) {
       CELT_Complex s3;
       mul_conj(&s1, f[m], TWIDDLE_R(t1), TWIDDLE_I(t1));
       mul_conj(&s2, f[m2], TWIDDLE_R(t2), TWIDDLE_I(t2));
-      s3.r = s1.r + s2.r;
-      s3.i = s1.i + s2.i;
-      s0.r = s1.r - s2.r;
-      s0.i = s1.i - s2.i;
+      s3.r = gaud_celt_add32(s1.r, s2.r);
+      s3.i = gaud_celt_add32(s1.i, s2.i);
+      s0.r = gaud_celt_sub32(s1.r, s2.r);
+      s0.i = gaud_celt_sub32(s1.i, s2.i);
       t1 += stride;
       t2 += stride * 2u;
-      f[m].r = f->r - (s3.r >> 1);
-      f[m].i = f->i - (s3.i >> 1);
+      f[m].r = gaud_celt_sub32(f->r, s3.r >> 1);
+      f[m].i = gaud_celt_sub32(f->i, s3.i >> 1);
       s0.r = s_mul(s0.r, -epi3_i);
       s0.i = s_mul(s0.i, -epi3_i);
-      f->r += s3.r;
-      f->i += s3.i;
-      f[m2].r = f[m].r + s0.i;
-      f[m2].i = f[m].i - s0.r;
-      f[m].r -= s0.i;
-      f[m].i += s0.r;
+      f->r = gaud_celt_add32(f->r, s3.r);
+      f->i = gaud_celt_add32(f->i, s3.i);
+      f[m2].r = gaud_celt_add32(f[m].r, s0.i);
+      f[m2].i = gaud_celt_sub32(f[m].i, s0.r);
+      f[m].r = gaud_celt_sub32(f[m].r, s0.i);
+      f[m].i = gaud_celt_add32(f[m].i, s0.r);
       ++f;
     }
   }
@@ -312,32 +311,36 @@ static void bfly5(CELT_Complex * out, size_t stride, int m, int n, int mm) {
           TWIDDLE_I(3u * (size_t)u * stride));
       mul_conj(&s[4], *f4, TWIDDLE_R(4u * (size_t)u * stride),
           TWIDDLE_I(4u * (size_t)u * stride));
-      s[7].r = s[1].r + s[4].r;
-      s[7].i = s[1].i + s[4].i;
-      s[10].r = s[1].r - s[4].r;
-      s[10].i = s[1].i - s[4].i;
-      s[8].r = s[2].r + s[3].r;
-      s[8].i = s[2].i + s[3].i;
-      s[9].r = s[2].r - s[3].r;
-      s[9].i = s[2].i - s[3].i;
-      f0->r += s[7].r + s[8].r;
-      f0->i += s[7].i + s[8].i;
-      s[5].r = s[0].r + s_mul(s[7].r, ya_r) + s_mul(s[8].r, yb_r);
-      s[5].i = s[0].i + s_mul(s[7].i, ya_r) + s_mul(s[8].i, yb_r);
-      s[6].r = -s_mul(s[10].i, ya_i) - s_mul(s[9].i, yb_i);
-      s[6].i = s_mul(s[10].r, ya_i) + s_mul(s[9].r, yb_i);
-      f1->r = s[5].r - s[6].r;
-      f1->i = s[5].i - s[6].i;
-      f4->r = s[5].r + s[6].r;
-      f4->i = s[5].i + s[6].i;
-      s[11].r = s[0].r + s_mul(s[7].r, yb_r) + s_mul(s[8].r, ya_r);
-      s[11].i = s[0].i + s_mul(s[7].i, yb_r) + s_mul(s[8].i, ya_r);
-      s[12].r = s_mul(s[10].i, yb_i) - s_mul(s[9].i, ya_i);
-      s[12].i = -s_mul(s[10].r, yb_i) + s_mul(s[9].r, ya_i);
-      f2->r = s[11].r + s[12].r;
-      f2->i = s[11].i + s[12].i;
-      f3->r = s[11].r - s[12].r;
-      f3->i = s[11].i - s[12].i;
+      s[7].r = gaud_celt_add32(s[1].r, s[4].r);
+      s[7].i = gaud_celt_add32(s[1].i, s[4].i);
+      s[10].r = gaud_celt_sub32(s[1].r, s[4].r);
+      s[10].i = gaud_celt_sub32(s[1].i, s[4].i);
+      s[8].r = gaud_celt_add32(s[2].r, s[3].r);
+      s[8].i = gaud_celt_add32(s[2].i, s[3].i);
+      s[9].r = gaud_celt_sub32(s[2].r, s[3].r);
+      s[9].i = gaud_celt_sub32(s[2].i, s[3].i);
+      f0->r = gaud_celt_add32(f0->r, gaud_celt_add32(s[7].r, s[8].r));
+      f0->i = gaud_celt_add32(f0->i, gaud_celt_add32(s[7].i, s[8].i));
+      s[5].r = gaud_celt_add32(gaud_celt_add32(s[0].r, s_mul(s[7].r, ya_r)),
+          s_mul(s[8].r, yb_r));
+      s[5].i = gaud_celt_add32(gaud_celt_add32(s[0].i, s_mul(s[7].i, ya_r)),
+          s_mul(s[8].i, yb_r));
+      s[6].r = gaud_celt_sub32(-s_mul(s[10].i, ya_i), s_mul(s[9].i, yb_i));
+      s[6].i = gaud_celt_add32(s_mul(s[10].r, ya_i), s_mul(s[9].r, yb_i));
+      f1->r = gaud_celt_sub32(s[5].r, s[6].r);
+      f1->i = gaud_celt_sub32(s[5].i, s[6].i);
+      f4->r = gaud_celt_add32(s[5].r, s[6].r);
+      f4->i = gaud_celt_add32(s[5].i, s[6].i);
+      s[11].r = gaud_celt_add32(gaud_celt_add32(s[0].r, s_mul(s[7].r, yb_r)),
+          s_mul(s[8].r, ya_r));
+      s[11].i = gaud_celt_add32(gaud_celt_add32(s[0].i, s_mul(s[7].i, yb_r)),
+          s_mul(s[8].i, ya_r));
+      s[12].r = gaud_celt_sub32(s_mul(s[10].i, yb_i), s_mul(s[9].i, ya_i));
+      s[12].i = gaud_celt_add32(-s_mul(s[10].r, yb_i), s_mul(s[9].r, ya_i));
+      f2->r = gaud_celt_add32(s[11].r, s[12].r);
+      f2->i = gaud_celt_add32(s[11].i, s[12].i);
+      f3->r = gaud_celt_sub32(s[11].r, s[12].r);
+      f3->i = gaud_celt_sub32(s[11].i, s[12].i);
       ++f0;
       ++f1;
       ++f2;
@@ -408,10 +411,10 @@ void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
     int32_t high = in[(size_t)(n2 - 1 - 2 * i) * stride];
     int32_t a = (int32_t)gaud_opus_mdct_twiddles960[(size_t)i << shift];
     int32_t b = (int32_t)gaud_opus_mdct_twiddles960[(size_t)(n4 - i) << shift];
-    int32_t yr = -s_mul(high, a) + s_mul(low, b);
-    int32_t yi = -s_mul(high, b) - s_mul(low, a);
-    rotated[i].r = yr - s_mul(yi, sine);
-    rotated[i].i = yi + s_mul(yr, sine);
+    int32_t yr = gaud_celt_add32(-s_mul(high, a), s_mul(low, b));
+    int32_t yi = gaud_celt_sub32(-s_mul(high, b), s_mul(low, a));
+    rotated[i].r = gaud_celt_sub32(yr, s_mul(yi, sine));
+    rotated[i].i = gaud_celt_add32(yi, s_mul(yr, sine));
   }
 
   inverse_fft(&state, rotated, scratch);
@@ -422,10 +425,10 @@ void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
     int32_t im = scratch[i].i;
     int32_t a = (int32_t)gaud_opus_mdct_twiddles960[(size_t)i << shift];
     int32_t b = (int32_t)gaud_opus_mdct_twiddles960[(size_t)(n4 - i) << shift];
-    int32_t yr = s_mul(re, a) - s_mul(im, b);
-    int32_t yi = s_mul(im, a) + s_mul(re, b);
-    scratch[i].r = yr - s_mul(yi, sine);
-    scratch[i].i = yi + s_mul(yr, sine);
+    int32_t yr = gaud_celt_sub32(s_mul(re, a), s_mul(im, b));
+    int32_t yi = gaud_celt_add32(s_mul(im, a), s_mul(re, b));
+    scratch[i].r = gaud_celt_sub32(yr, s_mul(yi, sine));
+    scratch[i].i = gaud_celt_add32(yi, s_mul(yr, sine));
   }
 
   // De-shuffle into the order the window expects. The reference walks
@@ -451,8 +454,10 @@ void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
     for (int32_t i = n4 - half_overlap; i < n4; ++i) {
       int32_t value = flat_get(rotated, n4 - 1 - i);
       int32_t at = i - (n4 - half_overlap);
-      base[n4 - half_overlap + at] += -s_mul(value, window[at]);
-      base[n2 - 1 - i] += s_mul(value, window[(int32_t)overlap - 1 - at]);
+      base[n4 - half_overlap + at] = gaud_celt_sub32(
+          base[n4 - half_overlap + at], s_mul(value, window[at]));
+      base[n2 - 1 - i] = gaud_celt_add32(
+          base[n2 - 1 - i], s_mul(value, window[(int32_t)overlap - 1 - at]));
     }
     for (int32_t i = 0; i < n4 - half_overlap; ++i) {
       base[n2 + i] = flat_get(rotated, n4 + i);

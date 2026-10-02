@@ -69,6 +69,7 @@
 #define GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_CELT_H
 
 #include "opus_range.h"
+#include <ghoti.io/audio/codec_sdk.h>
 #include "opus_tables.h"
 #include <ghoti.io/audio/macros.h>
 #include <stdbool.h>
@@ -755,13 +756,15 @@ void gaud_celt_comb_filter(int32_t * out, const int32_t * in,
  * `alpha_p = 0.8500061035`, which is 27853 in Q15. The state carries
  * between frames, so a decoder that drops it clicks at every boundary.
  *
- * **The accumulator is 32 bits and the input has to stay inside it.**
+ * **The accumulator is 32 bits and the margin is about four of them.**
  * The filter's running sum is clamped to 16 bits on the way out, at
  * `2^27` in the synthesis scale, but the sum itself is not - and a
- * one-pole at 0.85 has a gain of nearly seven at DC. Anything the
- * transform produces is far below that, and RFC 6716 accumulates in 32
- * bits too, but the margin is about four bits rather than unlimited.
- * A sweep that feeds this white noise above about `1.2e8` finds it.
+ * one-pole at 0.85 has a gain of nearly seven at DC. White noise above
+ * about `1.2e8` wraps it, as it wraps RFC 6716's. The wrap is written
+ * as wrapping rather than left as signed overflow, so the result is
+ * the reference's on every machine instead of being undefined; what
+ * comes out of it is still noise, and a bitstream that gets there was
+ * not produced by an encoder.
  *
  * @param in One pointer per channel into the synthesis buffer.
  * @param pcm Receives interleaved 16-bit samples.
@@ -772,6 +775,104 @@ void gaud_celt_comb_filter(int32_t * out, const int32_t * in,
  */
 void gaud_celt_deemphasis(const int32_t * const * in, int16_t * pcm, int n,
     uint32_t channels, int downsample, int32_t * memory);
+
+/** Samples of synthesis the post-filter may reach back into. */
+#define CELT_DECODE_HISTORY 2048
+
+/**
+ * @brief What one CELT stream remembers between frames.
+ *
+ * Most of a CELT decoder is this struct. The energy envelope and two
+ * frames of it behind, so that anti-collapse can tell how far a band
+ * has just risen; the transform's overlap; a couple of thousand
+ * samples of synthesis, because the post-filter reaches back up to
+ * 1,022 of them; the de-emphasis filter's one pole per channel; and
+ * the range decoder's final state, which is the number RFC 6716
+ * section 6 compares to decide whether a decoder is conformant.
+ *
+ * Zeroing it is not enough to initialise it - see
+ * ::gaud_celt_decoder_init.
+ */
+typedef struct {
+  uint32_t channels;    ///< How many the *stream* has; 1 or 2.
+  int downsample;       ///< Output one sample in this many.
+  uint32_t start;       ///< First band this stream codes.
+  uint32_t end;         ///< One past the last.
+  uint32_t rng;         ///< The range decoder's state after the last frame.
+  /** Synthesis history, then the transform's overlap, per channel. */
+  int32_t decode_mem[2][CELT_DECODE_HISTORY + CELT_OVERLAP];
+  int16_t old_band_e[2 * CELT_BANDS];       ///< Last frame's envelope.
+  int16_t old_log_e[2 * CELT_BANDS];        ///< And the frame before.
+  int16_t old_log_e2[2 * CELT_BANDS];       ///< And the one before that.
+  int16_t background_log_e[2 * CELT_BANDS]; ///< A slow floor estimate.
+  int postfilter_period;                    ///< This frame's pitch.
+  int postfilter_period_old;                ///< Last frame's.
+  int16_t postfilter_gain;                  ///< This frame's gain, Q15.
+  int16_t postfilter_gain_old;              ///< Last frame's.
+  unsigned postfilter_tapset;               ///< This frame's tap set.
+  unsigned postfilter_tapset_old;           ///< Last frame's.
+  int32_t preemph_memory[2];                ///< The de-emphasis pole.
+} CELT_Decoder;
+
+/**
+ * @brief Working space for one frame, which the caller owns.
+ *
+ * Kept out of ::CELT_Decoder because none of it survives a frame, and
+ * out of the stack because the largest piece is nearly eight kilobytes
+ * and this library does not put that there.
+ */
+typedef struct {
+  int16_t shape[2 * CELT_MAX_SIZE];     ///< The normalised spectrum.
+  int32_t spectrum[2 * CELT_MAX_SIZE];  ///< And denormalised.
+  int32_t synthesis[CELT_MAX_SIZE + CELT_OVERLAP]; ///< One channel's samples.
+  int16_t bands[2 * CELT_MAX_SIZE + 2 * CELT_MAX_BAND_BINS]; ///< For §4.3.4.
+  int32_t amplitude[2 * CELT_BANDS];    ///< Linear band energies.
+  int32_t pulses[CELT_BANDS];           ///< The allocation.
+  int32_t cap[CELT_BANDS];              ///< Its ceiling per band.
+  int32_t offsets[CELT_BANDS];          ///< The decoded boosts.
+  int fine[CELT_BANDS];                 ///< Fine energy bits per band.
+  int priority[CELT_BANDS];             ///< Which bands get a spare bit.
+  int tf_res[CELT_BANDS];               ///< Time-frequency flags.
+  unsigned char collapse[2 * CELT_BANDS]; ///< Which blocks got pulses.
+} CELT_Scratch;
+
+/**
+ * @brief Set up a decoder for a stream of @p channels channels.
+ *
+ * **Not the same as zeroing it.** The two history envelopes start at
+ * the quietest value the format has rather than at zero, because a
+ * first frame has no history and "silent before" is the reading that
+ * keeps anti-collapse from firing on it.
+ *
+ * @param decoder Receives the state.
+ * @param channels 1 or 2.
+ * @param downsample Output one sample in this many; 1 at 48 kHz.
+ */
+void gaud_celt_decoder_init(
+    CELT_Decoder * decoder, uint32_t channels, int downsample);
+
+/**
+ * @brief Decode one CELT frame, section 4.3 end to end.
+ *
+ * Reads every symbol the frame holds, in the one order they can be
+ * read in, and leaves @p decoder ready for the next frame - including
+ * ::CELT_Decoder::rng, which is what a conformance test compares.
+ *
+ * @param decoder The stream's state.
+ * @param range The range decoder, already pointed at the frame.
+ * @param bytes How long the frame is.
+ * @param stream_channels 1 or 2; may differ from the decoder's own,
+ *   because a stereo stream may send a mono frame and the other way.
+ * @param lm 0 for a 2.5 ms frame through 3 for 20 ms.
+ * @param pcm Receives interleaved samples, one frame's worth per
+ *   channel of ::CELT_Decoder::channels.
+ * @param scratch Working space; its contents need not be initialised.
+ * @return ::GAUD_OK, or ::GAUD_ERR_CORRUPT for a frame that overruns
+ *   its own length or names a frame size the format does not have.
+ */
+GAUD_Result gaud_celt_decode_frame(CELT_Decoder * decoder, OPUS_Range * range,
+    uint32_t bytes, uint32_t stream_channels, unsigned lm, int16_t * pcm,
+    CELT_Scratch * scratch);
 
 #ifdef __cplusplus
 }
