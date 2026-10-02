@@ -125,6 +125,38 @@ typedef struct {
   bool frames_known;                ///< Whether that could be established.
 } OPUS_File;
 
+/** The most frames one packet may carry: 48 of 2.5 ms is 120 ms. */
+#define OPUS_MAX_FRAMES 48u
+
+/** The most bytes one frame may be, so a gateway can repack a stream. */
+#define OPUS_MAX_FRAME_BYTES 1275u
+
+/** @brief One packet split into the frames it carries. */
+typedef struct {
+  OPUS_Toc toc;                            ///< What the first byte says.
+  const unsigned char * frame[OPUS_MAX_FRAMES]; ///< Into the packet.
+  uint32_t length[OPUS_MAX_FRAMES];        ///< Bytes of each.
+  uint32_t count;                          ///< How many are in use.
+  size_t payload_offset;                   ///< Where the first one starts.
+} OPUS_Packet;
+
+/**
+ * @brief Split one packet into its frames.
+ *
+ * Stricter than ::gaud_opus_parse_toc, which answers only how long the
+ * packet is; this enforces every one of section 3.2's numbered framing
+ * requirements and so refuses packets whose duration is still readable.
+ *
+ * @param data The packet.
+ * @param size Its length.
+ * @param self_delimited Whether the last frame states its own length,
+ *   which is how the multistream mapping packs all but its last stream.
+ * @param out Receives the frames; the pointers are into @p data.
+ * @return ::GAUD_OK, or ::GAUD_ERR_CORRUPT.
+ */
+GAUD_Result gaud_opus_parse_packet(const unsigned char * data, size_t size,
+    bool self_delimited, OPUS_Packet * out);
+
 /**
  * @brief Read an `OpusHead` out of @p data.
  *

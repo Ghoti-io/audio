@@ -521,6 +521,315 @@ TEST(OpusProbe, OggIsFiveFormatsAndTheProbeDecidesWhich) {
   }
 }
 
+/* ------------------------------------------- RFC 6716 section 3.2:
+                                                   splitting a packet */
+
+/**
+ * The frame packing, and the seven numbered requirements it carries.
+ *
+ * Every packet below is built by hand. The conformance vectors exercise
+ * this code twenty thousand times and never once exercise a *refusal* -
+ * they are all valid - so the cases that must be rejected exist only
+ * here. Several of them describe packets whose frames would decode
+ * perfectly well; they are invalid anyway, because the point of the
+ * rules is that a gateway repacking a stream can rely on them.
+ *
+ * The configurations used are 31 (CELT fullband, 20 ms, so 960 samples
+ * a frame) and 16 (CELT narrowband, 2.5 ms, 120 samples), chosen
+ * because the 120 ms ceiling falls in a different place for each.
+ */
+
+namespace {
+
+/** A packet's first byte, section 3.1. */
+unsigned char Toc(unsigned config, bool stereo, unsigned code) {
+  return (unsigned char)((config << 3) | (stereo ? 4u : 0u) | code);
+}
+
+/** Parse, and say only whether it was accepted. */
+bool Accepts(const std::vector<unsigned char> & packet) {
+  OPUS_Packet parsed;
+  return gaud_opus_parse_packet(packet.data(), packet.size(), false, &parsed)
+      == GAUD_OK;
+}
+
+} // namespace
+
+TEST(OpusPacket, CodeZeroIsOneFrameOfWhatIsLeft) {
+  std::vector<unsigned char> packet(41u, 0xA5u);
+  packet[0] = Toc(31u, false, 0u);
+  OPUS_Packet parsed;
+  ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 1u);
+  EXPECT_EQ(parsed.length[0], 40u);
+  EXPECT_EQ(parsed.frame[0], packet.data() + 1);
+}
+
+/** [R3]: the payload of a code 1 packet must divide in two. */
+TEST(OpusPacket, CodeOneSplitsEvenlyAndRefusesOdd) {
+  std::vector<unsigned char> even(41u, 0xA5u);
+  even[0] = Toc(31u, false, 1u);
+  OPUS_Packet parsed;
+  ASSERT_EQ(
+      gaud_opus_parse_packet(even.data(), even.size(), false, &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 2u);
+  EXPECT_EQ(parsed.length[0], 20u);
+  EXPECT_EQ(parsed.length[1], 20u);
+  EXPECT_EQ(parsed.frame[1], parsed.frame[0] + 20);
+
+  std::vector<unsigned char> odd(42u, 0xA5u);
+  odd[0] = Toc(31u, false, 1u);
+  EXPECT_FALSE(Accepts(odd));
+}
+
+/** Section 3.2.1: one length byte below 252, two at or above it. */
+TEST(OpusPacket, CodeTwoReadsOneAndTwoByteLengths) {
+  {
+    std::vector<unsigned char> packet(41u, 0xA5u);
+    packet[0] = Toc(31u, false, 2u);
+    packet[1] = 10u;
+    OPUS_Packet parsed;
+    ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                  &parsed),
+        GAUD_OK);
+    EXPECT_EQ(parsed.count, 2u);
+    EXPECT_EQ(parsed.length[0], 10u);
+    EXPECT_EQ(parsed.length[1], 29u);
+    EXPECT_EQ(parsed.frame[0], packet.data() + 2);
+  }
+  {
+    /* 252 + 4*1 = 256, which needs the second byte to be read at all. */
+    std::vector<unsigned char> packet(3u + 256u + 5u, 0xA5u);
+    packet[0] = Toc(31u, false, 2u);
+    packet[1] = 252u;
+    packet[2] = 1u;
+    OPUS_Packet parsed;
+    ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                  &parsed),
+        GAUD_OK);
+    EXPECT_EQ(parsed.length[0], 256u);
+    EXPECT_EQ(parsed.length[1], 5u);
+  }
+}
+
+/**
+ * [R4], and the three two-byte code 2 packets.
+ *
+ * The specification singles these out: a one-byte code 2 packet is
+ * always invalid, a two-byte one whose second byte is 252 or above is
+ * invalid because the length is unfinished, and a two-byte one whose
+ * second byte is 1 to 251 is invalid because that many bytes are not
+ * there. The *only* valid two-byte code 2 packet states a length of
+ * zero, making both frames empty.
+ */
+TEST(OpusPacket, CodeTwoAcceptsOnlyTheEmptyTwoBytePacket) {
+  std::vector<unsigned char> one{Toc(31u, false, 2u)};
+  EXPECT_FALSE(Accepts(one));
+
+  std::vector<unsigned char> unfinished{Toc(31u, false, 2u), 253u};
+  EXPECT_FALSE(Accepts(unfinished));
+
+  std::vector<unsigned char> overlong{Toc(31u, false, 2u), 1u};
+  EXPECT_FALSE(Accepts(overlong));
+
+  std::vector<unsigned char> empty{Toc(31u, false, 2u), 0u};
+  OPUS_Packet parsed;
+  ASSERT_EQ(
+      gaud_opus_parse_packet(empty.data(), empty.size(), false, &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 2u);
+  EXPECT_EQ(parsed.length[0], 0u);
+  EXPECT_EQ(parsed.length[1], 0u);
+}
+
+/** [R6]: constant rate code 3 divides what is left by the count. */
+TEST(OpusPacket, CodeThreeConstantRateDividesTheRemainder) {
+  std::vector<unsigned char> packet(2u + 30u, 0xA5u);
+  packet[0] = Toc(31u, false, 3u);
+  packet[1] = 3u; /* VBR clear, padding clear, three frames. */
+  OPUS_Packet parsed;
+  ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 3u);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(parsed.length[i], 10u) << i;
+  }
+
+  std::vector<unsigned char> ragged(2u + 31u, 0xA5u);
+  ragged[0] = Toc(31u, false, 3u);
+  ragged[1] = 3u;
+  EXPECT_FALSE(Accepts(ragged));
+}
+
+/** [R7]: variable rate states every length but the last. */
+TEST(OpusPacket, CodeThreeVariableRateStatesAllButTheLast) {
+  std::vector<unsigned char> packet;
+  packet.push_back(Toc(31u, false, 3u));
+  packet.push_back((unsigned char)(0x80u | 3u)); /* VBR, three frames. */
+  packet.push_back(5u);
+  packet.push_back(7u);
+  packet.resize(packet.size() + 5u + 7u + 9u, 0xA5u);
+  OPUS_Packet parsed;
+  ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 3u);
+  EXPECT_EQ(parsed.length[0], 5u);
+  EXPECT_EQ(parsed.length[1], 7u);
+  EXPECT_EQ(parsed.length[2], 9u);
+  EXPECT_EQ(parsed.frame[1], parsed.frame[0] + 5);
+  EXPECT_EQ(parsed.frame[2], parsed.frame[1] + 7);
+
+  /* A stated length that does not fit in what remains. */
+  std::vector<unsigned char> overrun;
+  overrun.push_back(Toc(31u, false, 3u));
+  overrun.push_back((unsigned char)(0x80u | 2u));
+  overrun.push_back(200u);
+  overrun.resize(overrun.size() + 10u, 0xA5u);
+  EXPECT_FALSE(Accepts(overrun));
+}
+
+/**
+ * Section 3.2.5's padding, including the chain that 255 starts.
+ *
+ * A padding byte of 255 means 254 bytes *and another length byte*, so
+ * the two packets below carry the same four bytes of audio with
+ * different amounts of padding described two different ways. Reading
+ * 255 as "255 bytes and stop" would leave the frame one byte long and
+ * is the obvious way to get this wrong.
+ */
+TEST(OpusPacket, CodeThreePaddingIsSubtractedAndChains) {
+  {
+    std::vector<unsigned char> packet;
+    packet.push_back(Toc(31u, false, 3u));
+    packet.push_back((unsigned char)(0x40u | 1u)); /* padded, one frame. */
+    packet.push_back(3u);                          /* three bytes of it. */
+    packet.resize(packet.size() + 4u, 0xA5u);      /* the frame. */
+    packet.resize(packet.size() + 3u, 0u);         /* the padding. */
+    OPUS_Packet parsed;
+    ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                  &parsed),
+        GAUD_OK);
+    EXPECT_EQ(parsed.count, 1u);
+    EXPECT_EQ(parsed.length[0], 4u);
+  }
+  {
+    std::vector<unsigned char> packet;
+    packet.push_back(Toc(31u, false, 3u));
+    packet.push_back((unsigned char)(0x40u | 1u));
+    packet.push_back(255u); /* 254 bytes, and another length byte. */
+    packet.push_back(2u);   /* two more. */
+    packet.resize(packet.size() + 4u, 0xA5u);
+    packet.resize(packet.size() + 256u, 0u);
+    OPUS_Packet parsed;
+    ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                  &parsed),
+        GAUD_OK);
+    EXPECT_EQ(parsed.count, 1u);
+    EXPECT_EQ(parsed.length[0], 4u);
+  }
+  {
+    /* [R6]: padding that claims more than the packet holds. */
+    std::vector<unsigned char> packet;
+    packet.push_back(Toc(31u, false, 3u));
+    packet.push_back((unsigned char)(0x40u | 1u));
+    packet.push_back(200u);
+    packet.resize(packet.size() + 10u, 0u);
+    EXPECT_FALSE(Accepts(packet));
+  }
+}
+
+/** [R5]: no frames at all, and more than 120 ms of them. */
+TEST(OpusPacket, CodeThreeBoundsTheFrameCount) {
+  std::vector<unsigned char> none(10u, 0xA5u);
+  none[0] = Toc(31u, false, 3u);
+  none[1] = 0u;
+  EXPECT_FALSE(Accepts(none));
+
+  /* Config 31 is 20 ms, so six frames are 120 ms and seven are too many. */
+  std::vector<unsigned char> six(2u + 12u, 0xA5u);
+  six[0] = Toc(31u, false, 3u);
+  six[1] = 6u;
+  EXPECT_TRUE(Accepts(six));
+
+  std::vector<unsigned char> seven(2u + 14u, 0xA5u);
+  seven[0] = Toc(31u, false, 3u);
+  seven[1] = 7u;
+  EXPECT_FALSE(Accepts(seven));
+
+  /* Config 16 is 2.5 ms, where the same ceiling falls at 48. */
+  std::vector<unsigned char> forty_eight(2u + 48u, 0xA5u);
+  forty_eight[0] = Toc(16u, false, 3u);
+  forty_eight[1] = 48u;
+  EXPECT_TRUE(Accepts(forty_eight));
+
+  std::vector<unsigned char> forty_nine(2u + 49u, 0xA5u);
+  forty_nine[0] = Toc(16u, false, 3u);
+  forty_nine[1] = 49u;
+  EXPECT_FALSE(Accepts(forty_nine));
+}
+
+/**
+ * [R2]: no frame may exceed 1,275 bytes.
+ *
+ * The bound applies to the frame whose length is inferred rather than
+ * stated, because a stated length cannot encode a larger number: the
+ * two-byte form tops out at 255*4+255, which is 1,275 exactly.
+ */
+TEST(OpusPacket, NoFrameMayExceedTheRepacketizationBound) {
+  std::vector<unsigned char> largest(1u + 1275u, 0xA5u);
+  largest[0] = Toc(31u, false, 0u);
+  EXPECT_TRUE(Accepts(largest));
+
+  std::vector<unsigned char> toobig(1u + 1276u, 0xA5u);
+  toobig[0] = Toc(31u, false, 0u);
+  EXPECT_FALSE(Accepts(toobig));
+}
+
+/** An empty buffer is not a packet. */
+TEST(OpusPacket, EmptyIsRefused) {
+  OPUS_Packet parsed;
+  unsigned char nothing = 0;
+  EXPECT_EQ(gaud_opus_parse_packet(&nothing, 0u, false, &parsed),
+      GAUD_ERR_CORRUPT);
+}
+
+/**
+ * Appendix B's self-delimiting framing, where the last frame's length is
+ * written down too.
+ *
+ * The same bytes mean different things under the two framings, which is
+ * the whole point: in a multistream packet every stream but the last is
+ * followed by another stream rather than by the end of the buffer.
+ */
+TEST(OpusPacket, SelfDelimitedStatesTheLastLength) {
+  std::vector<unsigned char> packet;
+  packet.push_back(Toc(31u, false, 0u));
+  packet.push_back(6u); /* The length of the one frame. */
+  packet.resize(packet.size() + 6u, 0xA5u);
+  packet.resize(packet.size() + 20u, 0x5Au); /* The next stream's. */
+
+  OPUS_Packet parsed;
+  ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), true,
+                &parsed),
+      GAUD_OK);
+  EXPECT_EQ(parsed.count, 1u);
+  EXPECT_EQ(parsed.length[0], 6u);
+  EXPECT_EQ(parsed.frame[0], packet.data() + 2);
+
+  /* Read the same bytes the ordinary way and the frame swallows the
+   * stream that follows it. */
+  OPUS_Packet plain;
+  ASSERT_EQ(gaud_opus_parse_packet(packet.data(), packet.size(), false,
+                &plain),
+      GAUD_OK);
+  EXPECT_EQ(plain.length[0], 27u);
+}
+
 /* ------------------------------------------ RFC 6716 section 4.1:
                                                  the range decoder */
 
