@@ -42,6 +42,7 @@
 #include "../../src/codec/opus/opus_celt.h"
 #include "../../src/codec/opus/opus_celt_math.h"
 #include "../../src/codec/opus/opus_tables.h"
+#include "../../src/codec/opus/opus_silk_tables.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
@@ -756,6 +757,387 @@ TEST(OpusTables, PredictionCoefficientsAreQ15AndFall) {
  * a frame) and 16 (CELT narrowband, 2.5 ms, 120 samples), chosen
  * because the 120 ms ceiling falls in a different place for each.
  */
+
+// --- the SILK tables ------------------------------------------------
+//
+// Section 4.2 prints its own tables, which section 4.3 does not, so
+// `make check-opus-tables` reads each of them twice - once from the
+// prose and once from Appendix A - and refuses to generate anything
+// unless the two agree. That gate needs the network. What follows is
+// the offline half: a few of the prose's tables transcribed by hand,
+// and the structural properties every one of them has to have for the
+// range decoder to be able to read a packet at all.
+
+namespace {
+
+/** RFC 6716's probabilities, in the reference's inverse cumulative form. */
+std::vector<unsigned char> Icdf(const std::vector<int> & pdf) {
+  std::vector<unsigned char> out;
+  int cumulative = 0;
+  size_t lead = 0;
+  while (lead < pdf.size() && pdf[lead] == 0) {
+    ++lead;
+  }
+  for (size_t i = 0; i < pdf.size(); ++i) {
+    cumulative += pdf[i];
+    if (i < lead) {
+      continue;
+    }
+    out.push_back((unsigned char)(256 - cumulative));
+    if (cumulative == 256) {
+      break;
+    }
+  }
+  return out;
+}
+
+} // namespace
+
+/**
+ * Five of section 4.2's tables, typed in from the document.
+ *
+ * The generator checks all ninety-one this way and this checks five,
+ * which is the point: the five are here so that a `make test` with no
+ * network still fails if the committed tables stop being the RFC's.
+ * They are chosen to cover the three shapes the conversion has - a
+ * distribution with impossible symbols at the front (Table 4), one
+ * that reaches zero before its last symbol would (Table 9), and the
+ * plain kind.
+ */
+TEST(OpusSilkTables, TheProseTablesTypedInHereStillMatch) {
+  const std::vector<int> lbrr40 = {0, 53, 53, 150};
+  const std::vector<int> lbrr60 = {0, 41, 20, 29, 41, 15, 28, 82};
+  const std::vector<int> inactive = {26, 230, 0, 0, 0, 0};
+  const std::vector<int> active = {0, 0, 24, 74, 148, 10};
+  const std::vector<int> interpolation = {13, 22, 29, 11, 181};
+
+  auto same = [](const std::vector<unsigned char> & mine,
+                  const unsigned char * theirs, size_t count,
+                  const char * what) {
+    ASSERT_EQ(mine.size(), count) << what;
+    for (size_t i = 0; i < count; ++i) {
+      EXPECT_EQ(mine[i], theirs[i]) << what << " at " << i;
+    }
+  };
+  same(Icdf(lbrr40), gaud_opus_silk_lbrr_flags_2_icdf, 3, "Table 4, 40 ms");
+  same(Icdf(lbrr60), gaud_opus_silk_lbrr_flags_3_icdf, 7, "Table 4, 60 ms");
+  same(Icdf(inactive), gaud_opus_silk_type_offset_no_vad_icdf, 2, "Table 9");
+  same(Icdf(active), gaud_opus_silk_type_offset_vad_icdf, 4, "Table 9");
+  same(Icdf(interpolation), gaud_opus_silk_nlsf_interpolation_factor_icdf, 5,
+      "Table 26");
+
+  // Table 7, the sixteen stereo prediction weights.
+  const int16_t weights[16] = {-13732, -10050, -8266, -7526, -6500, -5000,
+      -2950, -820, 820, 2950, 5000, 6500, 7526, 8266, 10050, 13732};
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(gaud_opus_silk_stereo_pred_quant_q13[i], weights[i])
+        << "Table 7 at " << i;
+  }
+  // Section 4.2.7.6.3's three scale factors, which the prose gives in a
+  // sentence rather than a table.
+  EXPECT_EQ(gaud_opus_silk_ltp_scales_q14[0], 15565);
+  EXPECT_EQ(gaud_opus_silk_ltp_scales_q14[1], 12288);
+  EXPECT_EQ(gaud_opus_silk_ltp_scales_q14[2], 8192);
+  // Table 53, which prints its offsets four times smaller than the
+  // reference holds them.
+  EXPECT_EQ(gaud_opus_silk_quantization_offsets_q10[0], 4 * 25);
+  EXPECT_EQ(gaud_opus_silk_quantization_offsets_q10[1], 4 * 60);
+  EXPECT_EQ(gaud_opus_silk_quantization_offsets_q10[2], 4 * 8);
+  EXPECT_EQ(gaud_opus_silk_quantization_offsets_q10[3], 4 * 25);
+}
+
+/**
+ * Every SILK distribution is strictly decreasing and ends at zero.
+ *
+ * A repeated entry is a symbol the encoder can write and the decoder
+ * cannot distinguish, and a table that never reaches zero leaves part
+ * of the range unassigned. Neither looks like a wrong number when it
+ * happens - the decoder simply desynchronises some way further on - so
+ * it is worth asserting over all forty of them rather than trusting the
+ * extraction.
+ */
+TEST(OpusSilkTables, EverySilkIcdfIsDecreasingAndZeroTerminated) {
+  struct Table {
+    const char * name;
+    const unsigned char * values;
+    size_t stride;
+    size_t rows;
+  };
+  const Table tables[] = {
+      {"lbrr_flags_2", gaud_opus_silk_lbrr_flags_2_icdf, 3, 1},
+      {"lbrr_flags_3", gaud_opus_silk_lbrr_flags_3_icdf, 7, 1},
+      {"stereo_pred_joint", gaud_opus_silk_stereo_pred_joint_icdf, 25, 1},
+      {"stereo_only_code_mid", gaud_opus_silk_stereo_only_code_mid_icdf, 2, 1},
+      {"uniform3", gaud_opus_silk_uniform3_icdf, 3, 1},
+      {"uniform4", gaud_opus_silk_uniform4_icdf, 4, 1},
+      {"uniform5", gaud_opus_silk_uniform5_icdf, 5, 1},
+      {"uniform6", gaud_opus_silk_uniform6_icdf, 6, 1},
+      {"uniform8", gaud_opus_silk_uniform8_icdf, 8, 1},
+      {"type_offset_no_vad", gaud_opus_silk_type_offset_no_vad_icdf, 2, 1},
+      {"type_offset_vad", gaud_opus_silk_type_offset_vad_icdf, 4, 1},
+      {"gain", gaud_opus_silk_gain_icdf, 8, 3},
+      {"delta_gain", gaud_opus_silk_delta_gain_icdf, 41, 1},
+      {"nlsf_cb1_nb_mb", gaud_opus_silk_nlsf_cb1_icdf_nb_mb, 32, 2},
+      {"nlsf_cb1_wb", gaud_opus_silk_nlsf_cb1_icdf_wb, 32, 2},
+      {"nlsf_cb2_nb_mb", gaud_opus_silk_nlsf_cb2_icdf_nb_mb, 9, 8},
+      {"nlsf_cb2_wb", gaud_opus_silk_nlsf_cb2_icdf_wb, 9, 8},
+      {"nlsf_ext", gaud_opus_silk_nlsf_ext_icdf, 7, 1},
+      {"nlsf_interpolation", gaud_opus_silk_nlsf_interpolation_factor_icdf,
+          5, 1},
+      {"pitch_lag", gaud_opus_silk_pitch_lag_icdf, 32, 1},
+      {"pitch_delta", gaud_opus_silk_pitch_delta_icdf, 21, 1},
+      {"pitch_contour_10_ms_nb", gaud_opus_silk_pitch_contour_10_ms_nb_icdf,
+          3, 1},
+      {"pitch_contour_nb", gaud_opus_silk_pitch_contour_nb_icdf, 11, 1},
+      {"pitch_contour_10_ms", gaud_opus_silk_pitch_contour_10_ms_icdf, 12, 1},
+      {"pitch_contour", gaud_opus_silk_pitch_contour_icdf, 34, 1},
+      {"ltp_per_index", gaud_opus_silk_ltp_per_index_icdf, 3, 1},
+      {"ltp_gain_0", gaud_opus_silk_ltp_gain_icdf_0, 8, 1},
+      {"ltp_gain_1", gaud_opus_silk_ltp_gain_icdf_1, 16, 1},
+      {"ltp_gain_2", gaud_opus_silk_ltp_gain_icdf_2, 32, 1},
+      {"ltpscale", gaud_opus_silk_ltpscale_icdf, 3, 1},
+      {"rate_levels", gaud_opus_silk_rate_levels_icdf, 9, 2},
+      {"pulses_per_block", gaud_opus_silk_pulses_per_block_icdf, 18, 10},
+      {"lsb", gaud_opus_silk_lsb_icdf, 2, 1},
+  };
+  size_t counted = 0;
+  for (const Table & one : tables) {
+    for (size_t row = 0; row < one.rows; ++row) {
+      const unsigned char * values = one.values + row * one.stride;
+      EXPECT_EQ(values[one.stride - 1], 0u) << one.name << " row " << row;
+      for (size_t i = 1; i < one.stride; ++i) {
+        EXPECT_LT(values[i], values[i - 1])
+            << one.name << " row " << row << " at " << i;
+      }
+      ++counted;
+    }
+  }
+  EXPECT_EQ(counted, 61u);
+}
+
+/**
+ * The four shell-code tables are one distribution per pulse count.
+ *
+ * Splitting p pulses between two halves has p+1 outcomes, so the
+ * offsets have to step by p+1 and the whole thing has to come to 152
+ * bytes. The offsets are shared by all four tables, which is why
+ * getting one wrong would misread three of them silently.
+ */
+TEST(OpusSilkTables, ShellCodeOffsetsPartitionAllFourTables) {
+  const unsigned char * offsets = gaud_opus_silk_shell_code_table_offsets;
+  EXPECT_EQ(offsets[0], 0u);
+  EXPECT_EQ(offsets[1], 0u);
+  for (int pulses = 1; pulses <= 15; ++pulses) {
+    EXPECT_EQ((int)offsets[pulses + 1] - (int)offsets[pulses], pulses + 1)
+        << "at " << pulses;
+  }
+  EXPECT_EQ((int)offsets[16] + 17, 152);
+  const unsigned char * const tables[4] = {
+      gaud_opus_silk_shell_code_table0, gaud_opus_silk_shell_code_table1,
+      gaud_opus_silk_shell_code_table2, gaud_opus_silk_shell_code_table3};
+  for (int which = 0; which < 4; ++which) {
+    for (int pulses = 1; pulses <= 16; ++pulses) {
+      const unsigned char * row = tables[which] + offsets[pulses];
+      EXPECT_EQ(row[pulses], 0u) << "table " << which << " at " << pulses;
+      for (int i = 1; i <= pulses; ++i) {
+        EXPECT_LT(row[i], row[i - 1])
+            << "table " << which << " at " << pulses << ", " << i;
+      }
+    }
+  }
+}
+
+/**
+ * Rate level 10 is rate level 9 shifted, which is what caps the LSBs.
+ *
+ * Section 4.2.7.8.2 says the eleventh pulse-count distribution "is just
+ * a shifted version of that for 9 and thus does not require any
+ * additional storage", and the decoder reads it as a pointer one past
+ * the start of row 9. The consequence is the part that matters: the
+ * probability of reading another 17 is then zero, so a block cannot
+ * carry more than ten extra LSBs however the bitstream is built.
+ */
+TEST(OpusSilkTables, RateLevelTenIsRateLevelNineShiftedAndCannotEscape) {
+  const unsigned char * nine = gaud_opus_silk_pulses_per_block_icdf + 9 * 18;
+  const unsigned char * ten = nine + 1;
+  EXPECT_EQ(ten[16], 0u);
+  for (int i = 0; i < 17; ++i) {
+    EXPECT_EQ(ten[i], nine[i + 1]) << "at " << i;
+  }
+  // Symbol 17 is the escape. Its probability under rate level 10 is the
+  // gap between entries 16 and 17 of the shifted row, and entry 16 is
+  // already zero.
+  EXPECT_EQ(nine[17], 0u);
+}
+
+/**
+ * The cosine table is antisymmetric, falling, and entirely even.
+ *
+ * The last of those is not decoration. Appendix A holds this table at
+ * twice the scale the prose prints it at - the name
+ * `silk_LSFCosTab_FIX_Q12` says Q12 and the array is Q13 - and the two
+ * interpolation formulas differ by one shift to match. They give the
+ * same answer at every input only because every entry is even, so the
+ * halving the prose's version implies loses nothing. The 32,768
+ * comparisons below are the whole claim, not a sample of it.
+ */
+TEST(OpusSilkTables, TheCosineTableAgreesWithTheProsesHalfOfIt) {
+  const int16_t * q13 = gaud_opus_silk_lsf_cos_q13;
+  EXPECT_EQ(q13[0], 8192);
+  EXPECT_EQ(q13[128], -8192);
+  for (int i = 0; i <= 128; ++i) {
+    EXPECT_EQ(q13[i] % 2, 0) << "at " << i;
+    EXPECT_EQ(q13[128 - i], -q13[i]) << "at " << i;
+    if (i < 128) {
+      EXPECT_GT(q13[i], q13[i + 1]) << "at " << i;
+    }
+  }
+  int differed = 0;
+  for (int i = 0; i < 128; ++i) {
+    int low = q13[i] / 2;
+    int high = q13[i + 1] / 2;
+    for (int fraction = 0; fraction < 256; ++fraction) {
+      int prose = (low * 256 + (high - low) * fraction + 4) >> 3;
+      int appendix =
+          ((q13[i] << 8) + (q13[i + 1] - q13[i]) * fraction + 8) >> 4;
+      if (prose != appendix) {
+        ++differed;
+      }
+    }
+  }
+  EXPECT_EQ(differed, 0);
+}
+
+/**
+ * Every stage-1 LSF codebook vector is already a stable filter.
+ *
+ * The decoder runs a stabilisation pass (section 4.2.7.5.4) over the
+ * reconstructed LSFs because the stage-2 residual can push two of them
+ * together. These 64 vectors need none of it: measured over all of
+ * them, every coefficient is above the previous one by at least the
+ * minimum spacing Table 25 gives, and the last clears 1.0 by the same
+ * margin. So anything the stabiliser ever has to fix was put there by
+ * the residual, never by the codebook.
+ */
+TEST(OpusSilkTables, EveryStageOneVectorAlreadyClearsTheMinimumSpacing) {
+  struct Book {
+    const char * name;
+    const unsigned char * vectors;
+    const int16_t * spacing;
+    int order;
+  };
+  const Book books[] = {
+      {"NB/MB", gaud_opus_silk_nlsf_cb1_nb_mb_q8,
+          gaud_opus_silk_nlsf_delta_min_nb_mb_q15, 10},
+      {"WB", gaud_opus_silk_nlsf_cb1_wb_q8,
+          gaud_opus_silk_nlsf_delta_min_wb_q15, 16},
+  };
+  for (const Book & book : books) {
+    for (int entry = 0; entry < 32; ++entry) {
+      int previous = 0;
+      for (int k = 0; k < book.order; ++k) {
+        // The codebook is Q8 and the spacing is Q15.
+        int value = (int)book.vectors[entry * book.order + k] << 7;
+        EXPECT_GE(value - previous, book.spacing[k])
+            << book.name << " entry " << entry << " coefficient " << k;
+        previous = value;
+      }
+      EXPECT_GE((1 << 15) - previous, book.spacing[book.order])
+          << book.name << " entry " << entry << " at the top";
+    }
+  }
+}
+
+/**
+ * No select byte asks for a weight the prediction list does not hold.
+ *
+ * `silk_NLSF_unpack` reads `pred_Q8[i + sel*(order-1) + 1]` for the odd
+ * coefficient of each pair, and the list is exactly `2*(order-1)` long,
+ * so a set selector bit on the last coefficient reads one past the end.
+ * The prose prints one fewer column than there are coefficients for
+ * exactly that reason; this is the same statement made about the packed
+ * bytes.
+ */
+TEST(OpusSilkTables, NoSelectByteSetsTheWeightBitOnALastCoefficient) {
+  struct Book {
+    const char * name;
+    const unsigned char * select;
+    int order;
+  };
+  const Book books[] = {
+      {"NB/MB", gaud_opus_silk_nlsf_cb2_select_nb_mb, 10},
+      {"WB", gaud_opus_silk_nlsf_cb2_select_wb, 16},
+  };
+  for (const Book & book : books) {
+    int pairs = book.order / 2;
+    for (int entry = 0; entry < 32; ++entry) {
+      unsigned char last = book.select[entry * pairs + pairs - 1];
+      EXPECT_EQ(last & 0x10u, 0u) << book.name << " entry " << entry;
+    }
+  }
+}
+
+/**
+ * The pitch contour codebooks have one entry per index the PDF can code.
+ *
+ * The reference stores these transposed - subframe outermost - so a
+ * length that comes out right is also a check that the transpose was
+ * read the right way round.
+ */
+TEST(OpusSilkTables, EveryPitchContourIndexHasACodebookEntry) {
+  struct Contour {
+    const char * name;
+    size_t indices;
+    size_t entries;
+    int subframes;
+  };
+  const Contour contours[] = {
+      {"NB 10 ms", 3, 6, 2},
+      {"NB 20 ms", 11, 44, 4},
+      {"MB or WB 10 ms", 12, 24, 2},
+      {"MB or WB 20 ms", 34, 136, 4},
+  };
+  for (const Contour & one : contours) {
+    EXPECT_EQ(one.indices * (size_t)one.subframes, one.entries) << one.name;
+  }
+  // The offsets themselves are small: measured over all 210 of them,
+  // none moves a subframe's lag by more than nine samples. The decoder
+  // clamps the result to the legal lag range afterwards, so this bounds
+  // how far that clamp can ever be asked to reach.
+  const int8_t * all[] = {gaud_opus_silk_cb_lags_stage2_10_ms,
+      gaud_opus_silk_cb_lags_stage2, gaud_opus_silk_cb_lags_stage3_10_ms,
+      gaud_opus_silk_cb_lags_stage3};
+  const size_t counts[] = {6, 44, 24, 136};
+  for (int which = 0; which < 4; ++which) {
+    for (size_t i = 0; i < counts[which]; ++i) {
+      EXPECT_GE(all[which][i], -9) << which << " at " << i;
+      EXPECT_LE(all[which][i], 9) << which << " at " << i;
+    }
+  }
+}
+
+/** Each LSF ordering is a permutation of its own coefficient numbers. */
+TEST(OpusSilkTables, TheLsfOrderingsArePermutations) {
+  for (int order = 10; order <= 16; order += 6) {
+    const unsigned char * ordering = order == 10
+        ? gaud_opus_silk_nlsf_ordering10
+        : gaud_opus_silk_nlsf_ordering16;
+    std::vector<bool> seen((size_t)order, false);
+    for (int k = 0; k < order; ++k) {
+      ASSERT_LT(ordering[k], order) << "order " << order << " at " << k;
+      EXPECT_FALSE(seen[ordering[k]]) << "order " << order << " at " << k;
+      seen[ordering[k]] = true;
+    }
+  }
+}
+
+/** Both outcomes of every excitation sign decision are codable. */
+TEST(OpusSilkTables, EverySignContextCanCodeBothSigns) {
+  for (int i = 0; i < 42; ++i) {
+    EXPECT_GE(gaud_opus_silk_sign_icdf[i], 1u) << "at " << i;
+    EXPECT_LE(gaud_opus_silk_sign_icdf[i], 255u) << "at " << i;
+  }
+}
 
 namespace {
 

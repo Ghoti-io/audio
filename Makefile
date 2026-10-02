@@ -799,11 +799,12 @@ check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_opus.py
 
-check-opus-tables: ## Fail if the generated CELT tables are not what the RFC yields
+check-opus-tables: ## Fail if the generated Opus tables are not what the RFC yields
 # Needs the network, so it is asked for by name and is not in TEST_GATES.
-# The offline half of this claim - that what was compiled in matches
-# Table 55 of the prose - is in tests/unit/test_opus.cpp, where it runs
-# on every `make test`.
+# The offline half of this claim is in tests/unit/test_opus.cpp, where it
+# runs on every `make test`: Table 55 for CELT, and for SILK five of
+# section 4.2's printed tables typed in by hand plus the structural
+# properties every distribution has to have.
 	@python3 tools/tables/gen_opus_tables.py --check
 
 opus-vectors: ## Fetch RFC 6716's conformance vectors (39 MB, deliberate)

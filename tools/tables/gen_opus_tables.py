@@ -8,7 +8,7 @@
 # Ghoti.io Audio is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""The CELT tables, out of the document that defines them.
+"""The CELT and SILK tables, out of the document that defines them.
 
 Usage:
 
@@ -48,6 +48,36 @@ Each is computed here, compared against what the appendix holds, and
 only then written out. A mismatch is a failure rather than a note: if
 the formula and the table disagree, one of the two readings is wrong and
 guessing which would be the whole mistake.
+
+**SILK is the other way round, and that is worth exploiting.** Section
+4.2 prints almost every table it uses - fifty of them, from the LBRR
+flag distributions to the pulse-count splits - so the document holds two
+independent copies of each, and they can be made to check each other.
+That is what this script does with them: ninety-one tables are read once
+out of section 4.2's ASCII tables and once out of Appendix A, converted
+into a common form, and compared. A disagreement is a failure, because
+one of the two readings would then be wrong and guessing which is the
+whole mistake.
+
+The conversion is where the content is. The prose prints probabilities
+and the appendix stores inverse cumulative distributions; several tables
+are also stored transposed, at a different scale, or with the
+zero-probability symbols trimmed off the front. Each of those is a named
+step rather than a tolerance, and three of them are not cosmetic:
+
+  - the pitch contour codebooks are stored subframe-outermost and
+    printed entry-per-row, so the comparison is against the transpose;
+  - the four shell-code tables are numbered by partition size in the
+    prose and by depth in the appendix, which puts Table 47 against
+    `silk_shell_code_table3`;
+  - the LSF cosine table is Q12 in the prose and Q13 in the appendix in
+    spite of being called `silk_LSFCosTab_FIX_Q12`, and the two
+    interpolation formulas differ by the matching shift - so what is
+    checked is that they agree at all 32,768 inputs.
+
+One thing in section 4.2 is simply wrong: Table 17 labels the row for
+stage-1 index 6 with the letter "g". It is listed in `INDEX_ERRATA` so
+that the index column stays a real check everywhere else.
 
 `--check` regenerates into a temporary directory and compares, so a gate
 can assert the committed tables are what this script produces.
@@ -352,6 +382,703 @@ def table_57(rfc_text):
     return rows
 
 
+# --- the prose's own copy of the SILK tables ------------------------
+#
+# Section 4.2 is not written the way section 4.3 is. CELT's chapter
+# names its tables and leaves them in the appendix; SILK's chapter
+# *prints* almost every one of its own - fifty tables, from the LBRR
+# flag PDFs to the pulse-count splits - so for SILK the document holds
+# two independent copies of each table, and they can be made to check
+# each other. That is worth more than either alone: a table extracted
+# from the appendix is only as good as the extraction, and a table
+# typed in from the prose is only as good as the typing.
+#
+# The prose prints probabilities and the appendix stores inverse
+# cumulative distributions, so the comparison is through
+# `pdf_to_icdf()` rather than literal. Several tables are also stored
+# in a different order, a different scaling, or a different shape from
+# the way they are printed; each of those is a named conversion below
+# rather than a tolerance.
+
+
+def is_box_line(line):
+    """Whether a line is part of an ASCII table."""
+    stripped = line.strip()
+    return stripped.startswith("|") or stripped.startswith("+-")
+
+
+def close_page_breaks(block):
+    """The lines of `block` with the RFC's page furniture removed.
+
+    A table longer than a page is interrupted by a form feed, a footer,
+    a header, and blank lines either side. Dropping the two text lines
+    leaves a run of blanks between two table lines, and dropping that
+    run as well makes the table contiguous again. A blank run is only
+    removed when a table line sits on both sides of it, so two separate
+    tables - which always have a caption between them - never merge.
+    """
+    lines = []
+    for line in block.replace("\x0c", "").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("Valin, et al.") or stripped.startswith(
+                "RFC 6716 "):
+            continue
+        lines.append(line)
+    out = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            end = index
+            while end < len(lines) and not lines[end].strip():
+                end += 1
+            previous = out[-1] if out else ""
+            following = lines[end] if end < len(lines) else ""
+            if is_box_line(previous) and is_box_line(following):
+                index = end
+                continue
+            out.extend(lines[index:end])
+            index = end
+            continue
+        out.append(lines[index])
+        index += 1
+    return out
+
+
+def rfc_captions(rfc_text):
+    """Where each `Table N:` caption begins and ends."""
+    captions = {}
+    for match in re.finditer(r"^ +Table (\d+):", rfc_text, re.M):
+        captions[int(match.group(1))] = (match.start(), match.end())
+    if 53 not in captions:
+        raise SystemExit(
+            "gen_opus_tables: the RFC text has no Table 53, so it is not "
+            "the full document and the SILK tables cannot be checked "
+            "against the prose.")
+    return captions
+
+
+# RFC 6716 misprints one index in Table 17: the row for stage-1 index 6
+# is labelled "g", a letter out of the table's own body. Every other row
+# of every other table carries the index it should, so this is listed
+# here and the index check stays strict everywhere else.
+INDEX_ERRATA = {(17, 6): "g"}
+
+
+class Prose:
+    """The tables the prose prints, read back out of the document."""
+
+    def __init__(self, rfc_text):
+        self.text = rfc_text
+        self.captions = rfc_captions(rfc_text)
+
+    def box(self, number):
+        """The ASCII table immediately above `Table N:`."""
+        previous = self.captions.get(number - 1)
+        start = previous[1] if previous else 0
+        lines = close_page_breaks(self.text[start:self.captions[number][0]])
+        out = []
+        for line in reversed(lines):
+            if is_box_line(line):
+                out.append(line)
+            elif out:
+                break
+        if not out:
+            raise SystemExit(f"gen_opus_tables: Table {number} has no box")
+        return list(reversed(out))
+
+    def rows(self, number, by_index):
+        """The table's logical rows, as lists of cell strings.
+
+        A logical row can span several physical lines. Which lines
+        belong together is decided one of two ways: `by_index` starts a
+        row wherever the first cell is non-empty, which is right for the
+        tables indexed 0, 1, 2, ...; otherwise a row runs until a line
+        whose cells are all blank, which is right for the tables whose
+        row label itself wraps. The first is needed because a page break
+        can fall exactly where a blank separator line would have been,
+        and then the separator is simply not there - as happens in
+        Table 41 between index 3 and index 4.
+        """
+        logical = []
+        current = None
+        for line in self.box(number):
+            stripped = line.strip()
+            if stripped.startswith("+"):
+                if current:
+                    logical.append(current)
+                current = None
+                continue
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if not any(cells):
+                if current:
+                    logical.append(current)
+                current = None
+                continue
+            if current is None:
+                current = cells
+            elif by_index and cells[0]:
+                logical.append(current)
+                current = cells
+            else:
+                current = [(a + " " + b).strip()
+                           for a, b in zip(current, cells)]
+        if current:
+            logical.append(current)
+        return logical
+
+    def indexed(self, number, skip):
+        """Rows after `skip` header rows, with their index checked.
+
+        The index column is the one thing in these tables that is
+        redundant, so it is the one thing that can catch a row lost to a
+        page break or a mis-joined continuation.
+        """
+        rows = self.rows(number, True)[skip:]
+        for position, row in enumerate(rows):
+            if row[0] != str(position) and INDEX_ERRATA.get(
+                    (number, position)) != row[0]:
+                raise SystemExit(
+                    f"gen_opus_tables: Table {number} row {position} is "
+                    f"indexed {row[0]!r}. The rows have been misread.")
+        return rows
+
+    def pdfs(self, number):
+        """Every `{...}/256` the table prints, in order."""
+        body = " ".join(" | ".join(row) for row in self.rows(number, False))
+        out = []
+        for group in re.findall(r"\{([^}]*)\}/256", body):
+            values = [int(piece) for piece in group.split(",")]
+            if sum(values) != 256:
+                raise SystemExit(
+                    f"gen_opus_tables: a PDF in Table {number} sums to "
+                    f"{sum(values)}, not 256. A distribution that does not "
+                    "tile the range is a value the encoder can write and "
+                    "no decoder can read.")
+            out.append(values)
+        if not out:
+            raise SystemExit(f"gen_opus_tables: Table {number} has no PDF")
+        return out
+
+
+def pdf_to_icdf(pdf):
+    """The reference's spelling of a distribution the prose prints.
+
+    `ec_dec_icdf` reads 256 minus the running sum, with the leading 256
+    left implicit. Two consequences show up in the tables: a symbol the
+    prose gives zero probability is simply absent from the front of the
+    reference's array - the caller adds the offset back - and nothing is
+    stored past the first zero, because the distribution is exhausted
+    there.
+    """
+    cumulative = 0
+    full = []
+    for probability in pdf:
+        cumulative += probability
+        full.append(256 - cumulative)
+    lead = 0
+    while lead < len(pdf) and pdf[lead] == 0:
+        lead += 1
+    trimmed = full[lead:]
+    for position, value in enumerate(trimmed):
+        if value == 0:
+            return trimmed[:position + 1]
+    raise SystemExit("gen_opus_tables: an iCDF never reaches zero")
+
+
+def silk_define(root, name):
+    """One integer `#define` out of silk/define.h."""
+    with open(os.path.join(root, "silk", "define.h"), encoding="utf-8",
+              errors="replace") as handle:
+        source = handle.read()
+    match = re.search(r"^#define\s+" + re.escape(name) + r"\s+(-?\d+)\s*$",
+                      source, re.M)
+    if not match:
+        raise SystemExit(f"gen_opus_tables: silk/define.h has no {name}")
+    return int(match.group(1))
+
+
+class SilkCheck:
+    """Appendix A's SILK tables, each held against the prose's copy."""
+
+    OTHER = "silk/tables_other.c"
+    GAIN = "silk/tables_gain.c"
+    LAG = "silk/tables_pitch_lag.c"
+    LTP = "silk/tables_LTP.c"
+    PULSES = "silk/tables_pulses_per_block.c"
+    NB_MB = "silk/tables_NLSF_CB_NB_MB.c"
+    WB = "silk/tables_NLSF_CB_WB.c"
+    PITCH = "silk/pitch_est_tables.c"
+    COS = "silk/table_LSF_cos.c"
+
+    def __init__(self, root, rfc_text):
+        self.root = root
+        self.prose = Prose(rfc_text)
+        self.tables = {}
+        self.checked = 0
+
+    def array(self, relative, name):
+        return read_array(self.root, relative, name)
+
+    def agree(self, label, mine, theirs, source):
+        """Fail unless the two readings of one table are identical."""
+        if list(mine) != list(theirs):
+            raise SystemExit(
+                f"gen_opus_tables: {label} reads differently in the two "
+                f"places RFC 6716 states it.\n  {source}: {list(mine)}\n"
+                f"  Appendix A: {list(theirs)}\nOne of the two is being "
+                "misread; do not pick one.")
+        self.checked += 1
+
+    def emit(self, name, kind, values):
+        self.tables["silk_" + name] = (kind, list(values))
+
+    def take(self, name, kind, relative, reference):
+        """Extract an array and emit it under our own name."""
+        values = self.array(relative, reference)
+        self.emit(name, kind, values)
+        return values
+
+    # -- section 4.2.3 to 4.2.7.3: the frame header ------------------
+
+    def header(self):
+        prose = self.prose
+        lbrr = prose.pdfs(4)
+        for frames, suffix in ((2, "2"), (3, "3")):
+            name = f"silk_LBRR_flags_{suffix}_iCDF"
+            values = self.take(f"lbrr_flags_{suffix}_icdf", "uint8_t",
+                               self.OTHER, name)
+            self.agree(name, pdf_to_icdf(lbrr[frames - 2]), values,
+                       f"Table 4, {20 * frames} ms")
+
+        stereo = prose.pdfs(6)
+        joint = self.take("stereo_pred_joint_icdf", "uint8_t", self.OTHER,
+                          "silk_stereo_pred_joint_iCDF")
+        self.agree("silk_stereo_pred_joint_iCDF", pdf_to_icdf(stereo[0]),
+                   joint, "Table 6 stage 1")
+        # The stage-2 and stage-3 stereo PDFs are the uniform tables the
+        # reference shares with several other fields, so this is also
+        # where two of those get checked.
+        for stage, size in ((1, 3), (2, 5)):
+            self.agree(f"silk_uniform{size}_iCDF", pdf_to_icdf(stereo[stage]),
+                       self.array(self.OTHER, f"silk_uniform{size}_iCDF"),
+                       f"Table 6 stage {stage + 1}")
+        for size in (3, 4, 5, 6, 8):
+            self.take(f"uniform{size}_icdf", "uint8_t", self.OTHER,
+                      f"silk_uniform{size}_iCDF")
+
+        weights = self.take("stereo_pred_quant_q13", "int16_t", self.OTHER,
+                            "silk_stereo_pred_quant_Q13")
+        self.agree("silk_stereo_pred_quant_Q13",
+                   [int(row[1]) for row in prose.indexed(7, 1)], weights,
+                   "Table 7")
+        mid = self.take("stereo_only_code_mid_icdf", "uint8_t", self.OTHER,
+                        "silk_stereo_only_code_mid_iCDF")
+        self.agree("silk_stereo_only_code_mid_iCDF",
+                   pdf_to_icdf(prose.pdfs(8)[0]), mid, "Table 8")
+
+        # Table 9 pads both frame-type distributions out to six symbols
+        # so that they can be printed side by side; the reference drops
+        # the impossible ones off the front and the caller adds the
+        # offset back. pdf_to_icdf does the same trimming.
+        frame_type = prose.pdfs(9)
+        for index, (name, label) in enumerate((
+                ("silk_type_offset_no_VAD_iCDF", "inactive"),
+                ("silk_type_offset_VAD_iCDF", "active"))):
+            values = self.take(name.lower()[5:], "uint8_t", self.OTHER, name)
+            self.agree(name, pdf_to_icdf(frame_type[index]), values,
+                       f"Table 9, {label}")
+
+        gains = self.take("gain_icdf", "uint8_t", self.GAIN, "silk_gain_iCDF")
+        for index, label in enumerate(("inactive", "unvoiced", "voiced")):
+            self.agree(f"silk_gain_iCDF[{label}]",
+                       pdf_to_icdf(prose.pdfs(11)[index]),
+                       gains[8 * index:8 * index + 8], f"Table 11, {label}")
+        self.agree("silk_uniform8_iCDF", pdf_to_icdf(prose.pdfs(12)[0]),
+                   self.array(self.OTHER, "silk_uniform8_iCDF"), "Table 12")
+        delta = self.take("delta_gain_icdf", "uint8_t", self.GAIN,
+                          "silk_delta_gain_iCDF")
+        self.agree("silk_delta_gain_iCDF", pdf_to_icdf(prose.pdfs(13)[0]),
+                   delta, "Table 13")
+
+    # -- section 4.2.7.5: the normalized LSFs ------------------------
+
+    def nlsf(self):
+        prose = self.prose
+        stage1 = prose.pdfs(14)
+        for half, (source, name) in enumerate(((self.NB_MB,
+                                                "silk_NLSF_CB1_iCDF_NB_MB"),
+                                               (self.WB,
+                                                "silk_NLSF_CB1_iCDF_WB"))):
+            values = self.take(name.lower()[5:], "uint8_t", source, name)
+            for voiced in (0, 1):
+                self.agree(f"{name}[{voiced}]",
+                           pdf_to_icdf(stage1[2 * half + voiced]),
+                           values[32 * voiced:32 * voiced + 32],
+                           f"Table 14 row {2 * half + voiced}")
+
+        for table, source, name in ((15, self.NB_MB, "silk_NLSF_CB2_iCDF_NB_MB"),
+                                    (16, self.WB, "silk_NLSF_CB2_iCDF_WB")):
+            values = self.take(name.lower()[5:], "uint8_t", source, name)
+            for letter, pdf in enumerate(prose.pdfs(table)):
+                self.agree(f"{name}[{letter}]", pdf_to_icdf(pdf),
+                           values[9 * letter:9 * letter + 9],
+                           f"Table {table} row {letter}")
+
+        # The reference packs two things into each byte of the select
+        # table, and the prose prints them as two separate tables: which
+        # of the eight stage-2 distributions a coefficient uses (as a
+        # letter), and which of the two prediction weight lists it reads
+        # (as a letter again, in a different alphabet). Reassembling
+        # them is what checks both at once.
+        for ec_table, weight_table, source, select, order, first in (
+                (17, 21, self.NB_MB, "silk_NLSF_CB2_SELECT_NB_MB", 10, "a"),
+                (18, 22, self.WB, "silk_NLSF_CB2_SELECT_WB", 16, "i")):
+            distributions = self.letters(ec_table, order, first, 8)
+            # The prose prints one fewer column here than there are
+            # coefficients, and that is not an omission: the reference
+            # indexes pred_Q8[i + sel*(order-1) + 1], so a set bit on
+            # the last coefficient would read one past the end of an
+            # array that is exactly 2*(order-1) long. The last
+            # coefficient's selector cannot be anything but zero.
+            selectors = self.letters(weight_table, order - 1,
+                                     "A" if order == 10 else "C", 2)
+            packed = []
+            for row_ec, row_sel in zip(distributions, selectors):
+                row_sel = row_sel + [0]
+                for index in range(0, order, 2):
+                    packed.append((row_ec[index] << 1) | row_sel[index]
+                                  | (row_ec[index + 1] << 5)
+                                  | (row_sel[index + 1] << 4))
+            values = self.take(select.lower()[5:], "uint8_t", source, select)
+            self.agree(select, packed, values,
+                       f"Tables {ec_table} and {weight_table}, packed")
+            if any(byte & 0x10 for byte in values[order // 2 - 1::order // 2]):
+                raise SystemExit(
+                    f"gen_opus_tables: {select} sets the prediction weight "
+                    "bit on a last coefficient, which would read past the "
+                    "end of the weight list.")
+
+        weights = [self.column(20, column) for column in (1, 2, 3, 4)]
+        for low, high, source, name in ((0, 1, self.NB_MB,
+                                         "silk_NLSF_PRED_NB_MB_Q8"),
+                                        (2, 3, self.WB,
+                                         "silk_NLSF_PRED_WB_Q8")):
+            values = self.take(name.lower()[5:], "uint8_t", source, name)
+            self.agree(name, weights[low] + weights[high], values,
+                       f"Table 20 columns {low + 1} and {high + 1}")
+
+        for table, source, name, order in (
+                (23, self.NB_MB, "silk_NLSF_CB1_NB_MB_Q8", 10),
+                (24, self.WB, "silk_NLSF_CB1_WB_Q8", 16)):
+            flat = []
+            for position, row in enumerate(prose.indexed(table, 2)):
+                vector = [int(piece) for piece in row[1].split()]
+                if len(vector) != order:
+                    raise SystemExit(
+                        f"gen_opus_tables: Table {table} row {position} has "
+                        f"{len(vector)} coefficients, not {order}")
+                flat += vector
+            values = self.take(name.lower()[5:], "uint8_t", source, name)
+            self.agree(name, flat, values, f"Table {table}")
+
+        for column, source, name in ((1, self.NB_MB,
+                                      "silk_NLSF_DELTA_MIN_NB_MB_Q15"),
+                                     (2, self.WB,
+                                      "silk_NLSF_DELTA_MIN_WB_Q15")):
+            values = self.take(name.lower()[5:], "int16_t", source, name)
+            self.agree(name, self.column(25, column), values,
+                       f"Table 25 column {column}")
+
+        extension = self.take("nlsf_ext_icdf", "uint8_t", self.OTHER,
+                              "silk_NLSF_EXT_iCDF")
+        self.agree("silk_NLSF_EXT_iCDF", pdf_to_icdf(prose.pdfs(19)[0]),
+                   extension, "Table 19")
+        interpolation = self.take("nlsf_interpolation_factor_icdf", "uint8_t",
+                                  self.OTHER,
+                                  "silk_NLSF_interpolation_factor_iCDF")
+        self.agree("silk_NLSF_interpolation_factor_iCDF",
+                   pdf_to_icdf(prose.pdfs(26)[0]), interpolation, "Table 26")
+
+    def letters(self, table, width, base, span):
+        """A grid of single letters, as indices into its own alphabet.
+
+        The prose names these choices with letters rather than numbers,
+        and uses a different run of the alphabet for each table so that
+        a NB/MB distribution can never be confused with a WB one.
+        """
+        rows = []
+        for position, row in enumerate(self.prose.indexed(table, 2)):
+            cells = row[1].split()
+            if len(cells) != width or any(
+                    len(cell) != 1 or not 0 <= ord(cell) - ord(base) < span
+                    for cell in cells):
+                raise SystemExit(
+                    f"gen_opus_tables: Table {table} row {position} is "
+                    f"{cells}, which is not {width} letters from "
+                    f"{base!r} to {chr(ord(base) + span - 1)!r}")
+            rows.append(cells)
+        return [[ord(cell) - ord(base) for cell in row] for row in rows]
+
+    def column(self, table, column, skip=1):
+        """One numeric column, skipping the rows that leave it blank."""
+        out = []
+        for row in self.prose.indexed(table, skip):
+            if row[column]:
+                out.append(int(row[column]))
+        return out
+
+    # -- section 4.2.7.5.6: the LSFs become LPC coefficients ---------
+
+    def lsf_to_lpc(self):
+        # Table 27's ordering is not in a table file at all; it is two
+        # local arrays inside silk_NLSF2A().
+        with open(os.path.join(self.root, "silk", "NLSF2A.c"),
+                  encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+        for column, order in ((1, 10), (2, 16)):
+            match = re.search(
+                r"ordering%d\s*\[\s*%d\s*\]\s*=\s*\{([^}]*)\}" % (order, order),
+                source)
+            if not match:
+                raise SystemExit(
+                    f"gen_opus_tables: silk/NLSF2A.c has no ordering{order}")
+            values = [int(piece) for piece in re.findall(r"\d+",
+                                                         match.group(1))]
+            self.agree(f"ordering{order}", self.column(27, column), values,
+                       f"Table 27 column {column}")
+            self.emit(f"nlsf_ordering{order}", "uint8_t", values)
+
+        # The reference calls this table Q12 and stores it in Q13; the
+        # prose prints the Q12 values its own formula wants. Neither is
+        # wrong, because the two interpolation formulas differ by the
+        # same bit - so what gets checked is that they agree at every
+        # one of the 32,768 inputs, not that the tables match.
+        cos13 = self.take("lsf_cos_q13", "int16_t", self.COS,
+                          "silk_LSFCosTab_FIX_Q12")
+        cos12 = []
+        for position, row in enumerate(self.prose.rows(28, True)[1:]):
+            if row[0] != str(4 * position):
+                raise SystemExit(
+                    f"gen_opus_tables: Table 28 row {position} is indexed "
+                    f"{row[0]!r}, not {4 * position}")
+            cos12 += [int(cell) for cell in row[1:] if cell]
+        if len(cos12) != len(cos13):
+            raise SystemExit(
+                f"gen_opus_tables: Table 28 has {len(cos12)} cosines and "
+                f"silk_LSFCosTab_FIX_Q12 has {len(cos13)}")
+        for index in range(len(cos13) - 1):
+            for fraction in range(256):
+                prose = (cos12[index] * 256
+                         + (cos12[index + 1] - cos12[index]) * fraction
+                         + 4) >> 3
+                appendix = ((cos13[index] << 8)
+                            + (cos13[index + 1] - cos13[index]) * fraction
+                            + 8) >> 4
+                if prose != appendix:
+                    raise SystemExit(
+                        "gen_opus_tables: the prose's Q12 cosine table and "
+                        f"Appendix A's Q13 one disagree at index {index}, "
+                        f"fraction {fraction}: {prose} against {appendix}")
+        self.checked += 1
+
+    # -- section 4.2.7.6: the long-term predictor -------------------
+
+    def ltp(self):
+        prose = self.prose
+        lag = self.take("pitch_lag_icdf", "uint8_t", self.LAG,
+                        "silk_pitch_lag_iCDF")
+        self.agree("silk_pitch_lag_iCDF", pdf_to_icdf(prose.pdfs(29)[0]), lag,
+                   "Table 29")
+        for index, size in enumerate((4, 6, 8)):
+            self.agree(f"silk_uniform{size}_iCDF",
+                       pdf_to_icdf(prose.pdfs(30)[index]),
+                       self.array(self.OTHER, f"silk_uniform{size}_iCDF"),
+                       f"Table 30 row {index}")
+        delta = self.take("pitch_delta_icdf", "uint8_t", self.LAG,
+                          "silk_pitch_delta_iCDF")
+        self.agree("silk_pitch_delta_iCDF", pdf_to_icdf(prose.pdfs(31)[0]),
+                   delta, "Table 31")
+        contours = prose.pdfs(32)
+        for index, name in enumerate(("silk_pitch_contour_10_ms_NB_iCDF",
+                                      "silk_pitch_contour_NB_iCDF",
+                                      "silk_pitch_contour_10_ms_iCDF",
+                                      "silk_pitch_contour_iCDF")):
+            values = self.take(name.lower()[5:], "uint8_t", self.LAG, name)
+            self.agree(name, pdf_to_icdf(contours[index]), values,
+                       f"Table 32 row {index}")
+
+        # The reference stores these with the subframe as the outer
+        # index and the codebook entry as the inner one; the prose
+        # prints one codebook entry per row. So the comparison is
+        # against the transpose, and reading it the other way round
+        # would be a decoder that moves the right offsets to the wrong
+        # subframes.
+        for table, name, subframes in (
+                (33, "silk_CB_lags_stage2_10_ms", 2),
+                (34, "silk_CB_lags_stage2", 4),
+                (35, "silk_CB_lags_stage3_10_ms", 2),
+                (36, "silk_CB_lags_stage3", 4)):
+            entries = []
+            for position, row in enumerate(prose.indexed(table, 1)):
+                offsets = [int(piece) for piece in row[1].split()]
+                if len(offsets) != subframes:
+                    raise SystemExit(
+                        f"gen_opus_tables: Table {table} row {position} has "
+                        f"{len(offsets)} offsets, not {subframes}")
+                entries.append(offsets)
+            transposed = [entry[subframe] for subframe in range(subframes)
+                          for entry in entries]
+            values = self.take(name.lower()[5:], "int8_t", self.PITCH, name)
+            self.agree(name, transposed, values, f"Table {table}, transposed")
+
+        periodicity = self.take("ltp_per_index_icdf", "uint8_t", self.LTP,
+                                "silk_LTP_per_index_iCDF")
+        self.agree("silk_LTP_per_index_iCDF", pdf_to_icdf(prose.pdfs(37)[0]),
+                   periodicity, "Table 37")
+        sizes = []
+        for index, pdf in enumerate(prose.pdfs(38)):
+            name = f"silk_LTP_gain_iCDF_{index}"
+            values = self.take(name.lower()[5:], "uint8_t", self.LTP, name)
+            self.agree(name, pdf_to_icdf(pdf), values,
+                       f"Table 38 row {index}")
+            sizes.append(len(values))
+        for table, index in ((39, 0), (40, 1), (41, 2)):
+            flat = []
+            for position, row in enumerate(prose.indexed(table, 1)):
+                taps = [int(piece) for piece in row[1].split()]
+                if len(taps) != 5:
+                    raise SystemExit(
+                        f"gen_opus_tables: Table {table} row {position} has "
+                        f"{len(taps)} taps, not 5")
+                flat += taps
+            name = f"silk_LTP_gain_vq_{index}"
+            values = self.take(name.lower()[5:], "int8_t", self.LTP, name)
+            self.agree(name, flat, values, f"Table {table}")
+        self.agree("silk_LTP_vq_sizes", sizes,
+                   self.array(self.LTP, "silk_LTP_vq_sizes"),
+                   "the lengths of the three distributions in Table 38")
+
+        scaling = self.take("ltpscale_icdf", "uint8_t", self.OTHER,
+                            "silk_LTPscale_iCDF")
+        self.agree("silk_LTPscale_iCDF", pdf_to_icdf(prose.pdfs(42)[0]),
+                   scaling, "Table 42")
+        # Section 4.2.7.6.3 prints the three scale factors in a
+        # sentence rather than a table.
+        match = re.search(r"Q14 scale factors of\s+([\d,\s]+?),?\s+and\s+"
+                          r"(\d+)", self.prose.text)
+        if not match:
+            raise SystemExit(
+                "gen_opus_tables: section 4.2.7.6.3 no longer names the LTP "
+                "scale factors in the sentence this reads them from")
+        printed = [int(piece) for piece in re.findall(r"\d+", match.group(1))]
+        printed.append(int(match.group(2)))
+        factors = self.take("ltp_scales_q14", "int16_t", self.OTHER,
+                            "silk_LTPScales_table_Q14")
+        self.agree("silk_LTPScales_table_Q14", printed, factors,
+                   "section 4.2.7.6.3")
+        self.agree("silk_uniform4_iCDF", pdf_to_icdf(prose.pdfs(43)[0]),
+                   self.array(self.OTHER, "silk_uniform4_iCDF"), "Table 43")
+
+    # -- section 4.2.7.8: the excitation ----------------------------
+
+    def excitation(self):
+        prose = self.prose
+        levels = self.take("rate_levels_icdf", "uint8_t", self.PULSES,
+                           "silk_rate_levels_iCDF")
+        for index, label in enumerate(("inactive or unvoiced", "voiced")):
+            self.agree(f"silk_rate_levels_iCDF[{label}]",
+                       pdf_to_icdf(prose.pdfs(45)[index]),
+                       levels[9 * index:9 * index + 9], f"Table 45, {label}")
+
+        counts = prose.pdfs(46)
+        per_block = self.take("pulses_per_block_icdf", "uint8_t", self.PULSES,
+                              "silk_pulses_per_block_iCDF")
+        stored = len(per_block) // 18
+        for level in range(stored):
+            self.agree(f"silk_pulses_per_block_iCDF[{level}]",
+                       pdf_to_icdf(counts[level]),
+                       per_block[18 * level:18 * level + 18],
+                       f"Table 46 rate level {level}")
+        # The prose prints one more distribution than the reference
+        # stores, and says why: rate level 10 "is just a shifted version
+        # of that for 9 and thus does not require any additional
+        # storage". That is a claim about the numbers, so it is checked
+        # rather than believed - and it is what caps the number of extra
+        # LSBs at ten, because reading a 17 has probability zero there.
+        if len(counts) != stored + 1:
+            raise SystemExit(
+                f"gen_opus_tables: Table 46 prints {len(counts)} rate "
+                f"levels and Appendix A stores {stored}")
+        self.agree("silk_pulses_per_block_iCDF[10]",
+                   pdf_to_icdf(counts[stored]),
+                   per_block[18 * (stored - 1) + 1:18 * stored],
+                   "Table 46 rate level 9, shifted by one")
+
+        # The prose numbers the split tables by the size of the
+        # partition being split, largest first; the reference numbers
+        # them by depth, finest first. Lining them up the other way
+        # round would put every split's distribution one level out.
+        offsets = self.take("shell_code_table_offsets", "uint8_t",
+                            self.PULSES, "silk_shell_code_table_offsets")
+        for table, index in ((47, 3), (48, 2), (49, 1), (50, 0)):
+            built = []
+            for pulses, pdf in enumerate(prose.pdfs(table), start=1):
+                if offsets[pulses] != len(built):
+                    raise SystemExit(
+                        f"gen_opus_tables: Table {table} puts the "
+                        f"distribution for {pulses} pulses at "
+                        f"{len(built)} and silk_shell_code_table_offsets "
+                        f"says {offsets[pulses]}")
+                built += pdf_to_icdf(pdf)
+            name = f"silk_shell_code_table{index}"
+            values = self.take(name.lower()[5:], "uint8_t", self.PULSES, name)
+            self.agree(name, built, values,
+                       f"Table {table}, {2 ** (index + 1)}-sample partitions")
+
+        lsb = self.take("lsb_icdf", "uint8_t", self.OTHER, "silk_lsb_iCDF")
+        self.agree("silk_lsb_iCDF", pdf_to_icdf(prose.pdfs(51)[0]), lsb,
+                   "Table 51")
+        # Each sign is one binary decision and the reference keeps only
+        # the first entry of each two-entry distribution;
+        # silk_encode_signs builds the pair on the stack with the zero
+        # after it.
+        signs = self.take("sign_icdf", "uint8_t", self.PULSES,
+                          "silk_sign_iCDF")
+        self.agree("silk_sign_iCDF",
+                   [pdf_to_icdf(pdf)[0] for pdf in prose.pdfs(52)], signs,
+                   "Table 52, the first entry of each")
+
+        # The prose prints these offsets on a scale six bits below the
+        # one the reference holds them on and four below the one it
+        # uses them on, so the two differ by a factor of four. The
+        # emitted table is the reference's Q10.
+        rows = prose.rows(53, True)[1:]
+        printed = [int(row[2]) for row in rows]
+        if printed[0] != printed[2] or printed[1] != printed[3]:
+            raise SystemExit(
+                "gen_opus_tables: Table 53 no longer gives inactive and "
+                "unvoiced frames the same quantization offsets, so the "
+                "reference's two-row table cannot hold it")
+        reference = [silk_define(self.root, name) for name in
+                     ("OFFSET_UVL_Q10", "OFFSET_UVH_Q10",
+                      "OFFSET_VL_Q10", "OFFSET_VH_Q10")]
+        self.agree("silk_Quantization_Offsets_Q10",
+                   [4 * printed[index] for index in (0, 1, 4, 5)], reference,
+                   "Table 53, times four")
+        self.emit("quantization_offsets_q10", "int16_t", reference)
+
+    def run(self):
+        self.header()
+        self.nlsf()
+        self.lsf_to_lpc()
+        self.ltp()
+        self.excitation()
+        print(f"gen_opus_tables: {self.checked} SILK tables read twice - "
+              "once from section 4.2's prose and once from Appendix A - "
+              "and the two readings agree")
+        return self.tables
+
+
 def main(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--rfc", default=os.path.join(
@@ -364,11 +1091,12 @@ def main(argv):
     with tempfile.TemporaryDirectory() as work:
         root = reference_source(rfc_text, work)
         tables = extract(root, rfc_text)
+        silk = SilkCheck(root, rfc_text.decode("ascii", "replace")).run()
     # The return value is the verdict. An earlier draft called emit() and
     # returned 0 regardless, so `--check` printed "is not what this script
     # produces" and exited successfully - a gate that says the right thing
     # and reports success is worse than no gate.
-    return emit(tables, args.check)
+    return emit(tables, silk, args.check)
 
 
 def extract(root, rfc_text):
@@ -724,63 +1452,129 @@ def render(name, kind, values, per_line=12):
     return "\n".join(out)
 
 
-def emit(tables, check):
-    """Write the pair, or compare against what is committed."""
-    header = [LICENSE, GENERATED, """
+CELT_NOTES = {
+    "eband5ms": "Band edges in 2.5 ms bins; checked against Table 55.",
+    "logN400": "Band widths as log2 in eighths of a bit.",
+    "window120": "The MDCT overlap window in Q15.",
+    "band_allocation": "Allocation in 1/32 bit per sample, 11 by 21.",
+    "tf_select_table": "Time-frequency resolution changes, 4 by 8.",
+    "trim_icdf": "The allocation trim's distribution.",
+    "spread_icdf": "The spreading decision's distribution.",
+    "tapset_icdf": "The post-filter tap set's distribution.",
+    "cache_index50": "Where each band's pulse cache starts.",
+    "cache_bits50": "Bits needed for K pulses in N bins.",
+    "cache_caps50": "The allocation ceiling per band and channel count.",
+    "e_prob_model": "Laplace parameters for coarse energy, 4 by 2 by 42.",
+    "pred_coef": "Coarse energy's time prediction, per frame size, Q15.",
+    "beta_coef": "Coarse energy's frequency prediction, Q15.",
+    "beta_intra": "The same, for a frame coded without history.",
+    "log2_frac_table": "Cost of coding one of k+1 values, in eighths of a bit.",
+    "e_means": "The mean energy per band, in Q4 decibels; 21 used of 25.",
+    "mdct_twiddles960": "The inverse MDCT's rotation, a quarter cosine in Q15.",
+    "fft_twiddles48000_960": "The FFT's twiddles: 480 complex pairs in Q15.",
+    "fft_bitrev480": "Input permutation for the 480-point FFT.",
+    "fft_bitrev240": "Input permutation for the 240-point FFT.",
+    "fft_bitrev120": "Input permutation for the 120-point FFT.",
+    "fft_bitrev60": "Input permutation for the 60-point FFT.",
+    "fft_nfft": "Each frame size's FFT length.",
+    "fft_shift": "Each frame size's twiddle stride, as a shift.",
+    "fft_factors": "Each frame size's radix factorisation, 4 by 16.",
+}
+
+
+SILK_NOTES = {
+    "silk_lbrr_flags_2_icdf": "Which of a 40 ms frame's two LBRR frames are coded.",
+    "silk_lbrr_flags_3_icdf": "The same for 60 ms, over three frames.",
+    "silk_stereo_pred_joint_icdf": "The stereo weights' shared high-order index.",
+    "silk_uniform3_icdf": "Three equally likely values.",
+    "silk_uniform4_icdf": "Four equally likely values.",
+    "silk_uniform5_icdf": "Five equally likely values.",
+    "silk_uniform6_icdf": "Six equally likely values.",
+    "silk_uniform8_icdf": "Eight equally likely values.",
+    "silk_stereo_pred_quant_q13": "The sixteen stereo prediction weights, Q13.",
+    "silk_stereo_only_code_mid_icdf": "Whether the side channel is coded at all.",
+    "silk_type_offset_no_vad_icdf": "Frame type in an inactive frame; add 0.",
+    "silk_type_offset_vad_icdf": "Frame type in an active frame; add 2.",
+    "silk_gain_icdf": "The independent gain's top three bits, by signal type.",
+    "silk_delta_gain_icdf": "A gain coded against the previous subframe's.",
+    "silk_nlsf_cb1_icdf_nb_mb": "NB and MB stage-1 LSF index, unvoiced then voiced.",
+    "silk_nlsf_cb1_icdf_wb": "The same for WB.",
+    "silk_nlsf_cb2_icdf_nb_mb": "NB and MB stage-2 residual, eight distributions of nine.",
+    "silk_nlsf_cb2_icdf_wb": "The same for WB.",
+    "silk_nlsf_cb2_select_nb_mb": "Per NB/MB coefficient: stage-2 distribution and weight list,\n    two per byte.",
+    "silk_nlsf_cb2_select_wb": "The same for WB.",
+    "silk_nlsf_pred_nb_mb_q8": "NB and MB backwards prediction weights, two lists of nine, Q8.",
+    "silk_nlsf_pred_wb_q8": "The same for WB, two lists of fifteen.",
+    "silk_nlsf_cb1_nb_mb_q8": "The NB and MB stage-1 codebook, 32 vectors of 10, Q8.",
+    "silk_nlsf_cb1_wb_q8": "The WB stage-1 codebook, 32 vectors of 16, Q8.",
+    "silk_nlsf_delta_min_nb_mb_q15": "Minimum spacing between NB and MB LSFs, Q15.",
+    "silk_nlsf_delta_min_wb_q15": "The same for WB.",
+    "silk_nlsf_ext_icdf": "The extension coded when a stage-2 index saturates.",
+    "silk_nlsf_interpolation_factor_icdf": "How far a 20 ms frame interpolates towards the previous LSFs.",
+    "silk_nlsf_ordering10": "The order 10 LSFs are evaluated in, which is chosen for accuracy.",
+    "silk_nlsf_ordering16": "The same for 16.",
+    "silk_lsf_cos_q13": "Cosine of an LSF, 129 points in Q13 despite the reference's name for it.",
+    "silk_pitch_lag_icdf": "The primary pitch lag's high part.",
+    "silk_pitch_delta_icdf": "A pitch lag coded against the previous frame's.",
+    "silk_pitch_contour_10_ms_nb_icdf": "Subframe pitch contour, NB, 10 ms.",
+    "silk_pitch_contour_nb_icdf": "Subframe pitch contour, NB, 20 ms.",
+    "silk_pitch_contour_10_ms_icdf": "Subframe pitch contour, MB or WB, 10 ms.",
+    "silk_pitch_contour_icdf": "Subframe pitch contour, MB or WB, 20 ms.",
+    "silk_cb_lags_stage2_10_ms": "The NB 10 ms contour offsets, subframe by subframe.",
+    "silk_cb_lags_stage2": "The NB 20 ms contour offsets, subframe by subframe.",
+    "silk_cb_lags_stage3_10_ms": "The MB and WB 10 ms contour offsets.",
+    "silk_cb_lags_stage3": "The MB and WB 20 ms contour offsets.",
+    "silk_ltp_per_index_icdf": "Which of the three LTP filter codebooks a frame uses.",
+    "silk_ltp_gain_icdf_0": "LTP filter index, periodicity 0.",
+    "silk_ltp_gain_icdf_1": "LTP filter index, periodicity 1.",
+    "silk_ltp_gain_icdf_2": "LTP filter index, periodicity 2.",
+    "silk_ltp_gain_vq_0": "Eight five-tap LTP filters, Q7.",
+    "silk_ltp_gain_vq_1": "Sixteen five-tap LTP filters, Q7.",
+    "silk_ltp_gain_vq_2": "Thirty-two five-tap LTP filters, Q7.",
+    "silk_ltpscale_icdf": "Which LTP scale factor a voiced frame uses.",
+    "silk_ltp_scales_q14": "The three LTP scale factors, Q14.",
+    "silk_rate_levels_icdf": "The excitation's rate level, by signal type.",
+    "silk_pulses_per_block_icdf": "Pulses in a shell block, ten rate levels of eighteen.",
+    "silk_shell_code_table_offsets": "Where each pulse count's split distribution starts.",
+    "silk_shell_code_table3": "Splitting a 16-sample partition.",
+    "silk_shell_code_table2": "Splitting an 8-sample partition.",
+    "silk_shell_code_table1": "Splitting a 4-sample partition.",
+    "silk_shell_code_table0": "Splitting a 2-sample partition.",
+    "silk_lsb_icdf": "One extra excitation bit.",
+    "silk_sign_icdf": "An excitation sign: six contexts by seven pulse counts.",
+    "silk_quantization_offsets_q10": "The excitation's quantization offset, Q10.",
+}
+
+
+def render_pair(stem, guard, headline, body_line, tables, notes):
+    """One generated .h/.c pair, as text."""
+    header = [LICENSE, GENERATED, f"""
 /**
  * @file
  *
- * The CELT tables, generated. tools/tables/gen_opus_tables.py says from
+{headline} tools/tables/gen_opus_tables.py says from
  * what, and which of them were checked against a second reading.
  */
 
-#ifndef GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_TABLES_H
-#define GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_TABLES_H
+#ifndef {guard}
+#define {guard}
 
 #include <ghoti.io/audio/macros.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
-extern "C" {
+extern "C" {{
 #endif
 """]
-    body = [LICENSE, GENERATED, """
+    body = [LICENSE, GENERATED, f"""
 /**
  * @file
  *
- * The CELT tables themselves.
+{body_line}
  */
 
-#include "opus_tables.h"
+#include "{stem}.h"
 """]
-    notes = {
-        "eband5ms": "Band edges in 2.5 ms bins; checked against Table 55.",
-        "logN400": "Band widths as log2 in eighths of a bit.",
-        "window120": "The MDCT overlap window in Q15.",
-        "band_allocation": "Allocation in 1/32 bit per sample, 11 by 21.",
-        "tf_select_table": "Time-frequency resolution changes, 4 by 8.",
-        "trim_icdf": "The allocation trim's distribution.",
-        "spread_icdf": "The spreading decision's distribution.",
-        "tapset_icdf": "The post-filter tap set's distribution.",
-        "cache_index50": "Where each band's pulse cache starts.",
-        "cache_bits50": "Bits needed for K pulses in N bins.",
-        "cache_caps50": "The allocation ceiling per band and channel count.",
-        "e_prob_model": "Laplace parameters for coarse energy, 4 by 2 by 42.",
-        "pred_coef": "Coarse energy's time prediction, per frame size, Q15.",
-        "beta_coef": "Coarse energy's frequency prediction, Q15.",
-        "beta_intra": "The same, for a frame coded without history.",
-        "log2_frac_table": "Cost of coding one of k+1 values, in eighths of a bit.",
-        "e_means": "The mean energy per band, in Q4 decibels; 21 used of 25.",
-        "mdct_twiddles960": "The inverse MDCT's rotation, a quarter cosine in Q15.",
-        "fft_twiddles48000_960": "The FFT's twiddles: 480 complex pairs in Q15.",
-        "fft_bitrev480": "Input permutation for the 480-point FFT.",
-        "fft_bitrev240": "Input permutation for the 240-point FFT.",
-        "fft_bitrev120": "Input permutation for the 120-point FFT.",
-        "fft_bitrev60": "Input permutation for the 60-point FFT.",
-        "fft_nfft": "Each frame size's FFT length.",
-        "fft_shift": "Each frame size's twiddle stride, as a shift.",
-        "fft_factors": "Each frame size's radix factorisation, 4 by 16.",
-    }
     for name in tables:
         if name not in notes:
             raise SystemExit(f"gen_opus_tables: {name} has no note")
@@ -790,17 +1584,28 @@ extern "C" {
                       "\n")
         body.append(f"/** {notes[name]} */\n"
                     + render(name, kind, values) + "\n")
-    header.append("""
+    header.append(f"""
 #ifdef __cplusplus
-}
+}}
 #endif
 
-#endif // GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_TABLES_H
+#endif // {guard}
 """)
-    files = {
-        "opus_tables.h": "\n".join(header),
-        "opus_tables.c": "\n".join(body),
-    }
+    return {f"{stem}.h": "\n".join(header), f"{stem}.c": "\n".join(body)}
+
+
+def emit(tables, silk, check):
+    """Write both pairs, or compare against what is committed."""
+    files = {}
+    files.update(render_pair(
+        "opus_tables", "GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_TABLES_H",
+        " * The CELT tables, generated.",
+        " * The CELT tables themselves.", tables, CELT_NOTES))
+    files.update(render_pair(
+        "opus_silk_tables",
+        "GHOTI_IO_GAUD_SRC_CODEC_OPUS_OPUS_SILK_TABLES_H",
+        " * The SILK tables, generated.",
+        " * The SILK tables themselves.", silk, SILK_NOTES))
     if check:
         bad = 0
         for name, text in files.items():
@@ -822,7 +1627,5 @@ extern "C" {
             handle.write(text)
         print(f"gen_opus_tables: wrote {path} ({len(text)} bytes)")
     return 0
-
-
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
