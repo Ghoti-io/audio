@@ -31,11 +31,13 @@ every codebook's vector values are printed, because the first draft of
 that constant was chosen rather than measured and saturated on two of the
 ten fixtures.
 
-The output names what is dark. **That is the useful half**: four whole
+The output names what no encoder reaches. **That is the useful half**: five
 arms of the format are reached by nothing any encoder in the oracle image
-produces at any setting, and knowing which four before the decoder is
-written is the difference between a documented gap and a coverage hole
-with an excuse attached.
+produces at any setting, and knowing which before the decoder is written is
+the difference between a documented gap and a coverage hole with an excuse
+attached. They are reached instead by streams written by hand
+(tools/oracle/vorbis_synth.py), and the gate fails if one of the five is
+reached by neither.
 """
 
 import os
@@ -48,50 +50,45 @@ DATA = os.path.join(ROOT, "tests", "data")
 PROBE = os.environ.get("GAUD_VORBIS_PROBE") or os.path.join(
     ROOT, "build", "linux", "release", "apps", "oracle", "vorbis_probe")
 
-#: Arms this corpus cannot reach, why, and what would reach one.
+#: Arms of the format that no encoder in the oracle image produces at any
+#: setting, why, and which check reaches each instead.
 #:
-#: **Each is a feature of the format that no encoder in the oracle image
-#: produces at any setting**, which is a different thing from a feature
-#: nobody has got round to testing. Saying so here, with the reason, is
-#: what keeps the count below honest: a denominator that quietly excluded
-#: these would read as complete coverage.
-UNREACHABLE = {
+#: **Each is a feature of the format that no encoder writes**, which is a
+#: different thing from a feature nobody has got round to testing. Saying
+#: so here, with the reason, is what keeps the counts below honest: a
+#: denominator that quietly excluded these would read as complete coverage.
+#: They are reached by `tools/oracle/vorbis_synth.py`, which writes streams
+#: from the specification, and scored by `make check-vorbis-synth` against
+#: ffmpeg's decoder and libvorbis.
+HAND_WRITTEN_ONLY = {
     "floor type 0": (
         "Line spectral pair floors. In the specification and produced by "
         "neither libvorbis nor libavcodec, because floor 1 superseded it "
-        "before Vorbis I was finished. **Identified and refused**, per "
-        "track rather than by a capability bit: it needs a cosine and a "
-        "square root per spectral line in a decoder that must stay "
-        "integer and byte-identical, and - the deciding reason - nothing "
-        "here could score the approximation. A refusal that says so "
-        "beats an approximation nobody can check."),
+        "before Vorbis I was finished. Decoded in integer arithmetic "
+        "(src/codec/vorbis/vorbis_floor0.c) and scored against two "
+        "decoders on streams written for the purpose."),
     "residue type 0": (
-        "The original residue layout, which interleaves a partition's "
-        "values across the vector where types 1 and 2 keep them "
-        "contiguous. Same history as floor 0: specified, then "
-        "superseded, and no encoder emits it. **Implemented** - it is "
-        "one line's difference from type 1 - and reached by nothing, "
-        "which is a different state from floor 0's and is why the two "
-        "are listed separately."),
+        "The original residue layout, which lays a partition's vectors "
+        "across it where types 1 and 2 keep them end to end. Same history "
+        "as floor 0. The first version of it here was wrong, and nothing "
+        "noticed until a stream was written that used it."),
     "codebook lookup type 2": (
         "A codebook that states every entry's vector explicitly rather "
         "than as a lattice. Legal and enormous - entries times "
         "dimensions multiplicands rather than the lattice's one per axis "
-        "- so no encoder chooses it. Reachable only by hand."),
-    "one side of a coupled pair silent": (
-        "A coupling step reads both of its channels, so if either "
-        "carries something both must have their residue decoded - and a "
-        "decoder that skipped the silent one would read the pair's "
-        "residue out of step. The propagation is implemented and **no "
-        "fixture reaches it**: disabling it outright changes no sample "
-        "of any file here, which is how that was established rather "
-        "than assumed. It needs an encoder that leaves one channel of a "
-        "coupled pair empty while the other is not, and none of the "
-        "signals in this corpus produces one."),
+        "- so no encoder chooses it. ffmpeg's native decoder refuses it; "
+        "libvorbis reads it."),
     "a sequential codebook": (
         "`sequence_p` set, where a vector's values accumulate rather "
-        "than standing alone. Used by floor 0's codebooks, which is why "
-        "it is dark for the same reason floor 0 is."),
+        "than standing alone. Used by floor 0's codebooks."),
+    "one side of a coupled pair silent": (
+        "A coupling step reads both of its channels, so if either "
+        "carries something both must have their residue decoded, and "
+        "the silent one's spectrum is zero because it has no floor. No "
+        "signal in the corpus makes an encoder leave one channel of a "
+        "pair empty while the other is not. Reached by the coupled "
+        "streams, where reading the curve it never wrote changes the "
+        "output."),
 }
 
 
@@ -143,34 +140,47 @@ def main():
     high = 0
     smallest = 0
 
+    hand = set()      # arms the hand-written streams reach
+    encoder = set()   # and the encoders' streams
     for name, parts in parsed:
         kind = parts[0]
+        synthetic = name.startswith("vorbis_syn_")
         if kind == "info":
             blocksizes.add((int(parts[3]), int(parts[4])))
         elif kind == "book":
             books += 1
             lookups[int(parts[4])] += 1
+            if int(parts[4]) == 2:
+                (hand if synthetic else encoder).add("codebook lookup type 2")
             if int(parts[5]):
                 sequential += 1
+                (hand if synthetic else encoder).add("a sequential codebook")
             if int(parts[7]):
                 sparse += 1
             longest = max(longest, int(parts[6]))
             widest = max(widest, int(parts[2]))
             most_entries = max(most_entries, int(parts[3]))
-            low = min(low, int(parts[8]))
-            high = max(high, int(parts[9]))
-            one = int(parts[10])
-            if one and (smallest == 0 or one < smallest):
-                smallest = one
+            if not synthetic:
+                low = min(low, int(parts[8]))
+                high = max(high, int(parts[9]))
+                one = int(parts[10])
+                if one and (smallest == 0 or one < smallest):
+                    smallest = one
         elif kind == "floor":
             floors[int(parts[2])] += 1
+            if int(parts[2]) == 0:
+                (hand if synthetic else encoder).add("floor type 0")
             if int(parts[2]) == 1:
                 multipliers[int(parts[4])] = multipliers.get(
                     int(parts[4]), 0) + 1
         elif kind == "residue":
             residues[int(parts[2])] += 1
+            if int(parts[2]) == 0:
+                (hand if synthetic else encoder).add("residue type 0")
             passes[int(parts[7])] = passes.get(int(parts[7]), 0) + 1
         elif kind == "mapping":
+            if synthetic and int(parts[3]):
+                hand.add("one side of a coupled pair silent")
             submaps[int(parts[2])] = submaps.get(int(parts[2]), 0) + 1
             coupling[int(parts[3])] = coupling.get(int(parts[3]), 0) + 1
         elif kind == "mode":
@@ -216,19 +226,29 @@ def main():
     print("    which is how this came to be measured rather than assumed.")
 
     print()
-    print("Reached by nothing in this corpus, with the reason:")
-    for arm in sorted(UNREACHABLE):
-        print("  %s" % arm)
-        for line in _wrap(UNREACHABLE[arm], 68):
+    print("Reached by no encoder's stream, with the reason and what reaches "
+          "it:")
+    for arm in sorted(HAND_WRITTEN_ONLY):
+        by = []
+        if arm in encoder:
+            by.append("an encoder")
+        if arm in hand:
+            by.append("a hand-written stream")
+        print("  %s  [reached by: %s]" % (arm, ", ".join(by) or "nothing"))
+        for line in _wrap(HAND_WRITTEN_ONLY[arm], 68):
             print("      %s" % line)
+    dark = [arm for arm in HAND_WRITTEN_ONLY
+            if arm not in hand and arm not in encoder]
     print()
-    print("**None of the five is reachable from an encoder.** A corpus "
-          "cannot close them; a hand-built stream can, and two of the "
-          "five have one in tests/unit/test_vorbis.cpp. Of the other "
-          "three, floor 0 is refused rather than implemented, and "
-          "residue 0 and the coupled-pair propagation are implemented "
-          "and unreached - the last of those established by disabling "
-          "it and finding no fixture changed.")
+    print("%d of %d arms are reached only by streams `vorbis_synth.py` "
+          "wrote; %d by an encoder's; %d by nothing."
+          % (len([a for a in HAND_WRITTEN_ONLY if a in hand
+                  and a not in encoder]), len(HAND_WRITTEN_ONLY),
+             len([a for a in HAND_WRITTEN_ONLY if a in encoder]),
+             len(dark)))
+    if dark:
+        raise SystemExit("vorbis-coverage: reached by nothing: %s"
+                         % ", ".join(dark))
 
     # The one assertion this instrument makes. Everything above is a
     # count; this is a bound, because VORBIS_Q depends on it and a

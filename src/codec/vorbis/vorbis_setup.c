@@ -37,7 +37,8 @@
  * A corpus therefore samples encoders and not the format - more sharply
  * than a corpus of MP3s does, because an MP3's tables at least are fixed.
  * notes/audio/vorbis.md names what no encoder in the oracle image
- * produces at any setting, which is floor type 0 and residue type 0.
+ * produces at any setting, which is floor type 0 and residue type 0, and
+ * tools/oracle/vorbis_synth.py writes streams that use them.
  *
  * **Everything a later packet will index is range-checked here.** A
  * mapping names a floor and a residue by number; a residue names
@@ -70,10 +71,16 @@ static GAUD_Result parse_floor(
       if (book >= setup->codebook_count) {
         return GAUD_ERR_CORRUPT;
       }
+      // A floor 0 reads vectors out of its books, so a book with no lookup
+      // or no dimensions cannot be one of them.
+      if (setup->codebooks[book].lookup_type == 0
+          || setup->codebooks[book].dimensions == 0) {
+        return GAUD_ERR_CORRUPT;
+      }
       floor0->books[i] = (unsigned char)book;
     }
     if (bits->past_end || floor0->order == 0 || floor0->bark_map_size == 0
-        || floor0->amplitude_bits == 0 || floor0->amplitude_bits > 32u) {
+        || floor0->rate == 0 || floor0->amplitude_bits > 32u) {
       return GAUD_ERR_CORRUPT;
     }
     return GAUD_OK;

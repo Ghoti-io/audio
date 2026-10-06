@@ -688,6 +688,337 @@ TEST(VorbisDecode, ASeekOntoAPageThatContinuesAPacketIsStillExact) {
   CheckSeeks("vorbis_lib_noise_48000.ogg", 20, true);
 }
 
+namespace {
+
+/** Bits least-significant first, as Vorbis packs them. */
+struct PacketBits {
+  std::vector<unsigned char> bytes;
+  unsigned used = 0;
+  void Write(uint32_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i) {
+      if (used == 0) {
+        bytes.push_back(0);
+      }
+      if ((value >> i) & 1u) {
+        bytes.back() |= (unsigned char)(1u << used);
+      }
+      used = (used + 1) % 8;
+    }
+  }
+  /** A codeword: its first bit is its most significant. */
+  void Code(uint32_t word, unsigned length) {
+    for (unsigned i = length; i-- > 0;) {
+      Write((word >> i) & 1u, 1);
+    }
+  }
+};
+
+uint64_t DigestOf(const std::vector<int16_t> & samples) {
+  uint64_t digest = 1469598103934665603ULL;
+  for (int16_t v : samples) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (uint64_t)(((int64_t)v >> (8 * i)) & 0xFF);
+      digest *= 1099511628211ULL;
+    }
+  }
+  return digest;
+}
+
+double BarkOf(double x) {
+  return 13.1 * atan(.00074 * x) + 2.24 * atan(.0000000185 * x * x)
+      + .0001 * x;
+}
+
+}  // namespace
+
+TEST(VorbisFloor0, TheCosineIsWithinAFewBillionthsOfLibms) {
+  // Q30, so a billionth is about one unit. The angles run from far
+  // negative to far positive through every boundary the reduction has -
+  // multiples of a quarter turn and a hair either side - and then a few
+  // that no stream would state.
+  double worst = 0;
+  std::vector<int64_t> angles;
+  const int64_t quarter = 3373259426LL;
+  for (int64_t k = -40; k <= 40; ++k) {
+    for (int64_t nudge : {-2, -1, 0, 1, 2}) {
+      angles.push_back(k * quarter + nudge);
+    }
+  }
+  uint32_t state = 12345;
+  for (int i = 0; i < 20000; ++i) {
+    state = state * 1664525u + 1013904223u;
+    angles.push_back((int64_t)((int32_t)state) * 8);
+  }
+  angles.push_back((int64_t)1 << 50);
+  angles.push_back(-((int64_t)1 << 50));
+  double worst_far = 0;
+  for (int64_t angle : angles) {
+    double expect = cos((double)angle / 4294967296.0);
+    double got = (double)gaud_vorbis_f0_cos(angle) / 1073741824.0;
+    double error = fabs(expect - got);
+    // Beyond a thousand radians the constant two pi, rounded to 2^-32,
+    // is what limits it: every period adds its own error. No stream
+    // states an angle like that, and the answer is still the same on every
+    // machine, which is what is required of it.
+    if (fabs((double)angle) < 4294967296.0 * 1000.0) {
+      worst = std::max(worst, error);
+    }
+    else {
+      worst_far = std::max(worst_far, error);
+    }
+  }
+  EXPECT_LT(worst, 4e-9) << "worst error " << worst;
+  EXPECT_LT(worst_far, 1e-6) << "worst far error " << worst_far;
+}
+
+TEST(VorbisFloor0, TheArctangentIsWithinAFewHundredMillionthsOfLibms) {
+  double worst = 0;
+  std::vector<int64_t> arguments = {0, 1, 2, 1073741824LL / 2, 1073741824LL,
+      1073741824LL + 1, 1073741824LL - 1, (int64_t)1 << 40};
+  uint32_t state = 777;
+  for (int i = 0; i < 20000; ++i) {
+    state = state * 1664525u + 1013904223u;
+    int shift = (int)(state >> 27); // 0 to 31
+    arguments.push_back((int64_t)(state & 0x7FFFFFFFu) >> (shift > 30 ? 30 : shift));
+  }
+  for (int64_t t : arguments) {
+    double expect = atan((double)t / 1073741824.0);
+    double got = (double)gaud_vorbis_f0_atan(t) / 1073741824.0;
+    worst = std::max(worst, fabs(expect - got));
+  }
+  EXPECT_LT(worst, 3e-8) << "worst error " << worst;
+}
+
+TEST(VorbisFloor0, TheBarkMapFallsInTheBandsTheFormulaSays) {
+  // Section 6.2.3's map, computed here with libm in double precision. The
+  // two can differ only where the formula lands within a hair of a band's
+  // edge, so this counts them and expects almost none - and the references
+  // themselves, working in single precision, disagree with each other
+  // there far more often.
+  struct Config {
+    uint32_t rate;
+    uint32_t bark;
+    uint32_t lines;
+  };
+  size_t lines_total = 0;
+  size_t differing = 0;
+  for (const Config & c : {Config{44100, 256, 1024}, Config{44100, 256, 128},
+           Config{48000, 1000, 4096}, Config{8000, 64, 256},
+           Config{22050, 2, 512}, Config{96000, 256, 1024},
+           Config{16000, 65535, 1024}, Config{44101, 100, 1024},
+           Config{1000, 256, 1024}, Config{65535, 17, 32}}) {
+    std::vector<uint16_t> map(c.lines);
+    gaud_vorbis_f0_bark_map(c.rate, c.bark, c.lines, map.data());
+    double scale = c.bark / BarkOf(c.rate / 2.0);
+    for (uint32_t j = 0; j < c.lines; ++j) {
+      int expect = (int)floor(BarkOf((c.rate / 2.0) / c.lines * j) * scale);
+      if (expect >= (int)c.bark) {
+        expect = (int)c.bark - 1;
+      }
+      ++lines_total;
+      differing += map[j] != expect;
+      EXPECT_LE(abs((int)map[j] - expect), 1) << c.rate << " " << j;
+    }
+  }
+  EXPECT_LE(differing, lines_total / 2000u)
+      << differing << " of " << lines_total;
+}
+
+namespace {
+
+/** The first floor 0 in a fixture and the setup around it. */
+struct Floor0Fixture {
+  Loaded loaded;
+  const VORBIS_File * file = nullptr;
+  const VORBIS_Floor0 * floor = nullptr;
+};
+
+}  // namespace
+
+TEST(VorbisFloor0, TheCurveIsTheSpecificationsFormula) {
+  Floor0Fixture f;
+  ASSERT_EQ(OpenFile(f.loaded, "vorbis_syn_floor0_mono.ogg"), GAUD_OK);
+  f.file = (const VORBIS_File *)gaud_track_private(f.loaded.track());
+  ASSERT_EQ(f.file->setup.floors[0].type, 0u);
+  f.floor = &f.file->setup.floors[0].u.zero;
+  const VORBIS_Codebook * book = &f.file->setup.codebooks[f.floor->books[0]];
+  const uint32_t lines = 1024;
+  std::vector<uint16_t> map(lines);
+  gaud_vorbis_f0_bark_map(f.floor->rate, f.floor->bark_map_size, lines,
+      map.data());
+
+  uint32_t state = 99;
+  double worst = 0;
+  int checked = 0;
+  for (int trial = 0; trial < 60; ++trial) {
+    state = state * 1664525u + 1013904223u;
+    uint32_t amplitude = 1 + (state >> 8) % 63u;
+    // A packet: amplitude, the book number (one bit for one book), and
+    // enough entries to fill the order. The book's code is uniform and
+    // complete, so an entry's codeword is its number.
+    PacketBits w;
+    w.Write(amplitude, f.floor->amplitude_bits);
+    w.Write(0, 1);
+    std::vector<uint32_t> entries;
+    for (uint32_t n = 0; n < f.floor->order; n += book->dimensions) {
+      state = state * 1664525u + 1013904223u;
+      uint32_t entry = (state >> 10) % book->entries;
+      entries.push_back(entry);
+      w.Code(entry, book->lengths[entry]);
+    }
+    VORBIS_Bits bits;
+    gaud_vorbis_bits_init(&bits, w.bytes.data(), w.bytes.size());
+    std::vector<int32_t> mantissa(lines);
+    std::vector<int16_t> shift(lines);
+    bool used = false;
+    ASSERT_EQ(gaud_vorbis_floor0_decode(f.floor, &f.file->setup, &bits, lines,
+                  map.data(), mantissa.data(), shift.data(), &used),
+        GAUD_OK);
+    ASSERT_TRUE(used);
+
+    // The same curve in double precision, from the same coefficients.
+    std::vector<double> lsp;
+    double last = 0;
+    for (uint32_t entry : entries) {
+      int64_t vector[256];
+      gaud_vorbis_codebook_vector_fine(book, entry, vector);
+      for (uint32_t k = 0; k < book->dimensions && lsp.size() < f.floor->order;
+           ++k) {
+        lsp.push_back((double)vector[k] / 4294967296.0 + last);
+      }
+      last = lsp.back();
+    }
+    for (double & x : lsp) {
+      x = 2.0 * cos(x);
+    }
+    uint32_t m = f.floor->order;
+    for (uint32_t j = 0; j < lines; ++j) {
+      double w2 = 2.0 * cos(M_PI / f.floor->bark_map_size * map[j]);
+      double p = .5;
+      double q = .5;
+      uint32_t i = 1;
+      for (; i < m; i += 2) {
+        q *= w2 - lsp[i - 1];
+        p *= w2 - lsp[i];
+      }
+      if (i == m) {
+        q *= w2 - lsp[i - 1];
+        p *= p * (4. - w2 * w2);
+        q *= q;
+      }
+      else {
+        p *= p * (2. - w2);
+        q *= q * (2. + w2);
+      }
+      double off = f.floor->amplitude_offset;
+      double a = (double)amplitude / ((1 << f.floor->amplitude_bits) - 1) * off;
+      double expect = exp((a / sqrt(p + q) - off) * .11512925);
+      double got = (double)mantissa[j] * pow(2.0, -(double)shift[j]);
+      // The curve is bounded at both ends (2^40 above, 2^-100 below), so
+      // a line the formula puts outside that is not compared. Random
+      // coefficients put plenty there: they are not an interlaced set.
+      if (expect < 1e-25 || expect > 1e9) {
+        continue;
+      }
+      worst = std::max(worst, fabs(got / expect - 1.0));
+      ++checked;
+    }
+  }
+  EXPECT_GT(checked, 50000);
+  EXPECT_LT(worst, 1e-5) << "worst relative error " << worst;
+}
+
+namespace {
+
+/** Every sample of a fixture, decoded straight through. */
+std::vector<int16_t> DecodeFixture(const char * name, unsigned * channels) {
+  std::vector<int16_t> all;
+  Loaded loaded;
+  EXPECT_EQ(OpenFile(loaded, name), GAUD_OK) << name;
+  GAUD_Track * track = loaded.track();
+  *channels = gaud_track_layout(track).channels;
+  GAUD_Decoder * decoder = nullptr;
+  GAUD_Buffer * buffer = nullptr;
+  if (gaud_decoder_create(track, &decoder) == GAUD_OK
+      && gaud_decoder_buffer_create(decoder, nullptr, 1024, &buffer)
+          == GAUD_OK) {
+    for (;;) {
+      EXPECT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK) << name;
+      size_t frames = gaud_buffer_frames(buffer);
+      if (frames == 0) {
+        break;
+      }
+      const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+      all.insert(all.end(), data, data + frames * *channels);
+    }
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+  return all;
+}
+
+}  // namespace
+
+TEST(VorbisFloor0, StreamsWrittenForTheUnusedPartsOfTheFormatDecodeAsTheReferencesDo) {
+  // tools/oracle/vorbis_synth.py writes these from the specification:
+  // a floor of type 0 in every shape its parameters allow, residue type
+  // 0, codebooks that state every vector. `make check-vorbis-synth`
+  // scored each against ffmpeg's decoder and libvorbis - no sample more
+  // than two off either, one off in all but a few - and these digests
+  // are what this library's own decode was then. The frame counts are
+  // the specification's, written into the file by the generator.
+  struct One {
+    const char * name;
+    uint64_t samples;
+    uint64_t digest;
+  };
+  for (const One & one : {
+           One{"vorbis_syn_floor0_8000.ogg", 7744, 15747972106037866980ULL},
+           One{"vorbis_syn_floor0_barkmap1.ogg", 11904,
+               9918005369529583434ULL},
+           One{"vorbis_syn_floor0_big_blocks.ogg", 39616,
+               6456521449833447283ULL},
+           One{"vorbis_syn_floor0_coupled.ogg", 47616,
+               6769520699941738338ULL},
+           One{"vorbis_syn_floor0_coupled_res2.ogg", 48512,
+               7684391101132030273ULL},
+           One{"vorbis_syn_floor0_equal_blocks.ogg", 5888,
+               16091302032093961777ULL},
+           One{"vorbis_syn_floor0_explicit_ramp.ogg", 10112,
+               10574510561962775911ULL},
+           One{"vorbis_syn_floor0_explicit_seq.ogg", 15040,
+               7840142512969825284ULL},
+           One{"vorbis_syn_floor0_mono.ogg", 12800, 10071505467492811047ULL},
+           One{"vorbis_syn_floor0_order17_dim1.ogg", 9216,
+               10048464347182690279ULL},
+           One{"vorbis_syn_floor0_order32_dim8.ogg", 11904,
+               3173640078163260182ULL},
+           One{"vorbis_syn_floor0_order64.ogg", 11456,
+               12376354765215560575ULL},
+           One{"vorbis_syn_floor0_order8.ogg", 14144, 3495387106158831558ULL},
+           One{"vorbis_syn_floor0_rate_mismatch.ogg", 10560,
+               9163696892424449560ULL},
+           One{"vorbis_syn_floor0_stereo.ogg", 29184, 16794459185419367056ULL},
+           One{"vorbis_syn_floor0_stereo_res2.ogg", 22016,
+               1882594875512902301ULL},
+           One{"vorbis_syn_res0_mono.ogg", 11904, 6141980546939861337ULL},
+           One{"vorbis_syn_res0_stereo.ogg", 22016,
+               17796420413390126798ULL}}) {
+    unsigned channels = 0;
+    std::vector<int16_t> samples = DecodeFixture(one.name, &channels);
+    EXPECT_EQ(samples.size(), one.samples) << one.name;
+    EXPECT_EQ(DigestOf(samples), one.digest) << one.name;
+    size_t peak = 0;
+    for (int16_t v : samples) {
+      peak = std::max<size_t>(peak, (size_t)std::abs((int)v));
+    }
+    // Loud enough to say something and nowhere near clipping, which tells
+    // two decoders nothing.
+    EXPECT_GT(peak, 1000u) << one.name;
+    EXPECT_LT(peak, 30000u) << one.name;
+  }
+}
+
 TEST(VorbisDecode, EveryFixtureDecodesToTheLengthItStated) {
   /*
    * **The frame count asserted exactly, before anything else is
@@ -1942,4 +2273,90 @@ TEST(VorbisTransform, TheIntegerTransformIsTheSpecificationsFormula) {
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+/* ------------------------------------------------- floor 0's refusals */
+
+TEST(VorbisFloor0, ABookWithNoLookupCannotBeOneOfTheFloorsBooks) {
+  // A floor of type 0 reads vectors out of its books. A book that states
+  // none - lookup type 0, which is how a book that only classifies is
+  // written - is refused when the setup is read, and not when the first
+  // packet reaches for a vector it does not have.
+  BitWriter w;
+  for (char c : std::string("\x05vorbis")) {
+    w.put((unsigned char)c, 8);
+  }
+  w.put(0, 8);            // one codebook
+  w.put(0x564342u, 24);   // its sync pattern
+  w.put(1, 16);           // dimension
+  w.put(2, 24);           // two entries
+  w.put(0, 1);            // not ordered
+  w.put(0, 1);            // not sparse
+  w.put(0, 5);            // length one
+  w.put(0, 5);
+  w.put(0, 4);            // lookup type 0: no vectors
+  w.put(0, 6);            // one time domain transform
+  w.put(0, 16);
+  w.put(0, 6);            // one floor
+  w.put(0, 16);           // of type 0
+  w.put(4, 8);            // order
+  w.put(44100, 16);       // rate
+  w.put(256, 16);         // bark map size
+  w.put(6, 6);            // amplitude bits
+  w.put(100, 8);          // amplitude offset
+  w.put(0, 4);            // one book
+  w.put(0, 8);            // book 0, which has no lookup
+  VORBIS_Setup setup;
+  memset(&setup, 0, sizeof setup);
+  setup.allocator = gaud_allocator_default();
+  EXPECT_EQ(gaud_vorbis_parse_setup(w.bytes().data(), w.bytes().size(), 1,
+                nullptr, &setup),
+      GAUD_ERR_CORRUPT);
+  gaud_vorbis_setup_free(&setup);
+}
+
+TEST(VorbisFloor0, AFloorPacketThatEndsOrNamesNoBookIsNothingOrRefused) {
+  Loaded loaded;
+  ASSERT_EQ(OpenFile(loaded, "vorbis_syn_floor0_mono.ogg"), GAUD_OK);
+  const VORBIS_File * file
+      = (const VORBIS_File *)gaud_track_private(loaded.track());
+  const VORBIS_Floor0 * floor = &file->setup.floors[0].u.zero;
+  const uint32_t lines = 128;
+  std::vector<uint16_t> map(lines);
+  gaud_vorbis_f0_bark_map(floor->rate, floor->bark_map_size, lines, map.data());
+  std::vector<int32_t> mantissa(lines);
+  std::vector<int16_t> shift(lines);
+
+  auto decode = [&](const PacketBits & w, bool * used) {
+    VORBIS_Bits bits;
+    gaud_vorbis_bits_init(&bits, w.bytes.data(), w.bytes.size());
+    return gaud_vorbis_floor0_decode(floor, &file->setup, &bits, lines,
+        map.data(), mantissa.data(), shift.data(), used);
+  };
+  bool used = true;
+  // Amplitude zero: the channel carries nothing, and says so by one field.
+  PacketBits zero;
+  zero.Write(0, floor->amplitude_bits);
+  EXPECT_EQ(decode(zero, &used), GAUD_OK);
+  EXPECT_FALSE(used);
+  // A book number the floor does not have. One book, so a bit of one.
+  PacketBits bad;
+  bad.Write(5, floor->amplitude_bits);
+  bad.Write(1, 1);
+  EXPECT_EQ(decode(bad, &used), GAUD_ERR_CORRUPT);
+  EXPECT_FALSE(used);
+  // A packet that ends before the vectors do carries nothing, as the
+  // reference decoders treat it; it is not an error.
+  PacketBits cut;
+  cut.Write(5, floor->amplitude_bits);
+  cut.Write(0, 1);
+  cut.Write(0, 8);
+  used = true;
+  EXPECT_EQ(decode(cut, &used), GAUD_OK);
+  EXPECT_FALSE(used);
+  // A packet with no bytes at all.
+  PacketBits empty;
+  used = true;
+  EXPECT_EQ(decode(empty, &used), GAUD_OK);
+  EXPECT_FALSE(used);
 }

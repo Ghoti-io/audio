@@ -288,6 +288,20 @@ typedef struct {
   int32_t * values; ///< Owned; NULL when lookup_type is 0.
 
   /**
+   * What the lookup was built from, kept for the one reader that needs
+   * more than sixteen fractional bits: a floor of type 0, whose
+   * coefficients are angles in radians.
+   *
+   * The multiplicands are a lattice's `lookup_values` of them, or
+   * `entries * dimensions` for an explicit lookup; the minimum and the
+   * step are Q32 and bounded.
+   */
+  uint32_t * multiplicands; ///< Owned; NULL when lookup_type is 0.
+  uint32_t lookup_values;   ///< How many multiplicands.
+  int64_t minimum_fine;     ///< The lookup's minimum, Q32.
+  int64_t delta_fine;       ///< Its step, Q32.
+
+  /**
    * The decode tree: two `int32_t` per node, a child index each.
    *
    * Zero is an empty slot, a positive value is the index of an interior
@@ -300,6 +314,23 @@ typedef struct {
   int32_t * tree;    ///< Owned.
   size_t tree_nodes; ///< How many nodes it holds.
 } VORBIS_Codebook;
+
+/**
+ * @brief The vector an entry stands for, with the precision of an angle.
+ *
+ * What gaud_vorbis_codebook_decode() names by number, computed as the
+ * specification does - the lattice's digits or the explicit values, times
+ * the step, plus the minimum, accumulated across the vector when the book
+ * is sequential - in Q32 rather than Q#VORBIS_Q, and each element
+ * bounded so that a running total of a floor's coefficients cannot
+ * overflow.
+ *
+ * @param book A book with a lookup.
+ * @param entry An entry number the book decoded.
+ * @param out Receives `book->dimensions` values.
+ */
+void gaud_vorbis_codebook_vector_fine(
+    const VORBIS_Codebook * book, uint32_t entry, int64_t * out);
 
 /* ----------------------------------------------------------------- floors */
 
@@ -478,6 +509,67 @@ typedef struct {
 GAUD_Result gaud_vorbis_floor_decode(const VORBIS_Floor * floor,
     const VORBIS_Setup * setup, VORBIS_Bits * bits, uint32_t lines,
     unsigned char * out_curve, bool * out_used);
+
+/**
+ * @brief The cosine of an angle, for floor type 0.
+ *
+ * Integer arithmetic and no table: the argument is reduced modulo two pi
+ * and the result is a series to the twelfth power. Within 3e-9 of libm's,
+ * which the unit tests measure.
+ *
+ * @param angle_q32 Radians in Q32; any value.
+ * @return The cosine in Q30.
+ */
+int32_t gaud_vorbis_f0_cos(int64_t angle_q32);
+
+/**
+ * @brief The arctangent of a non-negative number, for floor type 0.
+ *
+ * @param t_q30 The argument in Q30; anything not above 2^40 is within
+ *   2e-8 of libm's.
+ * @return Radians in Q30.
+ */
+int32_t gaud_vorbis_f0_atan(int64_t t_q30);
+
+/**
+ * @brief Which of a floor's Bark bands each spectral line falls in.
+ *
+ * Section 6.2.3: the line's frequency on the Bark scale, scaled so that
+ * half the sampling rate is the last band. Computed once per block size
+ * when a decoder opens, because it depends on nothing in a packet.
+ *
+ * @param rate The floor's own `rate`, in Hz.
+ * @param bark_size The floor's `bark_map_size`.
+ * @param lines How many spectral lines the block has, which is n/2.
+ * @param map Receives one band number per line.
+ */
+void gaud_vorbis_f0_bark_map(
+    uint32_t rate, uint32_t bark_size, uint32_t lines, uint16_t * map);
+
+/**
+ * @brief Decode one channel's floor of type 0 from @p bits.
+ *
+ * What gaud_vorbis_floor_decode() is for floor 1, with the curve held as
+ * a floor pair per spectral line - `mantissa * 2^-shift` - because a
+ * curve of this kind is continuous and the inverse decibel table has only
+ * 256 values.
+ *
+ * @param floor The configuration.
+ * @param setup For the codebooks.
+ * @param bits The packet.
+ * @param lines How many spectral lines.
+ * @param map The Bark band of each, from gaud_vorbis_f0_bark_map().
+ * @param gain_mantissa Receives each line's mantissa, in [2^30, 2^31) or
+ *   zero.
+ * @param gain_shift Receives each line's right shift.
+ * @param out_used Whether the channel carries anything.
+ * @return ::GAUD_OK, or ::GAUD_ERR_CORRUPT for a book number the floor
+ *   does not have.
+ */
+GAUD_Result gaud_vorbis_floor0_decode(const VORBIS_Floor0 * floor,
+    const VORBIS_Setup * setup, VORBIS_Bits * bits, uint32_t lines,
+    const uint16_t * map, int32_t * gain_mantissa, int16_t * gain_shift,
+    bool * out_used);
 
 /**
  * @brief Decode one residue into @p vectors, for the channels wanted.

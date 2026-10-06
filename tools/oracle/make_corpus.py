@@ -48,7 +48,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import oracle_env as oracle  # noqa: E402
+import oracle_env as oracle
+import vorbis_synth  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(HERE))
 DATA = os.path.join(ROOT, "tests", "data")
@@ -1342,6 +1343,17 @@ def main():
     made.append(path)
     print("  %-30s %s" % ("vorbis_tagged_stereo_44100",
                           os.path.getsize(path)))
+
+    # Streams written by hand, for the parts of Vorbis no encoder here
+    # writes - a floor of type 0, a residue of type 0, codebooks that
+    # state every vector. Not made by ffmpeg or libvorbis, and not by this
+    # library either: tools/oracle/vorbis_synth.py writes them from the
+    # specification, deterministically, and `make check-vorbis-synth`
+    # regenerates them and compares the bytes.
+    for name, (data, frames) in vorbis_synth.write_cases(DATA).items():
+        path = os.path.join(DATA, "%s.ogg" % name)
+        made.append(path)
+        print("  %-30s %s" % (name, len(data)))
 
     # Opus. Spelled `.opus`, which is what RFC 7845 asks for and what
     # every reader keys on - unlike Vorbis, where `.ogg` won before Xiph

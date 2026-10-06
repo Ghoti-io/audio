@@ -35,11 +35,13 @@
  *     of the 19 residues in this corpus.
  *   - **Type 1 is contiguous.** Each channel's vector is read on its
  *     own, and a partition's values are consecutive lines of it.
- *   - **Type 0 interleaves within a partition**: a vector of `dimensions`
- *     values from one codebook entry is spread across the partition at
- *     stride `dimensions` rather than written consecutively. It is in
- *     the specification, it is produced by no encoder, and
- *     `make vorbis-coverage` says so.
+ *   - **Type 0 interleaves within a partition**: a partition of `n`
+ *     values is read as `n / dimensions` vectors, and the `i`-th value of
+ *     the `v`-th lands at `i * (n / dimensions) + v` - the vectors are
+ *     laid across the partition and not end to end. It is in the
+ *     specification and produced by no encoder, so nothing checked this
+ *     until a stream was written for the purpose, and the first version
+ *     read it wrongly: see tools/oracle/vorbis_synth.py.
  *
  * Everything else about the three is identical, which is why one function
  * reads all of them and the type decides two line numbers.
@@ -86,17 +88,39 @@ static int32_t add_sat(int32_t a, int32_t b) {
 }
 
 /**
- * Read one codebook vector into @p into, at @p stride.
+ * Read one partition's vectors into @p into.
  *
- * @param stride 1 for types 1 and 2, where a partition's values are
- *   consecutive, and `dimensions` for type 0, where they are interleaved.
+ * @param interleave False for types 1 and 2, where a partition's values are
+ *   consecutive. True for type 0 (section 8.6.2), where a partition of `n`
+ *   values is read as `n / dimensions` vectors and the `i`-th element of
+ *   the `v`-th goes to position `i * (n / dimensions) + v`: the vectors
+ *   are laid across the partition, not end to end.
  * @return false if the packet ran out or the bits matched no codeword,
  *   which for the last packet of a stream is an ordinary end and for any
  *   other packet is a corrupt one. The caller decides which.
  */
 static bool read_vector(const VORBIS_Codebook * book, VORBIS_Bits * bits,
-    int32_t * into, uint32_t count, uint32_t stride) {
-  for (uint32_t at = 0; at < count;) {
+    int32_t * into, uint32_t count, bool interleave) {
+  if (book->dimensions == 0) {
+    return false; /* Would not advance; refused at parse, belt and braces. */
+  }
+  if (interleave) {
+    uint32_t step = count / book->dimensions;
+    for (uint32_t v = 0; v < step; ++v) {
+      uint32_t entry = gaud_vorbis_codebook_decode(book, bits);
+      if (entry == UINT32_MAX) {
+        return false;
+      }
+      const int32_t * values
+          = book->values + (size_t)entry * book->dimensions;
+      for (uint32_t j = 0; j < book->dimensions; ++j) {
+        uint32_t index = v + j * step;
+        into[index] = add_sat(into[index], values[j]);
+      }
+    }
+    return true;
+  }
+  for (uint32_t at = 0; at < count; at += book->dimensions) {
     uint32_t entry = gaud_vorbis_codebook_decode(book, bits);
     if (entry == UINT32_MAX) {
       return false;
@@ -104,7 +128,7 @@ static bool read_vector(const VORBIS_Codebook * book, VORBIS_Bits * bits,
     const int32_t * values
         = book->values + (size_t)entry * book->dimensions;
     for (uint32_t j = 0; j < book->dimensions; ++j) {
-      uint32_t index = stride == 1u ? at + j : at + j * stride;
+      uint32_t index = at + j;
       if (index >= count) {
         /* A codebook whose dimension does not divide the partition. The
          * specification leaves the remainder undefined rather than
@@ -112,11 +136,6 @@ static bool read_vector(const VORBIS_Codebook * book, VORBIS_Bits * bits,
         continue;
       }
       into[index] = add_sat(into[index], values[j]);
-    }
-    at += stride == 1u ? book->dimensions
-                       : book->dimensions * stride;
-    if (book->dimensions == 0) {
-      return false; /* Would not advance; refused at parse, belt and braces. */
     }
   }
   return true;
@@ -238,7 +257,6 @@ GAUD_Result gaud_vorbis_residue_decode(const VORBIS_Residue * residue,
           }
           const VORBIS_Codebook * one = &setup->codebooks[book];
           int32_t * into;
-          uint32_t stride = 1;
           int32_t scratch[256];
           if (interleaved) {
             /*
@@ -256,10 +274,9 @@ GAUD_Result gaud_vorbis_residue_decode(const VORBIS_Residue * residue,
           }
           else {
             into = vectors + (size_t)which * lines + at;
-            stride = residue->type == 0u ? one->dimensions : 1u;
           }
           if (!read_vector(one, bits, into, residue->partition_size,
-                  stride)) {
+                  residue->type == 0u)) {
             return GAUD_ERR_CORRUPT;
           }
           if (interleaved) {

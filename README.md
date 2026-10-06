@@ -56,21 +56,26 @@ This is what is implemented:
   twelve rows two standards also define. See \ref format_mpeg
   "formats/mpeg.md".
 
-- **Vorbis** - Vorbis I in Ogg. **Read.** The three header packets -
-  including the whole setup header, which is the codebooks, both floor
-  types, all three residue types, the channel coupling and the block
+- **Vorbis** - Vorbis I in Ogg, **read and decoded**. The three header
+  packets - including the whole setup header, which is the codebooks, both
+  floor types, all three residue types, the channel coupling and the block
   modes, and which is most of the format - plus the channel count, the
   sample rate, the two block sizes, the tags out of the comment header,
-  and the length. The length is the
-  part worth naming: a Vorbis stream states it *nowhere* - not in a
-  header, not in a trailer - so the only answer is the granule position
-  on its last page, and reading it is what `make check-vorbis` scores
-  against two independent readers. The codec declares
-  `GAUD_CAP_METADATA_READ` and not `GAUD_CAP_DECODE`, so a program that
-  asks for a decoder is told ::GAUD_ERR_UNSUPPORTED rather than finding
-  out from this paragraph. **A format that is identified and not decoded
-  is a reasonable commit and an unreasonable release**, and this sentence
-  is here to be deleted.
+  and the length. The length is the part worth naming: a Vorbis stream
+  states it *nowhere* - not in a header, not in a trailer - so the only
+  answer is the granule position on its last page, and reading it is what
+  `make check-vorbis` scores against two independent readers. The decoder
+  is integer throughout and produces **the same bytes on every
+  architecture**, and agrees with ffmpeg's native Vorbis decoder to one
+  least significant bit over 66,321 samples. **A seek bisects the file
+  and is exact**: nothing a block carries to the next is state except its
+  lap, so landing on a page and decoding the block that provides it reads
+  what a straight read reads. **Floor type 0, residue type 0 and codebooks
+  that state every vector are decoded** though no encoder here writes
+  them: `tools/oracle/vorbis_synth.py` writes streams that use them from
+  the specification, and `make check-vorbis-synth` scores the decode
+  against ffmpeg's decoder and libvorbis, within two least significant bits
+  of both. No encoder yet: phase 8.
 
 - **Opus** - RFC 6716 in Ogg, RFC 7845's mapping, **read and decoded**:
   SILK, CELT and the hybrid of the two, mono and stereo, every frame size
@@ -366,8 +371,9 @@ How it is judged:
 | `make check-mpeg-input` | The MPEG decode against **the signal the encoder was given**, which is the only decode gate here that consults no other decoder - and it exists because MPEG-2.5's band tables are in no standard and both references carry the same copy of them, so a differential against those two cannot see a table they agree on and that is wrong. The corpus is synthesised from closed-form expressions, so the input is regenerated rather than stored. Every band the encoder kept is within 1.96 dB of it - 0.71 dB at 8 kHz, 0.65 on the MPEG-1 calibration, 1.96 at 12 kHz where the encoder has least room; with the 8 kHz row deliberately replaced by the 16 kHz one the same measurement reads 5.24 and 6.33 dB, so the 3 dB threshold sits a decibel above the worst correct answer and two below the wrong one. Four wrong answers, a spectral tilt and a low-pass among them, must be rejected |
 | `make check-opus` | What an Opus stream *is*, against **three** readers that reconcile exactly - which is why this gate has no exclusions at all - and what it *sounds like*, against the fourth use of one of them. `opusdec` decodes the number of frames we report, `opusinfo` prints our playback length, and `ffprobe`'s `duration_ts` is ours **plus the pre-skip**, on every fixture: ffmpeg reports the granule position and we report the recording, checked as that equation rather than set aside. 15 fixtures, 105 comparisons, 15 more against the frame count the generator fed the encoder, and 5 controls - one of them the pre-skip left in, which is the error this format invites and no other here can make. Then the samples: every mono and stereo fixture (14) is decoded by `opusdec` and by this library through the whole Ogg path and put to **`opus_compare`**, the tool RFC 6716 defines conformance by, with 26 controls (silence, and the right signal at half amplitude) that it must reject. The six-channel fixture is scored sample for sample against RFC 6716's own decoder in the unit tests instead, because `opus_compare` takes one or two channels |
 | `make check-opus-vectors` | **RFC 6716 section 6, in full**, on its twelve conformance vectors (75 MB, fetched deliberately by `make opus-vectors`, pinned by hash): every one of 20,075 packets ends on exactly the reference's final range decoder state; `opus_compare` accepts every output; and every output is *identical to the bit* to what the RFC's own fixed-point decoder, patched as RFC 8251 says, writes, which section 6 does not ask for and which is pinned per vector. It was seen to fail: a single wrong all-pass coefficient in the resampler leaves every range state intact and is caught by the other two |
+| `make check-vorbis-synth` | The Vorbis decode of **eighteen streams written by hand** for the parts of the format no encoder writes - a floor of type 0 in every shape its parameters allow, residue type 0, books that state every vector, coupled pairs with one channel silent - against ffmpeg's native decoder and libvorbis, which are two implementations and agree with each other to one bit: 34 comparisons over 658,112 samples, none more than **two of 32,768** off. The fixtures are regenerated and compared byte for byte, the frame counts are the specification's own arithmetic, and three wrong answers must be rejected. One exclusion, asserted rather than assumed: ffmpeg's decoder refuses a lookup-type-2 book, so those two are scored against libvorbis alone |
 | `make check-vorbis` | The Vorbis decode against ffmpeg's native decoder, and what a Vorbis stream *is* against two independent readings of it. 66,321 samples compared, worst difference **one of 32,768**; 60 comparisons of rate, channels and length against `ffprobe`'s `duration_ts` and libsndfile, and 10 more against the frame count the generator fed each encoder, which involves no decoder at all. Nine wrong answers go through the same comparison and must be rejected, six decibels down and silence among them. **Two exclusions, and they point opposite ways**: ffmpeg's demuxer gets the length wrong, and libsndfile *wraps* on the samples that exceed full scale where ffmpeg clips - 60 of one fixture's 1,601 do, and ffmpeg's float output agrees with ours to five decimal places there. Two questions, two answers, the same two tools |
-| `make check-golden` | 106 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only. **Phase 5 is what this gate was built for**, and phase 6 is what it earned: an MPEG decoder is a filterbank and an inverse transform, a Vorbis decoder is a fast Fourier transform with its own rounding at every stage, and byte-identical output everywhere is a promise about this library that no floating-point reference can be asked to confirm |
+| `make check-golden` | 124 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only. **Phase 5 is what this gate was built for**, and phase 6 is what it earned: an MPEG decoder is a filterbank and an inverse transform, a Vorbis decoder is a fast Fourier transform with its own rounding at every stage, and byte-identical output everywhere is a promise about this library that no floating-point reference can be asked to confirm |
 | `make check-outoftree` | A codec in another repository works |
 | `make fuzz` | Six harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, `coded`, which drives the block layer below any container because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does, and `mpeg`, where the opposite is true: MPEG audio has no container to synthesise, so nearly every input reaches the frame search. `coded` found a real defect in its first minute; `mpeg` found two in its first ten, and neither was a crash - a header struct whose padding made two parses of one header compare unequal, and a document whose audio began past the end of its own file. **It then found eight more on a corpus that had grown since**, all one defect: every addition in the Q28 pipeline was signed overflow on a frame that states a legal global_gain near the top of its eight-bit range. The corpus is tracked in the repository for exactly this - it is the population that walks the arithmetic, and a run against a bigger one is a different experiment |
 | `make mpeg-coverage` | The same instrument for MPEG audio, and the same reason: 63 of 72 named arms are reached by the corpus, and **no reachable arm is now unreached**. Two of the remaining nine are unreachable by construction (the standard marks those Huffman tables unused), five need an encoder nothing in the image is - LAME has never implemented intensity stereo, and nothing emits a mixed block - and two are covered by unit tests on hand-built frames instead. The last five Huffman tables fell to one change: giving the stereo noise and transient fixtures channels that actually differ |

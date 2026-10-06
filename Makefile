@@ -830,6 +830,11 @@ check-vorbis: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_vorbis.py
 
+check-vorbis-synth: ## Fail if a reference decodes the hand-written Vorbis streams differently
+check-vorbis-synth: $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
+		python3 $(ORACLE)/check_vorbis_synth.py
+
 check-writer: ## Fail if a reference cannot read what our writer produced
 check-tags: ## Fail if a reference reads our tags differently than we do
 check-tags: $(TAG_PROBE)
@@ -966,7 +971,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: opus-vectors check-opus-vectors check-opus-tables
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
-.PHONY: vorbis-coverage check-opus
+.PHONY: vorbis-coverage check-opus check-vorbis-synth
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands

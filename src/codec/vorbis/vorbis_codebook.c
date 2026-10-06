@@ -71,11 +71,11 @@
  * because a right shift of a negative value is implementation-defined in
  * C and this library promises the same bytes on every platform.
  */
-static int64_t float32_unpack_q(uint32_t packed) {
+static int64_t float32_unpack_q(uint32_t packed, unsigned q) {
   int64_t magnitude = (int64_t)(packed & 0x1FFFFFu);
   int exponent = (int)((packed & 0x7FE00000u) >> 21);
   bool negative = (packed & 0x80000000u) != 0;
-  int shift = exponent - 788 + (int)VORBIS_Q;
+  int shift = exponent - 788 + (int)q;
 
   int64_t value;
   if (shift >= 0) {
@@ -97,6 +97,19 @@ static int64_t float32_unpack_q(uint32_t packed) {
     value = (magnitude + half) >> -shift;
   }
   return negative ? -value : value;
+}
+
+/** The largest magnitude a fine value or step may have: 256 radians in Q32. */
+#define VORBIS_FINE_LIMIT ((int64_t)1 << 40)
+
+static int64_t clamp_fine(int64_t value) {
+  if (value > VORBIS_FINE_LIMIT) {
+    return VORBIS_FINE_LIMIT;
+  }
+  if (value < -VORBIS_FINE_LIMIT) {
+    return -VORBIS_FINE_LIMIT;
+  }
+  return value;
 }
 
 /** Saturating narrowing to the spectrum's word, as the MPEG decoder does. */
@@ -332,12 +345,43 @@ static GAUD_Result build_values(const GAUD_Allocator * allocator,
   return GAUD_OK;
 }
 
+void gaud_vorbis_codebook_vector_fine(
+    const VORBIS_Codebook * book, uint32_t entry, int64_t * out) {
+  int64_t last = 0;
+  uint32_t divisor = 1;
+  for (uint32_t j = 0; j < book->dimensions; ++j) {
+    uint32_t offset;
+    if (book->lookup_type == 1u) {
+      offset = (entry / divisor) % book->lookup_values;
+      divisor *= book->lookup_values;
+    }
+    else {
+      offset = entry * book->dimensions + j;
+    }
+    int64_t value = book->minimum_fine
+        + (int64_t)book->multiplicands[offset] * book->delta_fine + last;
+    // Each element is bounded so that a running total of two hundred and
+    // fifty-six of them, which a floor adds to, cannot overflow.
+    if (value > ((int64_t)1 << 50)) {
+      value = (int64_t)1 << 50;
+    }
+    else if (value < -((int64_t)1 << 50)) {
+      value = -((int64_t)1 << 50);
+    }
+    out[j] = value;
+    if (book->sequence_p) {
+      last = value;
+    }
+  }
+}
+
 void gaud_vorbis_codebook_free(
     const GAUD_Allocator * allocator, VORBIS_Codebook * book) {
   gcu_allocator_free(allocator, book->lengths);
   gcu_allocator_free(allocator, book->codewords);
   gcu_allocator_free(allocator, book->entry_of);
   gcu_allocator_free(allocator, book->values);
+  gcu_allocator_free(allocator, book->multiplicands);
   gcu_allocator_free(allocator, book->tree);
   memset(book, 0, sizeof(*book));
 }
@@ -450,8 +494,15 @@ GAUD_Result gaud_vorbis_parse_codebook(VORBIS_Bits * bits,
     return GAUD_ERR_CORRUPT; /* A vector of no values. */
   }
 
-  int64_t minimum = float32_unpack_q(gaud_vorbis_bits_read(bits, 32));
-  int64_t delta = float32_unpack_q(gaud_vorbis_bits_read(bits, 32));
+  uint32_t minimum_packed = gaud_vorbis_bits_read(bits, 32);
+  uint32_t delta_packed = gaud_vorbis_bits_read(bits, 32);
+  int64_t minimum = float32_unpack_q(minimum_packed, VORBIS_Q);
+  int64_t delta = float32_unpack_q(delta_packed, VORBIS_Q);
+  // The same two numbers with room for an angle's precision, for a floor
+  // of type 0, whose coefficients are radians and cannot be held to
+  // sixteen fractional bits: see gaud_vorbis_codebook_vector_fine().
+  out->minimum_fine = clamp_fine(float32_unpack_q(minimum_packed, 32));
+  out->delta_fine = clamp_fine(float32_unpack_q(delta_packed, 32));
   unsigned value_bits = (unsigned)gaud_vorbis_bits_read(bits, 4) + 1u;
   out->sequence_p = gaud_vorbis_bits_read(bits, 1) != 0;
   if (bits->past_end) {
@@ -477,6 +528,8 @@ GAUD_Result gaud_vorbis_parse_codebook(VORBIS_Bits * bits,
     multiplicands[i] = gaud_vorbis_bits_read(bits, value_bits);
   }
   GAUD_Result result = bits->past_end ? GAUD_ERR_CORRUPT : GAUD_OK;
+  out->multiplicands = multiplicands;
+  out->lookup_values = lookup_values;
   if (result == GAUD_OK) {
     /* `delta` is multiplied by a `value_bits`-wide multiplicand, so the
      * product is bounded by 2^16 times what float32_unpack_q returned -
@@ -485,6 +538,5 @@ GAUD_Result gaud_vorbis_parse_codebook(VORBIS_Bits * bits,
     result = build_values(
         allocator, out, multiplicands, lookup_values, minimum, delta);
   }
-  gcu_allocator_free(allocator, multiplicands);
   return result;
 }

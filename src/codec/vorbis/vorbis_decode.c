@@ -90,6 +90,18 @@ typedef struct {
 
   int32_t * residue;  ///< channels by long_block/2, in Q#VORBIS_Q.
   unsigned char * curves; ///< channels by long_block/2, floor indices.
+  /**
+   * Floor 0's curves, which are values and not indices: a mantissa and a
+   * right shift per line, channels by long_block/2. Allocated only for a
+   * stream that has a floor of that type.
+   */
+  int32_t * gain_mantissa;
+  int16_t * gain_shift;       ///< See @p gain_mantissa.
+  /**
+   * The Bark band of each line, for each floor of type 0 and each block
+   * size: entry `floor * 2 + (long ? 1 : 0)`, NULL for a floor of type 1.
+   */
+  uint16_t ** bark_maps;
   int32_t * spectrum; ///< long_block/2, in Q#VORBIS_SPECTRUM_Q.
   int32_t * scratch;  ///< long_block, for the transform.
   int32_t * block;    ///< long_block, the transform's output.
@@ -251,6 +263,22 @@ static unsigned log2_of(uint32_t n) {
   return bits;
 }
 
+/** Release what a floor of type 0 needs. */
+static void free_floor0(VORBIS_Decoder * state) {
+  const GAUD_Allocator * allocator = state->allocator;
+  if (state->bark_maps) {
+    for (uint32_t i = 0; i < state->doc_state->setup.floor_count * 2u; ++i) {
+      gcu_allocator_free(allocator, state->bark_maps[i]);
+    }
+  }
+  gcu_allocator_free(allocator, state->bark_maps);
+  gcu_allocator_free(allocator, state->gain_mantissa);
+  gcu_allocator_free(allocator, state->gain_shift);
+  state->bark_maps = NULL;
+  state->gain_mantissa = NULL;
+  state->gain_shift = NULL;
+}
+
 static void decoder_close(GAUD_Decoder * decoder) {
   VORBIS_Decoder * state = gaud_decoder_private(decoder);
   if (!state) {
@@ -260,6 +288,7 @@ static void decoder_close(GAUD_Decoder * decoder) {
   gaud_ogg_reader_free(&state->reader);
   gcu_allocator_free(allocator, state->residue);
   gcu_allocator_free(allocator, state->curves);
+  free_floor0(state);
   gcu_allocator_free(allocator, state->spectrum);
   gcu_allocator_free(allocator, state->scratch);
   gcu_allocator_free(allocator, state->block);
@@ -409,15 +438,26 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
   // spectrum is zero, because there is no envelope to scale it by. Its
   // curve was never written.
   bool has_floor[256];
+  bool floor_is_zero[256];
   if (state->channels > 256u) {
     return GAUD_ERR_UNSUPPORTED;
   }
   for (uint32_t ch = 0; ch < state->channels; ++ch) {
-    const VORBIS_Floor * floor
-        = &setup->floors[mapping->floor[mapping->mux[ch]]];
+    uint32_t floor_index = mapping->floor[mapping->mux[ch]];
+    const VORBIS_Floor * floor = &setup->floors[floor_index];
     bool one = false;
-    GAUD_Result result = gaud_vorbis_floor_decode(floor, setup, &bits,
-        lines, state->curves + (size_t)ch * (state->long_block / 2u), &one);
+    GAUD_Result result;
+    floor_is_zero[ch] = floor->type == 0;
+    if (floor->type == 0) {
+      size_t at = (size_t)ch * (state->long_block / 2u);
+      result = gaud_vorbis_floor0_decode(&floor->u.zero, setup, &bits, lines,
+          state->bark_maps[floor_index * 2u + (mode->block_flag ? 1u : 0u)],
+          state->gain_mantissa + at, state->gain_shift + at, &one);
+    }
+    else {
+      result = gaud_vorbis_floor_decode(floor, setup, &bits, lines,
+          state->curves + (size_t)ch * (state->long_block / 2u), &one);
+    }
     if (result != GAUD_OK) {
       return result;
     }
@@ -599,9 +639,18 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
       memset(state->block, 0, (size_t)n * sizeof(*state->block));
     }
     else {
+      const int32_t * gain_m = state->gain_mantissa
+          ? state->gain_mantissa + (size_t)ch * (state->long_block / 2u)
+          : NULL;
+      const int16_t * gain_s = state->gain_shift
+          ? state->gain_shift + (size_t)ch * (state->long_block / 2u)
+          : NULL;
       for (uint32_t j = 0; j < lines; ++j) {
-        int32_t mantissa = gaud_vorbis_floor_db[curve[j]][0];
-        int32_t floor_shift = gaud_vorbis_floor_db[curve[j]][1];
+        int32_t mantissa = floor_is_zero[ch] ? gain_m[j]
+                                             : gaud_vorbis_floor_db[curve[j]][0];
+        int32_t floor_shift = floor_is_zero[ch]
+            ? gain_s[j]
+            : gaud_vorbis_floor_db[curve[j]][1];
         /* residue is Q#VORBIS_Q and the floor is mantissa >> shift, so
          * the product reaches Q#VORBIS_SPECTRUM_Q with a shift of
          * `floor_shift + VORBIS_Q - VORBIS_SPECTRUM_Q`. */
@@ -613,7 +662,17 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
           product >>= right;
         }
         else if (right < 0) {
-          product <<= -right;
+          // Only a floor of type 0 can be louder than one, and its curve
+          // is bounded, so the shift is at most a few places; the product
+          // is clamped first so that it cannot overflow.
+          int64_t bound = INT64_MAX >> (-right + 1);
+          if (product > bound) {
+            product = bound;
+          }
+          else if (product < -bound) {
+            product = -bound;
+          }
+          product *= (int64_t)1 << -right;
         }
         if (product > INT32_MAX) {
           product = INT32_MAX;
@@ -1096,14 +1155,6 @@ GAUD_Result gaud_vorbis_decoder_open(
   if (!doc_state) {
     return GAUD_ERR_INTERNAL;
   }
-  /* Floor 0 is identified and refused; see vorbis_floor.c for why. A
-   * per-track answer, which is what a capability bit cannot give. */
-  for (uint32_t i = 0; i < doc_state->setup.floor_count; ++i) {
-    if (doc_state->setup.floors[i].type == 0) {
-      return GAUD_ERR_UNSUPPORTED;
-    }
-  }
-
   const GAUD_Allocator * allocator = doc_state->allocator;
   VORBIS_Decoder * state = gcu_allocator_malloc(allocator, sizeof(*state));
   if (!state) {
@@ -1142,6 +1193,43 @@ GAUD_Result gaud_vorbis_decoder_open(
   }
   memset(state->tail, 0, per_channel * sizeof(int32_t));
 
+  // Floors of type 0 need the Bark band of each line, which depends on
+  // nothing in a packet, and a curve held as values.
+  bool has_zero = false;
+  for (uint32_t i = 0; i < doc_state->setup.floor_count; ++i) {
+    has_zero = has_zero || doc_state->setup.floors[i].type == 0;
+  }
+  state->bark_maps = gcu_allocator_calloc(allocator,
+      (size_t)doc_state->setup.floor_count * 2u, sizeof(*state->bark_maps));
+  if (!state->bark_maps) {
+    goto Fail;
+  }
+  if (has_zero) {
+    state->gain_mantissa = gcu_allocator_malloc(
+        allocator, per_channel * sizeof(*state->gain_mantissa));
+    state->gain_shift = gcu_allocator_malloc(
+        allocator, per_channel * sizeof(*state->gain_shift));
+    if (!state->gain_mantissa || !state->gain_shift) {
+      goto Fail;
+    }
+    for (uint32_t i = 0; i < doc_state->setup.floor_count; ++i) {
+      const VORBIS_Floor * floor = &doc_state->setup.floors[i];
+      if (floor->type != 0) {
+        continue;
+      }
+      for (uint32_t flag = 0; flag < 2u; ++flag) {
+        uint32_t lines = (flag ? state->long_block : state->short_block) / 2u;
+        uint16_t * map = gcu_allocator_malloc(allocator, lines * sizeof(*map));
+        if (!map) {
+          goto Fail;
+        }
+        state->bark_maps[i * 2u + flag] = map;
+        gaud_vorbis_f0_bark_map(floor->u.zero.rate,
+            floor->u.zero.bark_map_size, lines, map);
+      }
+    }
+  }
+
   gaud_ogg_reader_init(
       &state->reader, gaud_doc_stream(gaud_track_doc(track)), allocator);
   state->reader.serial = doc_state->serial;
@@ -1161,6 +1249,7 @@ Fail:
   gaud_ogg_reader_free(&state->reader);
   gcu_allocator_free(allocator, state->residue);
   gcu_allocator_free(allocator, state->curves);
+  free_floor0(state);
   gcu_allocator_free(allocator, state->spectrum);
   gcu_allocator_free(allocator, state->scratch);
   gcu_allocator_free(allocator, state->block);

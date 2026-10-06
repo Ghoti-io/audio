@@ -78,14 +78,10 @@ static const GAUD_Codec_Magic ogg_magics[] = {
 /**
  * The codec itself.
  *
- * `GAUD_CAP_DECODE` holds for every floor type 1 stream, which is every
- * stream any encoder writes. **Floor type 0 is identified and refused**,
- * per track rather than by a capability bit: it is a line spectral pair
- * curve needing a cosine and a square root per spectral line in a
- * decoder this library promises to keep integer and byte-identical
- * everywhere, and - the deciding reason - nothing in the oracle image
- * produces one, so a fixed-point approximation of it could not be
- * scored. src/codec/vorbis/vorbis_floor.c says it at length.
+ * `GAUD_CAP_DECODE` holds for every stream, floor type 0 included: that
+ * is decoded in integer arithmetic (vorbis_floor0.c) and scored against
+ * two decoders on streams written for the purpose, since no encoder
+ * writes one.
  *
  * No encoder: phase 8 brings the perceptual ones, with the two-gate
  * harness their output needs.

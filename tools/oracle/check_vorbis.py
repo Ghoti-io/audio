@@ -362,7 +362,12 @@ def main():
     if not os.path.isfile(PROBE):
         raise SystemExit(
             "dump_probe is not built: %s\nRun `make oracle-probe`." % PROBE)
+    # The streams tools/oracle/vorbis_synth.py writes are scored by their
+    # own gate, check_vorbis_synth.py: they were never written by an
+    # encoder, so there is no recorded input length for the controls here
+    # to be made from, and what they test is not what this gate tests.
     files = sorted(f for f in os.listdir(DATA) if f.startswith("vorbis_")
+                   and not f.startswith("vorbis_syn_")
                    and f.endswith(".ogg"))
     if not files:
         raise SystemExit("no Vorbis fixtures in tests/data, so this gate is "

@@ -56,7 +56,7 @@
  * *skipped* when the curve is rendered. A decoder that rendered through
  * it draws a curve with the right values at the wrong X positions.
  *
- * Floor 0 is here too, and it is refused. See the comment on it.
+ * Floor 0 is in vorbis_floor0.c, and is not integer by nature: see there.
  */
 
 #include "vorbis_internal.h"
@@ -334,28 +334,13 @@ GAUD_Result gaud_vorbis_floor_decode(const VORBIS_Floor * floor,
         out_used);
   }
   /*
-   * **Floor 0 is identified and refused, and the refusal is honest about
-   * why.** It is a line spectral pair curve: the packet states an
-   * amplitude and a set of LSP coefficients, and the curve is the
-   * magnitude response of the polynomial they describe - which needs a
-   * cosine and a square root per spectral line, in a decoder this
-   * library promises to keep integer and byte-identical everywhere
-   * (planning/audio.md section 11.1).
-   *
-   * That is doable and is not the reason it is not done. The reason is
-   * that **nothing can score it.** No encoder in the oracle image emits
-   * floor 0 at any setting - `make vorbis-coverage` says so - and the
-   * fixed-point approximation of a transcendental curve is exactly the
-   * kind of code whose error nobody notices without a reference to
-   * compare against. A refusal that says so is better than an
-   * approximation nobody can check.
-   *
-   * A stream using it opens and reports its length; asking it to decode
-   * answers ::GAUD_ERR_UNSUPPORTED, which is a per-track answer a
-   * capability bit cannot give.
+   * Floor 0 has its own entry point, gaud_vorbis_floor0_decode(): its
+   * curve is continuous, so it is held as a value per line and not as one
+   * of floor 1's 256 table entries, and the caller already knows which
+   * kind it has. This one is called for floor 1 only.
    */
   (void)lines;
   (void)out_curve;
   *out_used = false;
-  return GAUD_ERR_UNSUPPORTED;
+  return GAUD_ERR_INVALID;
 }

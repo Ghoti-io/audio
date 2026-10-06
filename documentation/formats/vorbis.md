@@ -80,17 +80,6 @@ count (see `notes/audio/vorbis.md`).
 
 ## What is not
 
-**Floor type 0.** A stream using it opens and reports its length, and
-asking it for a decoder answers ::GAUD_ERR_UNSUPPORTED - a per-track
-answer a capability bit cannot give. It is a line spectral pair curve
-needing a cosine and a square root per spectral line in a decoder that
-must stay integer and byte-identical everywhere, which is doable and is
-not the reason it is absent. The reason is that **nothing can score it**:
-no encoder in the oracle image emits one at any setting, and a
-fixed-point approximation of a transcendental curve is exactly the kind
-of code whose error nobody notices without a reference. A refusal that
-says so is better than an approximation nobody can check.
-
 **Seeking bisects, and is exact.** Nothing a Vorbis block carries to the
 next is state except its lap, so a seek lands on a page near the target
 (src/container/ogg/ogg_seek.c's bisection), decodes the first block there
@@ -108,27 +97,67 @@ than what it decodes to.
 **Writing.** Phase 8 brings the perceptual encoders with the two-gate
 harness their output needs.
 
-**Four arms of the format that no corpus here can reach.** `make
-vorbis-coverage` names them with the reason, which is the same reason for
-all four: nothing libvorbis or libavcodec produces at any setting uses
-them.
+**Orders of floor 0 above sixty-four are not scored.** The references
+compute the curve's two products in single precision, and past about order
+sixty-four they overflow it; what comes out is not a reference. The decode
+handles any order the format states (255), and is exact in the sense this
+library means by it, but nothing can say it is right.
+
+**Floor 0's loudness is bounded.** Its curve is held as a floor pair
+whose power of two is limited to 2^40 above and 2^-100 below, and a
+spectral line saturates at eight. A stream whose floor is louder than that
+is clipping in every decoder, and they disagree about how.
+
+**Writing.** Phase 8 brings the perceptual encoders with the two-gate
+harness their output needs.
+
+## Floor type 0 and the parts no encoder writes
+
+**Five arms of the format that no encoder here reaches**, which `make
+vorbis-coverage` names with the reason, and which are reached instead by
+streams `tools/oracle/vorbis_synth.py` writes from the specification:
 
 | arm | why no encoder emits it |
 | --- | --- |
 | floor type 0 | Line spectral pairs. Superseded by floor 1 before Vorbis I was finished |
-| residue type 0 | The original layout, which interleaves a partition's values where types 1 and 2 keep them contiguous. Same history |
+| residue type 0 | The original layout, which lays a partition's vectors across it where types 1 and 2 keep them end to end. Same history |
 | codebook lookup type 2 | States every entry's vector explicitly rather than as a lattice: entries times dimensions multiplicands where a lattice stores one per axis, so it is legal and enormous |
 | a sequential codebook | `sequence_p`, where a vector's values accumulate. Used by floor 0's codebooks and nothing else |
+| one side of a coupled pair silent | A channel used for the residue because its partner is, with no floor of its own: its spectrum is zero |
 
-Two of the four - lookup type 2 and `sequence_p` - have hand-built
-streams in the unit tests, which is the only way to reach either. Floor
-type 0 is refused rather than implemented, above. Residue type 0 *is*
-implemented - it differs from type 1 only in where a partition's values
-land, which is one line - and is reached by nothing, which the coverage
-instrument says rather than leaving it to be assumed.
+**Floor type 0 is decoded in integer arithmetic** (src/codec/vorbis/vorbis_floor0.c),
+which is the part the earlier version of this page called not worth
+attempting for want of anything to score it against. The curve is a
+cosine per coefficient and per Bark band, a square root, and an
+exponential, and the map from a line to its band is two arctangents; each
+is computed with a series on 64-bit integers, to within a few billionths
+of libm's (the unit tests measure it), and the products that span many
+decades are carried as a 32-bit mantissa and an exponent. The curve comes
+out as the same floor pair the inverse decibel table holds. A codebook
+used by a floor of this type keeps its lattice at Q32, because the angles
+it holds cannot live in the residue's Q16.
 
-**Recording this before the decoder is written is the point.** Found
-afterwards, the same four are a coverage hole with an excuse attached.
+**What scores it** is `make check-vorbis-synth`: eighteen streams, each
+chosen for one thing - the parity of the order, a book of one dimension and
+of eight, books that state every vector, a floor rate that is not the
+stream's, a band map of one band, block sizes from 64 to 8,192, coupled
+pairs - decoded by ffmpeg's native Vorbis decoder and by libvorbis, which
+agree with each other to one least significant bit, and compared with this
+library's decode: none more than two off either, and byte-identical output
+on two big-endian targets. Mutating the decoder in eleven places - the
+decibel constant, the odd order's last factor, the even order's, the Bark
+scale's, the offset a vector carries to the next, the amplitude offset,
+the codebook's minimum and its accumulation, the band index, the
+product's precision, and the residue's interleave - fails the gate and the
+unit tests every time.
+
+**It found a defect in residue type 0**, which was implemented and had
+nothing to say it was right: a partition's vectors were laid at the wrong
+stride, so every stream using it decoded to noise. The first stream written
+for it failed against both references by thousands of units. And it found
+the unwritten-curve read of a coupled channel with no floor, which
+Valgrind had reported on two fixtures that did not depend on it, and which
+changes the output of the coupled streams.
 
 ## What the corpus does cover, measured
 
