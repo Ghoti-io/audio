@@ -112,15 +112,21 @@ says a decoder should, in the fixed-point form libopus uses: the gain in
 Q7.8 decibels becomes a base-two logarithm, then a multiplier, and the
 result is rounded and clamped to plus or minus 32,767.
 
-**Seeking decodes from the start.** An Opus decoder's state converges
-rather than resets, which is why RFC 7845 suggests 80 ms of pre-roll
-before the target. Starting part-way through would give samples that
-differ in their last bits from a straight read's, and nothing here could
-then say which was right. So a seek decodes forward from the beginning
-and reads exactly what reading would have read, at the cost of a seek
-taking as long as decoding to the target. The page bisection in the Ogg
-layer would remove the cost, and using it is a decision about giving up
-that guarantee.
+**Seeking bisects, and the samples after it converge.** An Opus
+decoder's state converges rather than resets, which is why RFC 7845
+section 4.6 asks for 80 ms of pre-roll before the target. A seek does
+that: the Ogg layer's bisection finds the last page at or before 80 ms
+ahead of the target, every decoder is reset there, and the packets from
+it are decoded and dropped until the target. What is given up is
+bit-identity with a straight read. The samples right after a far seek
+differ from it, by a lot for a full-scale voiced tone, which is the worst
+case for a decoder that started part-way, and they converge: the
+decoder is the reference's, so another Opus decoder started on the same
+page reads the same. Three cases stay exact because they decode on from
+where the decoder is or from the start: a target within the first 80 ms,
+a forward seek under 160 ms, and a landing page that begins with the
+tail of a packet, which is refused (the packet's samples would be
+missing from the position) in favour of an earlier page or the start.
 
 ## What is not
 

@@ -47,20 +47,30 @@
  * are single channels, and the channel table says which decoded channel
  * feeds which output; a channel mapped to 255 is silent.
  *
- * **A seek decodes from the start.** An Opus decoder's state converges
- * rather than resets - RFC 7845 suggests 80 ms of pre-roll before the
- * target - so a seek that began part-way through would produce samples
- * that differ in their least significant bits from the ones a straight
- * read produces, and nothing here could then say which was right.
- * Decoding from the start makes the two the same by construction, at the
- * cost of a seek taking as long as reading. The page-bisection that
- * would avoid the cost is in the container layer and is a decision for
- * a later change, with the bit-exactness it gives up stated.
+ * **A seek bisects, and its samples are not a straight read's.** An Opus
+ * decoder's state converges rather than resets, so a decoder started
+ * part-way through produces samples that differ from a straight read's
+ * in their least significant bits until it has converged. RFC 7845
+ * section 4.6 says to decode 80 ms of pre-roll before the target and
+ * discard it, and that is what happens: the page bisection finds the
+ * last page at or before 80 ms ahead of the target, every decoder is
+ * reset there, and the packets from it are decoded and dropped until the
+ * target. What is given up is bit-exactness with a straight read, and
+ * only after a seek that landed part-way; a seek that lands in the first
+ * 80 ms, or forwards by less than 160 ms, or onto a page that begins with
+ * the tail of a packet, still decodes on from where it is or from the
+ * start and is exact.
  */
 
 #include "opus_decoder.h"
 #include "../../container/ogg/ogg.h"
 #include <string.h>
+
+/** RFC 7845's pre-roll: 80 ms at 48 kHz, decoded and dropped after a jump. */
+#define OPUS_PREROLL 3840u
+
+/** The most earlier pages a landing on a continued packet is moved back by. */
+#define OPUS_LAND_TRIES 4u
 
 /** The unit of the output: interleaved signed 16-bit. */
 typedef struct {
@@ -76,6 +86,7 @@ typedef struct {
   uint32_t pending_used;            ///< How much of it was handed out.
   uint64_t position;                ///< Frames handed out so far.
   uint64_t skip;                    ///< Pre-skip frames still to drop.
+  uint64_t seeked_to;               ///< Where the reader was last put.
   bool ended;                       ///< The stream has no more packets.
   /** For output channel `slot`: which stream and which of its channels. */
   struct {
@@ -112,7 +123,8 @@ static GAUD_Result rewind_player(OPUS_Player * player) {
   player->position = 0;
   player->skip = player->file->head.pre_skip;
   player->ended = false;
-  return gaud_ogg_reader_seek(&player->reader, player->file->audio_offset);
+  player->seeked_to = player->file->audio_offset;
+  return gaud_ogg_reader_seek(&player->reader, player->seeked_to);
 }
 
 /**
@@ -241,6 +253,80 @@ static GAUD_Result player_read(GAUD_Decoder * decoder, GAUD_Buffer * buffer) {
   return gaud_buffer_set_frames(buffer, filled);
 }
 
+/** Undo a search that moved the stream: the reader goes on as it was. */
+static GAUD_Result put_back(
+    OPUS_Player * player, bool mid_page, int64_t resume) {
+  if (mid_page) {
+    return gaud_stream_seek(player->reader.stream, resume, GAUD_SEEK_SET);
+  }
+  return gaud_ogg_reader_seek(&player->reader, (uint64_t)resume);
+}
+
+/**
+ * Put the decoders where a seek to @p frame can begin: the last page at
+ * least ::OPUS_PREROLL before it, every decoder reset there, or the
+ * start of the stream where that is no better. Does nothing when the
+ * place found is behind where the decoders already are and the target is
+ * ahead of them, because decoding on is then both faster and exact.
+ */
+static GAUD_Result land_near(OPUS_Player * player, uint64_t frame) {
+  uint64_t pre_skip = player->file->head.pre_skip;
+  uint64_t want = frame + pre_skip;
+  uint64_t target = want > OPUS_PREROLL ? want - OPUS_PREROLL : 0u;
+  uint64_t offset = 0;
+  uint64_t granule = 0;
+  // Searching moves the stream under the reader, so where the reader will
+  // read next is worked out to be put back when the search comes to
+  // nothing. The stream's own position is not it: the document's stream
+  // is shared with every other decoder of the track.
+  const OGG_Reader * reader = &player->reader;
+  bool mid_page = reader->page_live;
+  int64_t resume = (int64_t)(mid_page
+          ? reader->page_offset + 27u + reader->segments + reader->body_size
+          : player->seeked_to);
+  // A page whose first packet began on the page before cannot be landed
+  // on, because that packet is dropped and its samples would be missing
+  // from the position; step back to an earlier page instead.
+  for (unsigned tries = 0; tries < OPUS_LAND_TRIES && target > pre_skip;
+      ++tries) {
+    if (gaud_ogg_bisect(&player->reader, target, player->file->audio_offset,
+            &offset, &granule)
+        != GAUD_OK) {
+      break;
+    }
+    if (granule <= pre_skip) {
+      break;
+    }
+    OGG_Page_Info page;
+    if (gaud_ogg_find_page(player->reader.stream, player->allocator, offset,
+            offset + 1u, &page)
+            != GAUD_OK
+        || (page.flags & OGG_FLAG_CONTINUED)) {
+      target = granule - 1u;
+      continue;
+    }
+    uint64_t landed = granule - pre_skip;
+    if (frame >= player->position && landed <= player->position) {
+      // Decoding on is already as near and is exact.
+      return put_back(player, mid_page, resume);
+    }
+    for (uint32_t i = 0; i < player->stream_count; ++i) {
+      gaud_opus_decoder_reset(player->streams[i]);
+    }
+    player->pending_frames = 0;
+    player->pending_used = 0;
+    player->position = landed;
+    player->skip = 0;
+    player->ended = false;
+    player->seeked_to = offset;
+    return gaud_ogg_reader_seek(&player->reader, offset);
+  }
+  if (frame < player->position) {
+    return rewind_player(player);
+  }
+  return put_back(player, mid_page, resume);
+}
+
 static GAUD_Result player_seek(
     GAUD_Decoder * decoder, uint64_t frame, uint64_t * out_landed) {
   OPUS_Player * player = gaud_decoder_private(decoder);
@@ -248,8 +334,11 @@ static GAUD_Result player_seek(
   if (total != UINT64_MAX && frame > total) {
     frame = total;
   }
-  if (frame < player->position) {
-    GAUD_Result result = rewind_player(player);
+  // Where the state is now is a position on the decoder's own timeline;
+  // a jump is only worth its pre-roll when it moves the state further
+  // forward than decoding on would.
+  if (frame < player->position || frame - player->position > 2u * OPUS_PREROLL) {
+    GAUD_Result result = land_near(player, frame);
     if (result != GAUD_OK) {
       return result;
     }

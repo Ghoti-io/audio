@@ -5658,6 +5658,317 @@ std::vector<unsigned char> OggOpus(const std::vector<unsigned char> & head,
 
 }  // namespace
 
+namespace {
+
+/** A looped 60 times, as an Ogg Opus file with a page to each packet. */
+struct Looped {
+  std::vector<unsigned char> file;
+  uint64_t frames = 0;
+  unsigned channels = 0;
+};
+
+Looped Loop(const char * name, unsigned channels) {
+  Looped out;
+  auto once = AudioPackets(name);
+  std::vector<std::vector<unsigned char>> packets;
+  for (int repeat = 0; repeat < 60; ++repeat) {
+    packets.insert(packets.end(), once.begin(), once.end());
+  }
+  out.channels = channels;
+  out.frames = packets.size() * 960u - 312u;
+  out.file = OggOpus(Head(1, channels), packets, out.frames + 312u);
+  return out;
+}
+
+/** Everything the tests below need to hold open at once. */
+struct Opened {
+  GAUD_Stream * stream = nullptr;
+  GAUD_Doc * doc = nullptr;
+  GAUD_Diagnostics diagnostics;
+  GAUD_Decoder * decoder = nullptr;
+  GAUD_Buffer * buffer = nullptr;
+  Opened() { gaud_diagnostics_init(&diagnostics, nullptr); }
+  ~Opened() {
+    gaud_buffer_destroy(buffer);
+    gaud_decoder_destroy(decoder);
+    gaud_doc_destroy(doc);
+    gaud_stream_destroy(stream);
+    gaud_diagnostics_destroy(&diagnostics);
+  }
+  GAUD_Track * track() { return gaud_doc_track(doc, 0); }
+};
+
+GAUD_Result OpenLooped(Opened & out, const Looped & looped, size_t chunk) {
+  GAUD_Result result = gaud_stream_create_memory(
+      looped.file.data(), looped.file.size(), &out.stream);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  result = gaud_doc_load(nullptr, out.stream, nullptr, &out.diagnostics,
+      &out.doc);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  result = gaud_decoder_create(out.track(), &out.decoder);
+  if (result != GAUD_OK) {
+    return result;
+  }
+  return gaud_decoder_buffer_create(out.decoder, nullptr, chunk, &out.buffer);
+}
+
+/** The next buffer's samples. */
+std::vector<int16_t> ReadSome(Opened & opened, unsigned channels) {
+  EXPECT_EQ(gaud_decoder_read(opened.decoder, opened.buffer), GAUD_OK);
+  const int16_t * data =
+      (const int16_t *)gaud_buffer_data_const(opened.buffer);
+  return std::vector<int16_t>(
+      data, data + gaud_buffer_frames(opened.buffer) * channels);
+}
+
+}  // namespace
+
+namespace {
+
+/** One page whose body is @p bytes, ending on an open lacing value. */
+std::vector<unsigned char> OggPageSplit(uint32_t sequence, unsigned flags,
+    uint64_t granule, const std::vector<unsigned char> & tail,
+    const std::vector<unsigned char> & head) {
+  // The tail finishes the packet that the page before it began, and the
+  // head is exactly 255 bytes, so it ends on a 255 and the packet goes on.
+  std::vector<unsigned char> page(27, 0);
+  memcpy(page.data(), "OggS", 4);
+  page[5] = (unsigned char)flags;
+  for (int i = 0; i < 8; ++i) page[6 + i] = (unsigned char)(granule >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[14 + i] = (unsigned char)(7u >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[18 + i] = (unsigned char)(sequence >> (8 * i));
+  std::vector<unsigned char> table;
+  size_t left = tail.size();
+  if (!tail.empty()) {
+    while (left >= 255u) {
+      table.push_back(255);
+      left -= 255u;
+    }
+    table.push_back((unsigned char)left);
+  }
+  if (!head.empty()) {
+    table.push_back(255);
+  }
+  page[26] = (unsigned char)table.size();
+  page.insert(page.end(), table.begin(), table.end());
+  page.insert(page.end(), tail.begin(), tail.end());
+  page.insert(page.end(), head.begin(), head.end());
+  uint32_t crc = gaud_ogg_crc32(page.data(), page.size());
+  for (int i = 0; i < 4; ++i) page[22 + i] = (unsigned char)(crc >> (8 * i));
+  return page;
+}
+
+/** A code-0 packet as a code-3 one with @p pad zero bytes of padding. */
+std::vector<unsigned char> Padded(const std::vector<unsigned char> & p,
+    unsigned pad) {
+  std::vector<unsigned char> out{(unsigned char)(p[0] | 3u), 0x41,
+      (unsigned char)pad};
+  out.insert(out.end(), p.begin() + 1, p.end());
+  out.insert(out.end(), pad, 0);
+  return out;
+}
+
+}  // namespace
+
+TEST(OpusDecode, ASeekNeverLandsOnAPageThatContinuesAPacket) {
+  // Every page here begins with the end of the packet before it and
+  // ends in the start of the next, so a bisection can only find pages
+  // whose first packet is not whole. Landing on one would drop that
+  // packet and every position after would be one packet's samples out;
+  // the landing is refused instead, and what is read is a straight
+  // read's, exactly.
+  auto once = AudioPackets("opus_silk_mono_wb.opus");
+  std::vector<std::vector<unsigned char>> packets;
+  for (int repeat = 0; repeat < 60; ++repeat) {
+    for (const auto & packet : once) {
+      packets.push_back(Padded(packet, 254));
+    }
+  }
+  uint64_t frames = packets.size() * 960u - 312u;
+  std::vector<unsigned char> tags;
+  tags.insert(tags.end(), OPUS_TAGS_MAGIC, OPUS_TAGS_MAGIC + 8);
+  for (int i = 0; i < 8; ++i) tags.push_back(0);
+  Looped split;
+  split.channels = 1;
+  split.frames = frames;
+  split.file = OggPage(7, 0, 2, 0, Head(1, 1));
+  auto page = OggPage(7, 1, 0, 0, tags);
+  split.file.insert(split.file.end(), page.begin(), page.end());
+  for (size_t i = 0; i <= packets.size(); ++i) {
+    std::vector<unsigned char> tail;
+    std::vector<unsigned char> head;
+    if (i > 0) {
+      tail.assign(packets[i - 1].begin() + 255, packets[i - 1].end());
+    }
+    if (i < packets.size()) {
+      head.assign(packets[i].begin(), packets[i].begin() + 255);
+    }
+    bool last = i == packets.size();
+    page = OggPageSplit((uint32_t)(2 + i),
+        (i > 0 ? 1u : 0u) | (last ? 4u : 0u),
+        i == 0 ? ~0ULL : (uint64_t)i * 960u, tail, head);
+    split.file.insert(split.file.end(), page.begin(), page.end());
+  }
+  Opened opened;
+  ASSERT_EQ(OpenLooped(opened, split, 9600), GAUD_OK);
+  EXPECT_EQ(gaud_track_frames(opened.track()), frames);
+  // The straight read has a stream of its own: the decoders of one
+  // document share its stream, and one reading would move the other's.
+  Opened straight;
+  ASSERT_EQ(OpenLooped(straight, split, 9600), GAUD_OK);
+  std::vector<int16_t> all = DecodeAll(straight.track());
+  ASSERT_EQ(all.size(), frames);
+  {
+    // A decoder that has read nothing has no page in hand, and a refused
+    // landing has to leave it as it was.
+    Opened fresh;
+    ASSERT_EQ(OpenLooped(fresh, split, 9600), GAUD_OK);
+    uint64_t landed = 0;
+    ASSERT_EQ(gaud_decoder_seek(fresh.decoder, 400000u, &landed), GAUD_OK);
+    EXPECT_EQ(landed, 400000u);
+    std::vector<int16_t> got = ReadSome(fresh, 1);
+    ASSERT_EQ(got.size(), 9600u);
+    for (size_t i = 0; i < got.size(); ++i) {
+      ASSERT_EQ(got[i], all[400000u + i]) << i;
+    }
+  }
+  // Read first, so that the first jump is a forward one from the middle
+  // of a page, which is where the reader has to be put back as it was.
+  ASSERT_EQ(ReadSome(opened, 1).size(), 9600u);
+  for (uint64_t target : std::initializer_list<uint64_t>{500000u, 300001u,
+           100000u, 120000u, 5000u, 250000u, 250960u, 3913u}) {
+    uint64_t landed = 0;
+    ASSERT_EQ(gaud_decoder_seek(opened.decoder, target, &landed), GAUD_OK);
+    EXPECT_EQ(landed, target);
+    std::vector<int16_t> got = ReadSome(opened, 1);
+    ASSERT_EQ(got.size(), 9600u) << target;
+    for (size_t i = 0; i < got.size(); ++i) {
+      ASSERT_EQ(got[i], all[target + i]) << target << " sample " << i;
+    }
+  }
+}
+
+TEST(OpusDecode, ASeekFarAwayReadsWhatARestartedReferenceDecoderReads) {
+  // A long file is needed to seek in, and the fixtures are 200 ms, so
+  // each is looped sixty times with a page to every packet: every seek
+  // then has pages to bisect and a pre-roll to run. What a seek reads is
+  // what RFC 6716's decoder reads when started fresh at the page the
+  // bisection lands on and run to the target, which is not what a
+  // straight read gives (the next test says by how much). A position off
+  // by one sample, or a landing on another page, changes the digest.
+  // The pairs come from notes/audio/opus-harness/seek_ref.c.
+  struct One {
+    const char * name;
+    unsigned channels;
+    uint64_t digest;
+  };
+  for (const One & one : {One{"opus_silk_mono_wb.opus", 1, 18176665015197003023ULL},
+           One{"opus_celt_stereo_96k.opus", 2, 13304648250527632944ULL},
+           One{"opus_hybrid_mono_swb.opus", 1, 18049803235756285756ULL}}) {
+    Looped looped = Loop(one.name, one.channels);
+    Opened opened;
+    ASSERT_EQ(OpenLooped(opened, looped, 9600), GAUD_OK);
+    EXPECT_EQ(gaud_track_frames(opened.track()), looped.frames);
+    std::vector<int16_t> heard;
+    for (uint64_t target : std::initializer_list<uint64_t>{500000u, 300001u,
+             100000u, 120000u, 5000u, 9u, looped.frames - 100u,
+             looped.frames + 7u, 250000u, 0u, 250960u, 3913u}) {
+      uint64_t landed = 0;
+      ASSERT_EQ(gaud_decoder_seek(opened.decoder, target, &landed), GAUD_OK);
+      uint64_t expect = std::min<uint64_t>(target, looped.frames);
+      EXPECT_EQ(landed, expect) << one.name << " " << target;
+      EXPECT_EQ(gaud_decoder_tell(opened.decoder), expect) << one.name;
+      std::vector<int16_t> got = ReadSome(opened, one.channels);
+      EXPECT_EQ(got.size() / one.channels,
+          std::min<uint64_t>(9600u, looped.frames - expect))
+          << one.name << " " << target;
+      heard.insert(heard.end(), got.begin(), got.end());
+    }
+    EXPECT_EQ(heard.size(), 96100u * one.channels) << one.name;
+    EXPECT_EQ(DigestOf(heard), one.digest) << one.name;
+  }
+}
+
+TEST(OpusDecode, ASeekDiffersFromAStraightReadAtFirstAndConvergesAndIsExactNearTheStart) {
+  // A voiced tone at full scale is the worst case for a decoder started
+  // part-way, because the long-term predictor carries the difference
+  // from one pitch period to the next for as long as the tone lasts.
+  // The loop's restart every 220 ms is what ends it here. So the claim is
+  // the one RFC 7845 makes and no stronger: the difference is there
+  // right after the landing, which shows the decoder did start part-way
+  // and did not run from the beginning; it is small by 120 ms later; and
+  // within the first 80 ms, where there is nothing to skip, it is exact.
+  struct One {
+    const char * name;
+    unsigned channels;
+  };
+  for (const One & one : {One{"opus_silk_mono_wb.opus", 1},
+           One{"opus_hybrid_mono_swb.opus", 1}}) {
+    Looped looped = Loop(one.name, one.channels);
+    Opened opened;
+    ASSERT_EQ(OpenLooped(opened, looped, 9600), GAUD_OK);
+    std::vector<int16_t> all = DecodeAll(opened.track());
+    ASSERT_EQ(all.size(), looped.frames);
+    size_t differing_early = 0;
+    for (uint64_t target : std::initializer_list<uint64_t>{500000u, 300001u,
+             100000u, 120000u, 250000u, 9u, 0u}) {
+      uint64_t landed = 0;
+      ASSERT_EQ(gaud_decoder_seek(opened.decoder, target, &landed), GAUD_OK);
+      ASSERT_EQ(landed, target);
+      std::vector<int16_t> got = ReadSome(opened, 1);
+      ASSERT_EQ(got.size(), 9600u) << one.name << " " << target;
+      for (size_t i = 0; i < got.size(); ++i) {
+        int diff = got[i] - all[target + i];
+        if (target < 3840u) {
+          ASSERT_EQ(diff, 0) << one.name << " " << target << " " << i;
+        }
+        else if (i < 960u) {
+          differing_early += diff != 0;
+        }
+        else if (i >= 6u * 960u) {
+          // 3% of the full-scale tone this fixture is.
+          ASSERT_LE(std::abs(diff), 840)
+              << one.name << " " << target << " " << i;
+        }
+      }
+    }
+    EXPECT_GT(differing_early, 0u) << one.name;
+  }
+}
+
+TEST(OpusDecode, ASmallSeekForwardDecodesOnAndReadsWhatTheDecoderWouldHave) {
+  // A jump under 160 ms is not worth a pre-roll, so it decodes on from
+  // where the decoder is, and reads exactly what reading through would
+  // have - which for SILK is not what a straight read from the start
+  // gives, after an earlier seek, and is the guarantee kept.
+  Looped looped = Loop("opus_silk_mono_wb.opus", 1);
+  Opened a;
+  Opened b;
+  ASSERT_EQ(OpenLooped(a, looped, 960), GAUD_OK);
+  ASSERT_EQ(OpenLooped(b, looped, 960), GAUD_OK);
+  uint64_t landed = 0;
+  ASSERT_EQ(gaud_decoder_seek(a.decoder, 200000u, &landed), GAUD_OK);
+  ASSERT_EQ(gaud_decoder_seek(b.decoder, 200000u, &landed), GAUD_OK);
+  std::vector<int16_t> through;
+  for (int i = 0; i < 6; ++i) {
+    auto some = ReadSome(a, 1);
+    through.insert(through.end(), some.begin(), some.end());
+  }
+  ASSERT_EQ(through.size(), 5760u);
+  ASSERT_EQ(ReadSome(b, 1).size(), 960u);
+  ASSERT_EQ(gaud_decoder_seek(b.decoder, 200000u + 1500u, &landed), GAUD_OK);
+  EXPECT_EQ(landed, 201500u);
+  auto after = ReadSome(b, 1);
+  ASSERT_EQ(after.size(), 960u);
+  for (size_t i = 0; i < after.size(); ++i) {
+    ASSERT_EQ(after[i], through[1500 + i]) << i;
+  }
+}
+
 TEST(OpusDecode, ASilentChannelAndTwoStreamsAreMixedWhereTheTableSays) {
   // Three channels from two uncoupled streams and a channel mapped to
   // nothing: output 0 is the second stream, output 1 the first, output 2

@@ -87,9 +87,11 @@ This is what is implemented:
   as well. The length is the last page's granule position **minus the
   pre-skip** the format states, a subtraction no other format here needs;
   the sample rate reported is always 48,000, which is the format's
-  decision. Two things are deliberate: **a seek decodes from the start**,
-  so that seeking and reading give the same samples to the bit, and
-  **`OpusHead`'s output gain is applied**, as RFC 7845 asks and libopus
+  decision. Two things are deliberate: **a seek bisects the file** to a page 80 ms
+  before the target, as RFC 7845 says, so the samples after a far seek
+  differ from a straight read's in their last bits at first and
+  converge (a seek near the start, or forward by under 160 ms, is
+  exact), and **`OpusHead`'s output gain is applied**, as RFC 7845 asks and libopus
   does. Not implemented: forward error correction (decoding the in-band
   redundancy of a *following* packet to cover a lost one) and the custom
   modes of RFC 6716 Appendix B's `opus_custom`.
