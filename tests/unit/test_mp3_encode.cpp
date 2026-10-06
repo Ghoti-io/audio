@@ -48,6 +48,7 @@
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -114,6 +115,45 @@ std::vector<unsigned char> Encode(const Pcm & pcm, unsigned channels,
       EXPECT_EQ(gaud_buffer_set_frames(buffer, n), GAUD_OK);
       std::memcpy(gaud_buffer_data(buffer), pcm.data() + at * channels,
           n * channels * 2u);
+      EXPECT_EQ(gaud_encoder_write(encoder, buffer), GAUD_OK);
+    }
+    EXPECT_EQ(gaud_encoder_finish(encoder), GAUD_OK);
+    const void * data = nullptr;
+    size_t size = 0;
+    EXPECT_EQ(gaud_stream_writer_bytes(out, &data, &size), GAUD_OK);
+    bytes.assign((const unsigned char *)data, (const unsigned char *)data + size);
+    gaud_buffer_destroy(buffer);
+  }
+  gaud_encoder_destroy(encoder);
+  gaud_stream_destroy(out);
+  return bytes;
+}
+
+/** Encode with a caller-built parameter block. */
+std::vector<unsigned char> EncodeWith(const Pcm & pcm, GAUD_Encode_Params params,
+    GAUD_Result * out_result = nullptr) {
+  params.format = GAUD_SAMPLE_S16;
+  params.coding = GAUD_CODING_MPEG_LAYER3;
+  GAUD_Stream * out = nullptr;
+  EXPECT_EQ(gaud_stream_create_memory_writer(nullptr, &out), GAUD_OK);
+  GAUD_Encoder * encoder = nullptr;
+  GAUD_Result result = gaud_encoder_create("mp3", nullptr, out, &params, &encoder);
+  if (out_result) {
+    *out_result = result;
+  }
+  std::vector<unsigned char> bytes;
+  if (result == GAUD_OK) {
+    GAUD_Buffer * buffer = nullptr;
+    unsigned channels = params.layout.channels;
+    size_t chunk = 4096;
+    EXPECT_EQ(gaud_buffer_create(nullptr, GAUD_SAMPLE_S16, params.layout,
+                  GAUD_LAYOUT_INTERLEAVED, chunk, &buffer),
+        GAUD_OK);
+    size_t frames = pcm.size() / channels;
+    for (size_t at = 0; at < frames; at += chunk) {
+      size_t n = std::min(chunk, frames - at);
+      EXPECT_EQ(gaud_buffer_set_frames(buffer, n), GAUD_OK);
+      std::memcpy(gaud_buffer_data(buffer), pcm.data() + at * channels, n * channels * 2u);
       EXPECT_EQ(gaud_encoder_write(encoder, buffer), GAUD_OK);
     }
     EXPECT_EQ(gaud_encoder_finish(encoder), GAUD_OK);
@@ -759,6 +799,184 @@ TEST(Mp3EncodeFile, TheTagStatesTheDelayAndPaddingThatMakeTheLengthExact) {
   EXPECT_TRUE(trim.stated);
   EXPECT_EQ(trim.encoder_delay, 1057u);
   EXPECT_EQ(trim.encoder_delay + 10000u + trim.padding, (uint64_t)tag.frames * 1152u);
+}
+
+/* ----------------------------------------------------- the rate policies */
+
+/** The bit rate of every audio frame, in kbit/s, and the tag's fields. */
+struct Frames {
+  std::vector<unsigned> kbps;
+  MP3_Vbr_Tag tag;
+  bool tag_ok = false;
+  size_t first = 0;
+  size_t total_bytes = 0;
+};
+
+Frames Walk(const std::vector<unsigned char> & mp3) {
+  Frames f;
+  MP3_Header h;
+  EXPECT_TRUE(gaud_mp3_header_parse(mp3.data(), &h));
+  f.tag_ok = gaud_mp3_tag_parse(mp3.data(), h.frame_size, &h, &f.tag);
+  size_t at = h.frame_size;
+  while (at + 4 <= mp3.size()) {
+    MP3_Header g;
+    if (!gaud_mp3_header_parse(mp3.data() + at, &g)) {
+      break;
+    }
+    f.kbps.push_back(g.bitrate / 1000u);
+    at += g.frame_size;
+  }
+  EXPECT_EQ(at, mp3.size());
+  f.total_bytes = mp3.size();
+  return f;
+}
+
+GAUD_Encode_Params BaseParams(unsigned channels, uint32_t rate) {
+  GAUD_Encode_Params params;
+  gaud_encode_params_default(&params);
+  params.sample_rate = rate;
+  params.layout = gaud_channel_layout_default(channels);
+  return params;
+}
+
+/** A passage that is quiet and plain and then loud and busy, twice. */
+Pcm Dynamics(unsigned channels, size_t frames, double rate) {
+  Pcm pcm(frames * channels);
+  uint32_t state = 77;
+  for (size_t i = 0; i < frames; ++i) {
+    double phase = std::fmod((double)i / rate, 2.0) / 2.0;
+    double loud = phase < 0.5 ? 0.0 : 1.0;
+    for (unsigned c = 0; c < channels; ++c) {
+      state = state * 1664525u + 1013904223u;
+      double noise = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+      double v = 0.2 * std::sin(2 * M_PI * 440.0 * (c + 1) * i / rate)
+          + loud * 0.25 * noise;
+      pcm[i * channels + c] = (int16_t)std::lround(v * 32767.0);
+    }
+  }
+  return pcm;
+}
+
+TEST(Mp3EncodeRate, ConstantRateEveryFrameIsTheSameRateAndTheTagSaysInfo) {
+  Pcm pcm = Dynamics(2, 44100 * 3, 44100);
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.bitrate = 160000;
+  Frames f = Walk(EncodeWith(pcm, params));
+  ASSERT_TRUE(f.tag_ok);
+  EXPECT_TRUE(f.tag.is_info);
+  EXPECT_FALSE(f.tag.has_toc);
+  for (unsigned k : f.kbps) {
+    ASSERT_EQ(k, 160u);
+  }
+  EXPECT_EQ(f.tag.frames, f.kbps.size());
+}
+
+TEST(Mp3EncodeRate, VariableRateFollowsTheMaterialAndTheTagCarriesATable) {
+  Pcm pcm = Dynamics(2, 44100 * 6, 44100);
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_VBR;
+  params.quality = 50;
+  std::vector<unsigned char> mp3 = EncodeWith(pcm, params);
+  Frames f = Walk(mp3);
+  ASSERT_TRUE(f.tag_ok);
+  EXPECT_FALSE(f.tag.is_info);
+  EXPECT_TRUE(f.tag.has_toc);
+  EXPECT_EQ(f.tag.frames, f.kbps.size());
+  EXPECT_EQ(f.tag.bytes, mp3.size());
+  unsigned lo = *std::min_element(f.kbps.begin(), f.kbps.end());
+  unsigned hi = *std::max_element(f.kbps.begin(), f.kbps.end());
+  EXPECT_LT(lo * 2u, hi) << "quiet and plain costs far less than loud and busy";
+  /* The table never goes backwards and ends near the end. */
+  for (unsigned i = 1; i < 100; ++i) {
+    EXPECT_GE(f.tag.toc[i], f.tag.toc[i - 1]);
+  }
+  EXPECT_EQ(f.tag.toc[0], 0u + f.tag.toc[0]);
+  EXPECT_GT(f.tag.toc[99], 200u);
+  /* And it still decodes to the right length. */
+  EXPECT_EQ(Decode(mp3).frames, pcm.size() / 2);
+}
+
+TEST(Mp3EncodeRate, HigherQualityCostsMoreAndSoundsCloser) {
+  Pcm pcm = Dynamics(2, 44100 * 4, 44100);
+  size_t previous_size = 0;
+  double previous_snr = -1000;
+  for (uint32_t q : {20u, 50u, 80u}) {
+    GAUD_Encode_Params params = BaseParams(2, 44100);
+    params.rate_control = GAUD_RATE_VBR;
+    params.quality = q;
+    std::vector<unsigned char> mp3 = EncodeWith(pcm, params);
+    double snr = SnrDb(pcm, Decode(mp3).pcm);
+    EXPECT_GT(mp3.size(), previous_size) << "quality " << q;
+    EXPECT_GT(snr, previous_snr) << "quality " << q;
+    previous_size = mp3.size();
+    previous_snr = snr;
+  }
+}
+
+TEST(Mp3EncodeRate, VariableRateHonoursItsFloorAndCeiling) {
+  Pcm pcm = Dynamics(2, 44100 * 4, 44100);
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_VBR;
+  params.quality = 50;
+  params.min_bitrate = 96000;
+  params.bitrate = 192000;
+  Frames f = Walk(EncodeWith(pcm, params));
+  for (unsigned k : f.kbps) {
+    ASSERT_GE(k, 96u);
+    ASSERT_LE(k, 192u);
+  }
+}
+
+TEST(Mp3EncodeRate, AverageRateLandsNearItsTarget) {
+  Pcm pcm = Dynamics(2, 44100 * 12, 44100);
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_ABR;
+  params.bitrate = 128000;
+  std::vector<unsigned char> mp3 = EncodeWith(pcm, params);
+  Frames f = Walk(mp3);
+  double seconds = (double)pcm.size() / 2 / 44100.0;
+  double average = (double)mp3.size() * 8.0 / seconds / 1000.0;
+  EXPECT_NEAR(average, 128.0, 128.0 * 0.04);
+  unsigned lo = *std::min_element(f.kbps.begin(), f.kbps.end());
+  unsigned hi = *std::max_element(f.kbps.begin(), f.kbps.end());
+  EXPECT_LT(lo, hi) << "an average-rate file is not a constant one";
+}
+
+TEST(Mp3EncodeRate, TheLowerSamplingFrequenciesDoAllThreeToo) {
+  for (uint32_t rate : {22050u, 11025u}) {
+    Pcm pcm = Dynamics(1, rate * 3, rate);
+    for (GAUD_Rate_Control mode : {GAUD_RATE_CBR, GAUD_RATE_ABR, GAUD_RATE_VBR}) {
+      GAUD_Encode_Params params = BaseParams(1, rate);
+      params.rate_control = mode;
+      params.bitrate = mode == GAUD_RATE_VBR ? 0 : 48000;
+      std::vector<unsigned char> mp3 = EncodeWith(pcm, params);
+      ASSERT_FALSE(mp3.empty()) << rate << " mode " << mode;
+      EXPECT_EQ(Decode(mp3).frames, pcm.size()) << rate << " mode " << mode;
+    }
+  }
+}
+
+TEST(Mp3EncodeRate, ImpossibleRequestsAreRefused) {
+  Pcm pcm(1000, 0);
+  GAUD_Result result = GAUD_OK;
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_ABR;
+  EncodeWith(pcm, params, &result);
+  EXPECT_EQ(result, GAUD_ERR_UNSUPPORTED) << "an average with no target";
+  params.bitrate = 8000;
+  EncodeWith(pcm, params, &result);
+  EXPECT_EQ(result, GAUD_ERR_UNSUPPORTED) << "a target under the format's floor";
+  params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_VBR;
+  params.min_bitrate = 256000;
+  params.bitrate = 128000;
+  EncodeWith(pcm, params, &result);
+  EXPECT_EQ(result, GAUD_ERR_INVALID) << "a floor over the ceiling";
+  params = BaseParams(2, 44100);
+  params.rate_control = GAUD_RATE_VBR;
+  params.quality = 101;
+  EncodeWith(pcm, params, &result);
+  EXPECT_EQ(result, GAUD_ERR_INVALID);
 }
 
 /* ------------------------------------------------------------ refusals */

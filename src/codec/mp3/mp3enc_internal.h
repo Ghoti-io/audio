@@ -379,6 +379,67 @@ void gaud_mp3e_side_write(unsigned char * out, const MP3E_Frame_Header * h,
     uint32_t main_data_begin, const uint8_t scfsi[2],
     const MP3E_Granule granule[2][2]);
 
+/* ------------------------------------------------------------ the tag frame */
+
+/** What the Info or Xing frame states. */
+typedef struct {
+  MP3_Version version;
+  unsigned rate_index;
+  unsigned channels;
+  unsigned bitrate_index;  ///< The frame's own header.
+  uint32_t frame_bytes;    ///< Its length; at least 192 for the tag to fit.
+  bool vbr;                ///< Xing rather than Info.
+  uint32_t frames;         ///< Audio frames, not counting this one.
+  uint32_t bytes;          ///< The file's, from this frame to the last.
+  const unsigned char * toc; ///< A hundred entries, or NULL.
+  uint32_t quality;        ///< Xing's, 0 best to 100 worst (VBR only).
+  uint32_t delay;          ///< Samples of delay, as LAME states it.
+  uint32_t padding;        ///< And of padding.
+  uint16_t music_crc;
+  uint32_t music_length;
+  unsigned vbr_method;     ///< 1 constant, 2 average, 3 to 9 variable.
+  unsigned bitrate_byte;   ///< The extension's bit rate field.
+  unsigned lowpass_100hz;
+} MP3E_Tag;
+
+/** Write the tag frame into @p frame, which has room for its length. */
+void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame);
+
+/* --------------------------------------------------------------- the rate */
+
+/** The bit rate policy and its running state. */
+typedef struct {
+  GAUD_Rate_Control mode;
+  MP3_Version version;
+  uint32_t sample_rate;
+  unsigned min_index;        ///< Lowest bit rate index a frame may use.
+  unsigned max_index;        ///< Highest.
+  unsigned fixed_index;      ///< The constant rate's.
+  uint32_t target_bps;       ///< The average rate's target.
+  uint64_t pad_accumulator;  ///< The fractional bytes carried between frames.
+  uint64_t target_accumulator; ///< Target bytes so far, times the frequency.
+  uint64_t actual_bytes;     ///< Bytes of audio frames written so far.
+} MP3E_Rate;
+
+void gaud_mp3e_rate_init(MP3E_Rate * rate, GAUD_Rate_Control mode,
+    MP3_Version version, uint32_t sample_rate, unsigned min_index,
+    unsigned max_index, unsigned fixed_index, uint32_t target_bps);
+
+/** How many bytes the next frame is at bit rate @p index; sets @p padding. */
+uint32_t gaud_mp3e_rate_size(const MP3E_Rate * rate, unsigned index, bool * padding);
+
+/** The frame at @p index was written: advance the accumulators. */
+void gaud_mp3e_rate_commit(MP3E_Rate * rate, unsigned index);
+
+/**
+ * The bit rate index for a frame whose granules need @p need_bits: the
+ * fixed one for constant rate, the smallest that holds them (and
+ * @p reservoir_bytes of what is saved) for variable, the same for average
+ * after steering.
+ */
+unsigned gaud_mp3e_rate_choose(const MP3E_Rate * rate, uint64_t need_bits,
+    uint64_t reservoir_bytes, uint32_t head_bytes);
+
 /** CRC-16 of the Layer III protected bits (header bytes 2-3 and side info). */
 uint16_t gaud_mp3e_crc16(const unsigned char * data, size_t size, uint16_t crc);
 

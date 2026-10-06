@@ -129,6 +129,7 @@ typedef struct {
   uint64_t energy[MP3E_MAX_BANDS];
   bool preflag;
   bool scale;
+  unsigned gain_floor; ///< The finest step that does not clamp the loudest line.
   MP3E_Granule scratch; ///< A second granule to try a step in.
 } Work;
 
@@ -319,9 +320,10 @@ static unsigned masked_over(const Work * w, unsigned gain, MP3E_Granule * g) {
   return over;
 }
 
-/** The largest gain at which no band is over its threshold, or 0. */
+/** The largest gain at which no band is over its threshold. The caller has
+ *  shown the finest useful gain is masked. */
 static unsigned coarsest_masked(const Work * w, MP3E_Granule * g) {
-  unsigned low = 0;
+  unsigned low = w->gain_floor;
   unsigned high = 255;
   while (low < high) {
     unsigned mid = (low + high + 1u) >> 1;
@@ -441,6 +443,19 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
   }
   measure_energy(&w);
   set_caps(&w);
+  /* Below some step the loudest line is clamped to the largest value a
+   * granule can carry and its noise is not small: that is not a step to
+   * search, however fine it sounds. */
+  int32_t loudest = 0;
+  for (unsigned i = 0; i < MP3E_LINES; ++i) {
+    int32_t magnitude = w.xs[i] < 0 ? -w.xs[i] : w.xs[i];
+    loudest = magnitude > loudest ? magnitude : loudest;
+  }
+  w.gain_floor = 0;
+  while (w.gain_floor < 255u
+      && gaud_mp3e_quantize_one(loudest, (int)w.gain_floor - 210) >= QUANT_MAX) {
+    ++w.gain_floor;
+  }
 
   MP3E_Granule * trial = out;
   uint32_t budget = input->target_bits;
@@ -457,7 +472,7 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
    * and evens out the margins at that, which is the cheapest way to mask
    * them. Either way each pass moves the scalefactors toward equal margins
    * and chooses the step again. */
-  bool masks = masked_over(&w, 0u, trial) == 0u;
+  bool masks = masked_over(&w, w.gain_floor, trial) == 0u;
   for (unsigned pass = 0; pass < SHAPE_PASSES; ++pass) {
     unsigned gain;
     bool fits = true;

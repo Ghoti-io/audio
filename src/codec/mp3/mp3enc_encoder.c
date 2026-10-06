@@ -93,9 +93,15 @@ typedef struct {
   unsigned row;
   unsigned granules; ///< Per frame: 2 for MPEG-1, otherwise 1.
   uint32_t sample_rate;
-  unsigned bitrate_index;
-  uint32_t bitrate;
   unsigned reservoir_max;
+  MP3E_Rate rate;
+  unsigned tag_index;     ///< The tag frame's bit rate index.
+  uint32_t tag_bytes;     ///< And its length.
+  bool vbr_tag;           ///< Variable rate: a Xing tag with a table.
+  uint32_t quality;       ///< 1 to 100, for the tag.
+  uint32_t * sizes;       ///< Every audio frame's length, for the table.
+  size_t sizes_count;
+  size_t sizes_capacity;
 
   MP3E_Layout layout[2]; ///< Long, short.
   MP3E_Filter filter[2];
@@ -115,7 +121,6 @@ typedef struct {
 
   uint64_t cursor;
   uint64_t slot_end;
-  uint64_t pad_accumulator;
   Queued * queue;
   unsigned queue_head;
   unsigned queue_count;
@@ -125,58 +130,61 @@ typedef struct {
   uint64_t bytes_out;
   uint64_t tag_position;
   uint16_t music_crc;
-  uint32_t first_frame_bytes;
   GAUD_Result sticky;
 } MP3_Encoder;
 
 /* ---------------------------------------------------------- the tag frame */
 
-/** Write the Info/Xing frame, which stands where the first frame would. */
-static void build_tag_frame(
-    const MP3_Encoder * enc, unsigned char * frame, uint32_t total) {
-  MP3E_Frame_Header h = {
-      .version = enc->version,
-      .bitrate_index = enc->bitrate_index,
-      .rate_index = enc->rate_index,
-      .mode = enc->channels == 1u ? MP3_MODE_SINGLE_CHANNEL : MP3_MODE_STEREO,
-      .channels = enc->channels,
-      .bitrate = enc->bitrate,
-      .sample_rate = enc->sample_rate,
-  };
-  memset(frame, 0, total);
-  gaud_mp3e_header_write(frame, &h);
-  unsigned char * at = frame + 4u + gaud_mp3e_side_bytes(enc->version, enc->channels);
-  memcpy(at, "Info", 4);
-  /* Flags: frames, bytes. A seek table is for a variable-rate file. */
-  at[7] = 0x03;
-  uint32_t frames = (uint32_t)enc->audio_frames;
-  uint32_t bytes = (uint32_t)(enc->bytes_out + total);
-  at[8] = (unsigned char)(frames >> 24);
-  at[9] = (unsigned char)(frames >> 16);
-  at[10] = (unsigned char)(frames >> 8);
-  at[11] = (unsigned char)frames;
-  at[12] = (unsigned char)(bytes >> 24);
-  at[13] = (unsigned char)(bytes >> 16);
-  at[14] = (unsigned char)(bytes >> 8);
-  at[15] = (unsigned char)bytes;
-  unsigned char * lame = at + 16u;
-  memcpy(lame, "Ghoti.io 1", 9);
+/** What the tag frame says, from what has been written so far. */
+static void fill_tag(const MP3_Encoder * enc, MP3E_Tag * tag, unsigned char * toc) {
+  memset(tag, 0, sizeof(*tag));
+  tag->version = enc->version;
+  tag->rate_index = enc->rate_index;
+  tag->channels = enc->channels;
+  tag->bitrate_index = enc->tag_index;
+  tag->frame_bytes = enc->tag_bytes;
+  tag->vbr = enc->vbr_tag;
+  tag->frames = (uint32_t)enc->audio_frames;
+  tag->bytes = (uint32_t)(enc->bytes_out + enc->tag_bytes);
   uint64_t decoded = enc->audio_frames * enc->granules * MP3E_LINES;
-  uint32_t delay = TOTAL_DELAY - MP3_DECODER_DELAY;
-  uint64_t padding_total = decoded - TOTAL_DELAY - enc->samples_in;
-  uint32_t padding = (uint32_t)(padding_total + MP3_DECODER_DELAY);
-  lame[21] = (unsigned char)(delay >> 4);
-  lame[22] = (unsigned char)(((delay & 0xFu) << 4) | ((padding >> 8) & 0xFu));
-  lame[23] = (unsigned char)padding;
-  lame[28] = (unsigned char)(bytes >> 24);
-  lame[29] = (unsigned char)(bytes >> 16);
-  lame[30] = (unsigned char)(bytes >> 8);
-  lame[31] = (unsigned char)bytes;
-  lame[32] = (unsigned char)(enc->music_crc >> 8);
-  lame[33] = (unsigned char)enc->music_crc;
-  uint16_t tag_crc = gaud_mp3e_crc16(frame, 190u, 0);
-  lame[34] = (unsigned char)(tag_crc >> 8);
-  lame[35] = (unsigned char)tag_crc;
+  tag->delay = TOTAL_DELAY - MP3_DECODER_DELAY;
+  uint64_t padding_total = decoded >= TOTAL_DELAY + enc->samples_in
+      ? decoded - TOTAL_DELAY - enc->samples_in
+      : 0u;
+  tag->padding = (uint32_t)(padding_total + MP3_DECODER_DELAY);
+  tag->music_crc = enc->music_crc;
+  tag->music_length = tag->bytes;
+  tag->quality = 100u - enc->quality;
+  switch (enc->rate.mode) {
+  case GAUD_RATE_ABR:
+    tag->vbr_method = 2;
+    tag->bitrate_byte = enc->rate.target_bps / 1000u;
+    break;
+  case GAUD_RATE_VBR:
+    tag->vbr_method = 4;
+    tag->bitrate_byte = gaud_mp3e_bitrate_kbps(enc->version, enc->rate.min_index);
+    break;
+  default:
+    tag->vbr_method = 1;
+    tag->bitrate_byte = gaud_mp3e_bitrate_kbps(enc->version, enc->rate.fixed_index);
+    break;
+  }
+  if (enc->vbr_tag && enc->audio_frames > 0 && enc->sizes_count > 0) {
+    /* Entry i is where, as a 256th of the file, the frame at i per cent of
+     * the duration begins. */
+    uint64_t total = tag->bytes;
+    uint64_t offset = enc->tag_bytes;
+    size_t frame = 0;
+    for (unsigned i = 0; i < 100u; ++i) {
+      size_t want = (size_t)(i * enc->sizes_count / 100u);
+      while (frame < want) {
+        offset += enc->sizes[frame++];
+      }
+      uint64_t value = offset * 256u / total;
+      toc[i] = (unsigned char)(value > 255u ? 255u : value);
+    }
+    tag->toc = toc;
+  }
 }
 
 /* ------------------------------------------------------------ the queue */
@@ -267,25 +275,13 @@ static void to_middle_side(const int32_t * left, const int32_t * right,
 static GAUD_Result encode_frame(MP3_Encoder * enc) {
   MP3E_Frame_Header header = {
       .version = enc->version,
-      .bitrate_index = enc->bitrate_index,
       .rate_index = enc->rate_index,
       .mode = enc->channels == 1u ? MP3_MODE_SINGLE_CHANNEL : MP3_MODE_JOINT_STEREO,
       .channels = enc->channels,
-      .bitrate = enc->bitrate,
       .sample_rate = enc->sample_rate,
   };
-  /* The padding byte, from the fractional part of the frame length. */
-  uint64_t per_frame = (enc->version == MP3_MPEG1 ? 144u : 72u) * (uint64_t)enc->bitrate;
-  uint64_t whole = (enc->pad_accumulator + per_frame) / enc->sample_rate;
-  enc->pad_accumulator = (enc->pad_accumulator + per_frame) % enc->sample_rate;
-  header.padding = whole > per_frame / enc->sample_rate;
-  uint32_t total = (uint32_t)whole;
   uint32_t side_bytes = gaud_mp3e_side_bytes(enc->version, enc->channels);
   uint32_t head = 4u + side_bytes;
-  if (total < head || total > MP3_MAX_FRAME_SIZE) {
-    return GAUD_ERR_INTERNAL;
-  }
-  uint32_t area = total - head;
   if (enc->queue_count >= QUEUE_FRAMES) {
     return GAUD_ERR_INTERNAL;
   }
@@ -359,8 +355,6 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
    * hold in the reservoir at all, the surplus would be stuffed away, so it
    * is spent instead on finer steps. */
   unsigned units = granules * channels;
-  uint64_t base = 8u * (uint64_t)area;
-  uint64_t available = base + 8u * reservoir * 9u / 10u;
   uint32_t need[4] = {0, 0, 0, 0};
   uint64_t needed = 0;
   for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
@@ -377,6 +371,19 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
       needed += need[u];
     }
   }
+  /* The frame's size, now that what it needs is known. */
+  unsigned bitrate_index = gaud_mp3e_rate_choose(&enc->rate, needed, reservoir, head);
+  bool padding = false;
+  uint32_t total = gaud_mp3e_rate_size(&enc->rate, bitrate_index, &padding);
+  if (total < head || total > MP3_MAX_FRAME_SIZE) {
+    return GAUD_ERR_INTERNAL;
+  }
+  uint32_t area = total - head;
+  header.bitrate_index = bitrate_index;
+  header.bitrate = gaud_mp3e_bitrate_kbps(enc->version, bitrate_index) * 1000u;
+  header.padding = padding;
+  uint64_t base = 8u * (uint64_t)area;
+  uint64_t available = base + 8u * reservoir * 9u / 10u;
   uint64_t grant = 0;
   bool recode = false;
   if (needed > available) {
@@ -483,6 +490,17 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
   if (data_bytes > sizeof(data)) {
     enc->cursor += data_bytes - sizeof(data);
   }
+  gaud_mp3e_rate_commit(&enc->rate, bitrate_index);
+  if (enc->sizes_count == enc->sizes_capacity) {
+    size_t capacity = enc->sizes_capacity ? enc->sizes_capacity * 2u : 1024u;
+    uint32_t * grown = gcu_allocator_realloc(enc->allocator, enc->sizes, capacity * sizeof(*grown));
+    if (!grown) {
+      return GAUD_ERR_OOM;
+    }
+    enc->sizes = grown;
+    enc->sizes_capacity = capacity;
+  }
+  enc->sizes[enc->sizes_count++] = total;
   ++enc->audio_frames;
   enc->coded_granules += granules;
   return emit_ready(enc, false);
@@ -672,12 +690,15 @@ static GAUD_Result encoder_finish(GAUD_Encoder * encoder) {
   }
   /* The tag frame is rewritten now that the counts are known. */
   unsigned char tag[MP3_MAX_FRAME_SIZE];
-  build_tag_frame(enc, tag, enc->first_frame_bytes);
+  unsigned char toc[100];
+  MP3E_Tag description;
+  fill_tag(enc, &description, toc);
+  gaud_mp3e_tag_build(&description, tag);
   uint64_t end = gaud_stream_tell(enc->stream);
   if (gaud_stream_seek(enc->stream, (int64_t)enc->tag_position, GAUD_SEEK_SET) != GAUD_OK) {
     return GAUD_ERR_IO;
   }
-  GAUD_Result written = gaud_stream_write(enc->stream, tag, enc->first_frame_bytes);
+  GAUD_Result written = gaud_stream_write(enc->stream, tag, enc->tag_bytes);
   if (written != GAUD_OK) {
     return written;
   }
@@ -694,6 +715,7 @@ static void encoder_close(GAUD_Encoder * encoder) {
   }
   gcu_allocator_free(enc->allocator, enc->queue);
   gcu_allocator_free(enc->allocator, enc->ring);
+  gcu_allocator_free(enc->allocator, enc->sizes);
   gcu_allocator_free(enc->allocator, enc);
 }
 
@@ -720,17 +742,60 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   if (!gaud_mp3e_rate_lookup(params->sample_rate, &version, &rate_index)) {
     return GAUD_ERR_UNSUPPORTED;
   }
-  if (params->rate_control > GAUD_RATE_CBR) {
+  GAUD_Rate_Control mode = params->rate_control == GAUD_RATE_DEFAULT
+      ? GAUD_RATE_CBR
+      : params->rate_control;
+  if (mode > GAUD_RATE_VBR || params->bitrate % 1000u != 0u
+      || params->min_bitrate % 1000u != 0u) {
     return GAUD_ERR_UNSUPPORTED;
   }
+  unsigned lowest = 1;
+  unsigned highest = 14;
+  unsigned fixed_index = 0;
+  uint32_t target_bps = 0;
   unsigned kbps = params->bitrate / 1000u;
-  if (params->bitrate == 0) {
-    kbps = version == MP3_MPEG1 ? (channels == 1u ? 64u : 128u)
-                                : (channels == 1u ? 32u : 64u);
+  if (mode == GAUD_RATE_CBR) {
+    if (kbps == 0) {
+      kbps = version == MP3_MPEG1 ? (channels == 1u ? 64u : 128u)
+                                  : (channels == 1u ? 32u : 64u);
+    }
+    int index = gaud_mp3e_bitrate_index(version, kbps);
+    if (index < 0) {
+      return GAUD_ERR_UNSUPPORTED;
+    }
+    fixed_index = (unsigned)index;
+    lowest = highest = fixed_index;
   }
-  int index = gaud_mp3e_bitrate_index(version, kbps);
-  if (index < 0 || params->bitrate % 1000u != 0u) {
-    return GAUD_ERR_UNSUPPORTED;
+  else {
+    if (params->min_bitrate != 0) {
+      int index = gaud_mp3e_bitrate_index(version, params->min_bitrate / 1000u);
+      if (index < 0) {
+        return GAUD_ERR_UNSUPPORTED;
+      }
+      lowest = (unsigned)index;
+    }
+    if (mode == GAUD_RATE_VBR && kbps != 0) {
+      int index = gaud_mp3e_bitrate_index(version, kbps);
+      if (index < 0) {
+        return GAUD_ERR_UNSUPPORTED;
+      }
+      highest = (unsigned)index;
+    }
+    if (lowest > highest) {
+      return GAUD_ERR_INVALID;
+    }
+    if (mode == GAUD_RATE_ABR) {
+      if (kbps == 0
+          || kbps < gaud_mp3e_bitrate_kbps(version, lowest)
+          || kbps > gaud_mp3e_bitrate_kbps(version, highest)) {
+        return GAUD_ERR_UNSUPPORTED;
+      }
+      target_bps = kbps * 1000u;
+    }
+  }
+  uint32_t quality = params->quality ? params->quality : 50u;
+  if (quality > 100u) {
+    return GAUD_ERR_INVALID;
   }
 
   const GAUD_Allocator * allocator = gaud_stream_allocator(stream);
@@ -757,8 +822,16 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   enc->channels = channels;
   enc->granules = version == MP3_MPEG1 ? 2u : 1u;
   enc->sample_rate = params->sample_rate;
-  enc->bitrate_index = (unsigned)index;
-  enc->bitrate = kbps * 1000u;
+  enc->quality = quality;
+  /* Four tenths of a decibel of signal-to-noise ratio per point of quality,
+   * and the middle of the scale four decibels under the model's own level:
+   * measured against LAME on the same input, that puts the default where
+   * LAME's -V4 is, and the whole range is 40 decibels of how much
+   * quantisation noise the encoder leaves under what the ear masks. */
+  enc->snr_offset_q8 = mode == GAUD_RATE_VBR
+      ? ((int)quality - 50) * 4 * 256 / 10 - 4 * 256
+      : 0;
+  enc->vbr_tag = mode != GAUD_RATE_CBR;
   enc->reservoir_max = version == MP3_MPEG1 ? MP3E_RESERVOIR_MAX_V1 : MP3E_RESERVOIR_MAX_V2;
   MP3_Header probe;
   memset(&probe, 0, sizeof(probe));
@@ -785,15 +858,38 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
     }
     gcu_allocator_free(allocator, id3);
   }
+  gaud_mp3e_rate_init(&enc->rate, mode, version, params->sample_rate, lowest,
+      highest, fixed_index, target_bps);
+  if (failure == GAUD_OK) {
+    /* The tag frame has to be long enough to hold the tag: with a table of
+     * contents and the encoder's extension that is 156 bytes after the
+     * side information; without the table, 52. A constant-rate file keeps
+     * its own rate if that is enough. */
+    uint32_t head = 4u + gaud_mp3e_side_bytes(version, channels);
+    uint32_t needed_bytes = head + (enc->vbr_tag ? 156u : 52u);
+    unsigned index = mode == GAUD_RATE_CBR ? fixed_index : lowest;
+    for (;; ++index) {
+      if (gaud_mp3e_rate_size(&enc->rate, index, NULL) >= needed_bytes || index >= 14u) {
+        break;
+      }
+    }
+    enc->tag_index = index;
+    enc->tag_bytes = gaud_mp3e_rate_size(&enc->rate, index, NULL);
+    if (enc->tag_bytes < needed_bytes) {
+      failure = GAUD_ERR_INTERNAL;
+    }
+    gaud_mp3e_rate_commit(&enc->rate, index);
+    enc->rate.actual_bytes = 0;
+    enc->rate.target_accumulator = 0;
+  }
   if (failure == GAUD_OK) {
     enc->tag_position = gaud_stream_tell(stream);
-    uint64_t per_frame = (version == MP3_MPEG1 ? 144u : 72u) * (uint64_t)enc->bitrate;
-    uint64_t whole = (enc->pad_accumulator + per_frame) / enc->sample_rate;
-    enc->pad_accumulator = (enc->pad_accumulator + per_frame) % enc->sample_rate;
-    enc->first_frame_bytes = (uint32_t)whole;
     unsigned char tag[MP3_MAX_FRAME_SIZE];
-    build_tag_frame(enc, tag, enc->first_frame_bytes);
-    failure = gaud_stream_write(stream, tag, enc->first_frame_bytes);
+    unsigned char toc[100];
+    MP3E_Tag description;
+    fill_tag(enc, &description, toc);
+    gaud_mp3e_tag_build(&description, tag);
+    failure = gaud_stream_write(stream, tag, enc->tag_bytes);
   }
   if (failure == GAUD_OK) {
     failure = gaud_encoder_create_internal(
@@ -802,6 +898,7 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   if (failure != GAUD_OK) {
     gcu_allocator_free(allocator, enc->queue);
     gcu_allocator_free(allocator, enc->ring);
+    gcu_allocator_free(allocator, enc->sizes);
     gcu_allocator_free(allocator, enc);
   }
   return failure;
