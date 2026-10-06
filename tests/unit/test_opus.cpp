@@ -5750,6 +5750,42 @@ TEST(OpusDecode, ACoupledStreamAndAMonoOneFeedThreeChannels) {
   gaud_diagnostics_destroy(&diagnostics);
 }
 
+TEST(OpusDecode, StreamsOfDifferentLengthsInOnePacketAreRefused) {
+  // A coupled 10 ms stream beside a single 20 ms one: every stream of a
+  // packet has to be as long as the others.
+  auto first = AudioPackets("opus_celt_stereo_10ms.opus");
+  auto second = AudioPackets("opus_silk_mono_wb.opus");
+  ASSERT_GE(first.size(), 2u);
+  ASSERT_GE(second.size(), 2u);
+  std::vector<std::vector<unsigned char>> joined;
+  for (size_t i = 0; i < 2; ++i) {
+    auto packet = SelfDelimited(first[i]);
+    packet.insert(packet.end(), second[i].begin(), second[i].end());
+    joined.push_back(packet);
+  }
+  auto file = OggOpus(Head(1, 3, 312, 48000, 0, 255, {2, 1, 0, 1, 2}),
+      joined, 1920);
+  GAUD_Stream * stream = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory(file.data(), file.size(), &stream),
+      GAUD_OK);
+  GAUD_Diagnostics diagnostics;
+  gaud_diagnostics_init(&diagnostics, nullptr);
+  GAUD_Doc * doc = nullptr;
+  ASSERT_EQ(gaud_doc_load(nullptr, stream, nullptr, &diagnostics, &doc),
+      GAUD_OK);
+  GAUD_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_decoder_create(gaud_doc_track(doc, 0), &decoder), GAUD_OK);
+  GAUD_Buffer * buffer = nullptr;
+  ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 960, &buffer),
+      GAUD_OK);
+  EXPECT_EQ(gaud_decoder_read(decoder, buffer), GAUD_ERR_CORRUPT);
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+  gaud_doc_destroy(doc);
+  gaud_stream_destroy(stream);
+  gaud_diagnostics_destroy(&diagnostics);
+}
+
 TEST(OpusDecode, AnOutputGainScalesTheSamplesAsLibopusDoes) {
   // +6.02 dB is about a doubling, and -inf is not representable, so
   // check the two directions and the saturation: a quarter-scale value
@@ -5758,8 +5794,9 @@ TEST(OpusDecode, AnOutputGainScalesTheSamplesAsLibopusDoes) {
   std::vector<int16_t> doubled = samples;
   gaud_opus_apply_gain(doubled.data(), doubled.size(), 1541); // 6.02 dB
   EXPECT_EQ(doubled[0], 0);
-  EXPECT_NEAR(doubled[1], 2000, 3);
-  EXPECT_NEAR(doubled[2], -2000, 3);
+  // 1541 Q8 decibels is 1024 in Q10 octaves, which is exactly a doubling.
+  EXPECT_EQ(doubled[1], 2000);
+  EXPECT_EQ(doubled[2], -2000);
   EXPECT_EQ(doubled[3], 32767);
   EXPECT_EQ(doubled[4], -32767);
   EXPECT_EQ(doubled[5], 32767);

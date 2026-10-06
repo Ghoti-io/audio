@@ -124,6 +124,13 @@ successor. The decoder reads and discards it, as it must, and never uses
 it: a file has no lost packets, and the live-stream API that would ask
 for it does not exist here.
 
+**RFC 8251's corrections.** The decoder is RFC 6716's reference, bit
+for bit. RFC 8251 changes how hybrid frames fold the second CELT band
+and zeroes SILK's stereo state on a mode switch, both of which alter
+output for the streams they touch, and tightens several checks that
+matter only for invalid input. None is applied; doing so is a decision
+to re-pin against a patched reference, not a defect fix.
+
 **Custom modes**, RFC 6716's `opus_custom`: frame sizes and sample rates
 outside the 32 configurations. No encoder in common use makes them.
 

@@ -63,6 +63,7 @@
  * Run:        make fuzz-run-ogg FUZZ_TIME=300
  */
 
+#include "../../src/codec/opus/opus_decoder.h"
 #include "../../src/codec/opus/opus_internal.h"
 #include "../../src/codec/vorbis/vorbis_internal.h"
 #include "../../src/container/ogg/ogg.h"
@@ -404,6 +405,59 @@ void fuzz_opus_toc(const uint8_t * data, size_t size) {
   }
 }
 
+/**
+ * A stream of Opus packets, decoded directly.
+ *
+ * The decoder takes bytes an encoder wrote, so almost nothing a fuzzer
+ * makes is a packet the SILK and CELT parsers were designed for, which
+ * is the point: every flag a real encoder rarely sets - an enormous
+ * redundancy frame, a mid-only stereo frame after a coded one, an LTP
+ * lag past the history - is a branch here. The input is cut into
+ * packets by its own first bytes, and one in four becomes a loss, so
+ * concealment runs after every kind of frame.
+ *
+ * What is asserted is what a caller relies on, not what a decoder
+ * *should* produce: the sample count is the packet's own duration and
+ * never past the buffer, and a decode that says it worked leaves the
+ * range state a number rather than an error.
+ */
+void fuzz_opus_decode(const uint8_t * data, size_t size) {
+  static int16_t pcm[OPUS_MAX_PACKET_SAMPLES * 2u];
+  uint32_t channels = (data[0] & 1u) ? 2u : 1u;
+  OPUS_Decoder * decoder = NULL;
+  if (gaud_opus_decoder_create(NULL, channels, &decoder) != GAUD_OK) {
+    return;
+  }
+  size_t at = 1;
+  for (int packets = 0; at < size && packets < 64; ++packets) {
+    size_t length = 1u + (data[at] % 160u);
+    ++at;
+    if (length > size - at) {
+      length = size - at;
+    }
+    uint32_t got = 0;
+    GAUD_Result result;
+    if (length > 0 && (data[at - 1u] & 0xC0u) == 0xC0u) {
+      /* A loss, of a length taken from the byte. */
+      uint32_t wanted = 120u << (data[at - 1u] & 3u);
+      result = gaud_opus_decode_packet(
+          decoder, NULL, 0, pcm, OPUS_MAX_PACKET_SAMPLES, wanted, &got);
+    }
+    else {
+      result = gaud_opus_decode_packet(decoder, data + at, length, pcm,
+          OPUS_MAX_PACKET_SAMPLES, 0, &got);
+    }
+    if (result == GAUD_OK && got > OPUS_MAX_PACKET_SAMPLES) {
+      abort();
+    }
+    if (result != GAUD_OK && got != 0) {
+      abort();
+    }
+    at += length;
+  }
+  gaud_opus_decoder_destroy(NULL, decoder);
+}
+
 /** One OpusHead, read directly. */
 void fuzz_opus_head(const uint8_t * data, size_t size) {
   size_t total = OPUS_MAGIC_SIZE + size;
@@ -508,7 +562,7 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
    * files would never reach the seek layer: a loader reaches it only
    * after the mapping's signature has already been accepted, and almost
    * every mutation breaks that first. */
-  unsigned mode = data[0] % 7u;
+  unsigned mode = data[0] % 8u;
   const uint8_t * body = data + 1;
   size_t body_size = size - 1u;
   switch (mode) {
@@ -530,8 +584,11 @@ int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   case 5:
     fuzz_opus_toc(body, body_size);
     break;
-  default:
+  case 6:
     fuzz_opus_head(body, body_size);
+    break;
+  default:
+    fuzz_opus_decode(body, body_size);
     break;
   }
   return 0;
