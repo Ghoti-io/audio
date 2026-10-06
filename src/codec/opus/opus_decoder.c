@@ -123,16 +123,26 @@ static int16_t sat16(int32_t value) {
 }
 
 static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
-    uint32_t len, int16_t * pcm, uint32_t frame_size, GAUD_Result * status);
+    uint32_t len, int16_t * pcm, uint32_t frame_size, bool fec,
+    GAUD_Result * status);
 
 /** Conceal @p frame_size samples per channel. */
 static void conceal(OPUS_Decoder * st, int16_t * pcm, uint32_t frame_size) {
   GAUD_Result ignored = GAUD_OK;
-  (void)decode_frame(st, NULL, 0, pcm, frame_size, &ignored);
+  (void)decode_frame(st, NULL, 0, pcm, frame_size, false, &ignored);
 }
 
+/**
+ * Decode one frame, or what stands in for it.
+ *
+ * With @p fec set the frame is read for the *previous* packet's sake:
+ * the SILK redundancy it carries is decoded in place of its own frames,
+ * CELT is concealed as lost, and the redundant 0 to 8 kHz frame is not
+ * looked for. RFC 6716's `decode_fec`.
+ */
 static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
-    uint32_t len, int16_t * pcm, uint32_t frame_size, GAUD_Result * status) {
+    uint32_t len, int16_t * pcm, uint32_t frame_size, bool fec,
+    GAUD_Result * status) {
   uint32_t channels = st->channels;
   int16_t pcm_silk[2u * 2880u];
   int16_t pcm_transition[2u * F5];
@@ -179,7 +189,7 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
   if (!have_data && frame_size > F20 && mode != MODE_SILK) {
     uint32_t done = 0;
     do {
-      int got = decode_frame(st, NULL, 0, pcm, F20, status);
+      int got = decode_frame(st, NULL, 0, pcm, F20, false, status);
       if (got != F20) {
         *status = GAUD_ERR_CORRUPT;
         return 0;
@@ -230,7 +240,7 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
     }
     bool configured = gaud_silk_configure(&st->silk,
         st->silk_channels, (int)channels, st->silk_khz, payload_ms);
-    if (!configured && have_data) {
+    if (!configured && have_data && !fec) {
       *status = GAUD_ERR_CORRUPT;
       return 0;
     }
@@ -241,7 +251,9 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
     } else {
       do {
         int samples = 0;
-        if (have_data) {
+        if (have_data && fec) {
+          gaud_silk_decode_fec(&st->silk, &dec, at, &samples);
+        } else if (have_data) {
           gaud_silk_decode_frame(&st->silk, &dec, at, &samples);
         } else {
           gaud_silk_decode_lost(&st->silk, at, &samples);
@@ -252,7 +264,7 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
     }
   }
 
-  if (have_data && mode != MODE_CELT
+  if (have_data && !fec && mode != MODE_CELT
       && gaud_opus_tell(&dec) + 17u + (mode == MODE_HYBRID ? 20u : 0u)
           <= 8u * len) {
     // A redundant 0 to 8 kHz CELT frame follows the SILK symbols.
@@ -319,7 +331,7 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
     }
     // A frame the redundancy check left with one byte or none is
     // concealed like one that never came, as the reference does.
-    if (!have_data || len <= 1u) {
+    if (!have_data || fec || len <= 1u) {
       // Only the four frame sizes CELT has can be concealed.
       if ((120u << lm) != celt_size) {
         *status = GAUD_ERR_INVALID;
@@ -401,10 +413,9 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
   return (int)audiosize;
 }
 
-GAUD_Result gaud_opus_decode_stream_packet(OPUS_Decoder * st,
-    const unsigned char * data, size_t size, bool self_delimited,
-    int16_t * pcm, uint32_t capacity, uint32_t * out_samples,
-    size_t * consumed) {
+static GAUD_Result decode_stream(OPUS_Decoder * st, const unsigned char * data,
+    size_t size, bool self_delimited, bool fec, int16_t * pcm,
+    uint32_t capacity, uint32_t * out_samples, size_t * consumed) {
   GAUD_Result status = GAUD_OK;
   *out_samples = 0;
   if (consumed) {
@@ -449,7 +460,7 @@ GAUD_Result gaud_opus_decode_stream_packet(OPUS_Decoder * st,
   uint32_t done = 0;
   for (uint32_t i = 0; i < packet.count; ++i) {
     int got = decode_frame(st, packet.frame[i], packet.length[i],
-        pcm + (size_t)done * st->channels, capacity - done, &status);
+        pcm + (size_t)done * st->channels, capacity - done, fec, &status);
     if (status != GAUD_OK) {
       return status;
     }
@@ -457,6 +468,24 @@ GAUD_Result gaud_opus_decode_stream_packet(OPUS_Decoder * st,
   }
   *out_samples = done;
   return GAUD_OK;
+}
+
+GAUD_Result gaud_opus_decode_stream_packet(OPUS_Decoder * st,
+    const unsigned char * data, size_t size, bool self_delimited,
+    int16_t * pcm, uint32_t capacity, uint32_t * out_samples,
+    size_t * consumed) {
+  return decode_stream(st, data, size, self_delimited, false, pcm, capacity,
+      out_samples, consumed);
+}
+
+GAUD_Result gaud_opus_decode_fec(OPUS_Decoder * st, const unsigned char * data,
+    size_t size, int16_t * pcm, uint32_t capacity, uint32_t * out_samples) {
+  *out_samples = 0;
+  if (size == 0 || data == NULL) {
+    return GAUD_ERR_INVALID;
+  }
+  return decode_stream(
+      st, data, size, false, true, pcm, capacity, out_samples, NULL);
 }
 
 GAUD_Result gaud_opus_decode_packet(OPUS_Decoder * st,
@@ -468,7 +497,7 @@ GAUD_Result gaud_opus_decode_packet(OPUS_Decoder * st,
     if (lost_samples > capacity) {
       return GAUD_ERR_INVALID;
     }
-    int got = decode_frame(st, NULL, 0, pcm, lost_samples, &status);
+    int got = decode_frame(st, NULL, 0, pcm, lost_samples, false, &status);
     *out_samples = (uint32_t)got;
     return status;
   }

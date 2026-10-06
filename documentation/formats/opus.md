@@ -130,11 +130,18 @@ missing from the position) in favour of an earlier page or the start.
 
 ## What is not
 
-**Forward error correction.** An Opus packet may carry a low-bitrate copy
-of the *previous* frame so that a lost one can be recovered from its
-successor. The decoder reads and discards it, as it must, and never uses
-it: a file has no lost packets, and the live-stream API that would ask
-for it does not exist here.
+**Forward error correction in a file.** An Opus packet may carry a
+low-bitrate copy of the *previous* packet's frames, so that a lost one
+can be recovered from its successor. It is implemented
+(`gaud_opus_decode_fec`) and agrees with RFC 6716's decoder sample for
+sample, but only the packet decoder offers it: a file has no lost
+packets, and the track decoder never calls it. A caller with a lossy
+transport decodes the packet after a lost one first with that function,
+which plays the copy where there is one and conceals where there is not,
+and then with `gaud_opus_decode_packet`. The length of what comes out is
+the following packet's, as in RFC 6716's `decode_fec`; the wrapper in
+newer libopus that fits a lost span of another length around it is not
+part of this.
 
 **RFC 8251's optional downmix.** Section 10 lets a decoder skip the
 180-degree phase shift of intensity stereo when it is downmixing to
@@ -142,8 +149,11 @@ mono. This one always applies it, which is the plain set of 8251's
 vectors; the `m` set is the other half of that choice and `opus_compare`
 is run against it too if the plain one fails.
 
-**Custom modes**, RFC 6716's `opus_custom`: frame sizes and sample rates
-outside the 32 configurations. No encoder in common use makes them.
+**Custom modes**, libopus's optional `opus_custom` API (not part of
+RFC 6716's decoder): frame sizes and sample rates outside the 32
+configurations, which would need the band tables and transforms built at
+run time. No container carries them and no encoder in common use makes
+them.
 
 **Writing.** Phase 8.
 

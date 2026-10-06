@@ -6542,6 +6542,129 @@ TEST(OpusDecoder, ConcealedPacketsDecodeToExactlyTheReferencesSamples) {
   EXPECT_EQ(run.digest.value, 4703203084191092546ULL);
 }
 
+namespace {
+
+struct FecRun {
+  long packets = 0;
+  long fecs = 0;
+  long refused = 0;
+  long modes[4] = {0, 0, 0, 0};
+  long with_lbrr = 0;
+  long stereo_lbrr = 0;
+  long long_lbrr = 0;
+  Digest digest;
+};
+
+/**
+ * The generator of notes/audio/opus-harness/fecdiff.c, which put the
+ * same packets through RFC 6716's decoder with `decode_fec` set and
+ * compared every sample and every final range state. A third of the
+ * packets after the first are decoded first as the redundancy for the
+ * packet before them and then as themselves.
+ */
+FecRun RunFec(int streams, int per_stream) {
+  FecRun run;
+  std::vector<int16_t> pcm(5760 * 2);
+  std::vector<unsigned char> pkt(1500);
+  for (int s = 0; s < streams; ++s) {
+    uint32_t channels = (s % 3 == 2) ? 1u : 2u;
+    OPUS_Decoder * decoder = nullptr;
+    EXPECT_EQ(gaud_opus_decoder_create(nullptr, channels, &decoder), GAUD_OK);
+    HarnessRandom random = {7654321u + (uint32_t)s * 104729u};
+    int prev_cfg = -1;
+    for (int p = 0; p < per_stream; ++p) {
+      int cfg = (int)(random.Next() % 32);
+      if (random.Next() % 3 == 0 && prev_cfg >= 0) cfg = prev_cfg;
+      prev_cfg = cfg;
+      int stereo = (int)(random.Next() % 2);
+      int code = (int)(random.Next() % 4);
+      int len = 2 + (int)(random.Next() % 200);
+      if (random.Next() % 20 == 0) len = 1 + (int)(random.Next() % 3);
+      pkt[0] = (unsigned char)((cfg << 3) | (stereo << 2) | code);
+      for (int i = 1; i < len; ++i) pkt[i] = (unsigned char)random.Next();
+      if (code == 3 && len >= 2) {
+        int frames = 1 + (int)(random.Next() % 3);
+        pkt[1] = (unsigned char)(frames | ((random.Next() % 2) ? 0x80 : 0));
+        if (pkt[1] & 0x80) {
+          for (int f = 0; f < frames - 1 && 2 + f < len; ++f)
+            pkt[2 + f] = (unsigned char)(1 + random.Next() % 40);
+        }
+      }
+      if (code == 2 && len >= 2) pkt[1] = (unsigned char)(1 + random.Next() % 60);
+      if (code == 1 && (len & 1) == 0) --len;
+      bool fec = p > 0 && random.Next() % 3 == 0;
+      uint32_t got = 0;
+      ++run.packets;
+      if (fec) {
+        ++run.fecs;
+        GAUD_Result result = gaud_opus_decode_fec(
+            decoder, pkt.data(), (size_t)len, pcm.data(), 5760, &got);
+        if (result != GAUD_OK) {
+          ++run.refused;
+        } else {
+          for (uint32_t i = 0; i < got * channels; ++i) run.digest.Fold(pcm[i]);
+          ++run.modes[decoder->mode];
+          if (decoder->mode != 3 && decoder->silk.channel[0].lbrr_flag) {
+            ++run.with_lbrr;
+            run.stereo_lbrr += decoder->silk.channels == 2;
+            run.long_lbrr += decoder->silk.channel[0].frames_per_packet > 1;
+          }
+        }
+      }
+      GAUD_Result result = gaud_opus_decode_packet(
+          decoder, pkt.data(), (size_t)len, pcm.data(), 5760, 0, &got);
+      if (result != GAUD_OK) {
+        ++run.refused;
+        continue;
+      }
+      for (uint32_t i = 0; i < got * channels; ++i) run.digest.Fold(pcm[i]);
+    }
+    gaud_opus_decoder_destroy(nullptr, decoder);
+  }
+  return run;
+}
+
+}  // namespace
+
+TEST(OpusDecoder, RedundancyDecodesToExactlyTheReferencesSamples) {
+  // 2,409 decodes of the redundancy in a following packet, 536 of which
+  // had some to decode: 263 in stereo and 208 in packets of 40 or 60 ms,
+  // where frames the copy does not cover are concealed between ones it
+  // does. The digest and the counts were printed by the harness that
+  // compared each decoded sample and each final range state, for the
+  // redundancy and for the packet decoded after it, with RFC 6716's
+  // decoder, and it reported no difference in any of them; run on
+  // 54,000 packets it reported none either.
+  FecRun run = RunFec(150, 50);
+  EXPECT_EQ(run.packets, 7500);
+  EXPECT_EQ(run.fecs, 2409);
+  EXPECT_EQ(run.refused, 1165);
+  EXPECT_EQ(run.modes[1], 840);
+  EXPECT_EQ(run.modes[2], 273);
+  EXPECT_EQ(run.modes[3], 1022);
+  EXPECT_EQ(run.with_lbrr, 536);
+  EXPECT_EQ(run.stereo_lbrr, 263);
+  EXPECT_EQ(run.long_lbrr, 208);
+  EXPECT_EQ(run.digest.value, 12993314475496888961ULL);
+}
+
+TEST(OpusDecoder, RedundancyNeedsAPacketAndRoomForIt) {
+  OPUS_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_opus_decoder_create(nullptr, 2, &decoder), GAUD_OK);
+  std::vector<int16_t> pcm(5760 * 2);
+  uint32_t got = 99;
+  EXPECT_EQ(gaud_opus_decode_fec(decoder, nullptr, 0, pcm.data(), 5760, &got),
+      GAUD_ERR_INVALID);
+  EXPECT_EQ(got, 0u);
+  // A 20 ms packet in a buffer of 10 ms.
+  std::vector<unsigned char> packet(40, 0x33);
+  packet[0] = (9u << 3) | 0u;
+  EXPECT_EQ(gaud_opus_decode_fec(
+                decoder, packet.data(), packet.size(), pcm.data(), 480, &got),
+      GAUD_ERR_INVALID);
+  gaud_opus_decoder_destroy(nullptr, decoder);
+}
+
 TEST(OpusDecoder, ARefusedPacketStillTellsTheDecoderHowLongItsFramesWere) {
   // The reference reads the table of contents before it validates the
   // packet, so a loss concealed after a refused packet is as long as

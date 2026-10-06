@@ -92,9 +92,11 @@ This is what is implemented:
   differ from a straight read's in their last bits at first and
   converge (a seek near the start, or forward by under 160 ms, is
   exact), and **`OpusHead`'s output gain is applied**, as RFC 7845 asks and libopus
-  does. Not implemented: forward error correction (decoding the in-band
-  redundancy of a *following* packet to cover a lost one) and the custom
-  modes of RFC 6716 Appendix B's `opus_custom`.
+  does. Forward error correction (decoding the in-band
+  redundancy of a *following* packet to cover a lost one) is implemented
+  for the packet decoder and bit-identical to RFC 6716's, but a file
+  never uses it. Not implemented: the custom modes of libopus's optional
+  `opus_custom` API (not part of RFC 6716's decoder).
 
 Each has a page saying what it covers and where it differs: \ref format_wav
 "formats/wav.md", \ref format_aiff "formats/aiff.md", \ref format_coding

@@ -136,12 +136,17 @@ bool gaud_silk_decoder_init(
       gaud_silk_resampler_init(&decoder->resampler[c], fs_khz);
       channel->prev_signal_type = SILK_SIGNAL_INACTIVE;
       channel->prev_lag_index = 0;
-      // The synthesis state is in samples at the old rate and in
-      // units of the old gain, so none of it survives a change of
-      // either. The gain starts at one rather than zero because the
-      // first subframe divides by it.
-      channel->prev_gain_index = 0;
-      channel->prev_gain_q16 = 1 << 16;
+      // The synthesis state is in samples at the old rate, so none of
+      // it survives a change of rate. The last gain used to rescale that
+      // state does: the reference keeps it across a change, because the
+      // state it scales is empty - unless concealment filled it first,
+      // which is what decoding a packet's redundancy ahead of the packet
+      // does. A decoder that has decoded nothing starts it at one, since
+      // the first subframe divides by it.
+      channel->prev_gain_index = 10;
+      if (channel->fs_khz == 0) {
+        channel->prev_gain_q16 = 1 << 16;
+      }
       channel->first_after_reset = true;
       channel->lag_prev = 100;
       channel->plc_signal_type = SILK_SIGNAL_INACTIVE;

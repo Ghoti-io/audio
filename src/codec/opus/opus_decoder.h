@@ -126,6 +126,39 @@ GAUD_Result gaud_opus_decode_packet(OPUS_Decoder * decoder,
     uint32_t lost_samples, uint32_t * out_samples);
 
 /**
+ * @brief Decode what a packet carries of the packet before it.
+ *
+ * Forward error correction, RFC 6716's `decode_fec`. A SILK or hybrid
+ * packet may hold a low-rate copy of the frames of the one before it,
+ * and a receiver that lost that one calls this with the next packet to
+ * play the copy in its place, then ::gaud_opus_decode_packet with the
+ * same packet to play the packet itself.
+ *
+ * What comes out is as long as @p data's own frames, which is the
+ * duration it assumes the lost packet had. A frame the copy does not
+ * cover, and all of a CELT-only packet, is concealed as a lost one is,
+ * so a packet with no copy still yields something. The decoder's state
+ * moves as for a decode of the lost packet, and the packet is then
+ * decoded as the one that follows it.
+ *
+ * Not done: the libopus wrapper's handling of a lost span longer or
+ * shorter than the next packet; the caller chooses what to ask for.
+ *
+ * @param decoder The decoder.
+ * @param data The packet *after* the lost one.
+ * @param size Its length.
+ * @param pcm Receives interleaved 16-bit samples.
+ * @param capacity Room in @p pcm, in samples per channel.
+ * @param out_samples Receives samples per channel.
+ * @return ::GAUD_OK, ::GAUD_ERR_CORRUPT for a packet the format
+ *   refuses, or ::GAUD_ERR_INVALID if @p capacity is too small or there
+ *   is no packet.
+ */
+GAUD_Result gaud_opus_decode_fec(OPUS_Decoder * decoder,
+    const unsigned char * data, size_t size, int16_t * pcm, uint32_t capacity,
+    uint32_t * out_samples);
+
+/**
  * @brief Decode one packet of a multistream's several, or the only one.
  *
  * What ::gaud_opus_decode_packet does, for a packet that may be

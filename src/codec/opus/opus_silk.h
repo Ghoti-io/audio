@@ -585,6 +585,27 @@ void gaud_silk_decode_frame(SILK_Decoder * decoder, OPUS_Range * range,
     int16_t * out, int * out_samples);
 
 /**
+ * @brief Decode the next SILK frame of the packet from its redundancy.
+ *
+ * A packet may carry a low-rate copy of the frames of the packet
+ * before it (RFC 6716 section 4.2.4), so that a receiver that lost
+ * that one can still play something of it. This reads the copy in
+ * place of the regular frame the packet is about, and a frame the copy
+ * does not cover is concealed as a lost one is. Nothing here reads the
+ * regular frames, so what follows the call in the range decoder is of
+ * no use.
+ *
+ * @param decoder The decoder, configured as for the packet's own frames.
+ * @param range The range decoder, at the packet's start for the first
+ *   call.
+ * @param out Receives @c api_channels samples interleaved per output
+ *   sample; room for 960 of them is enough.
+ * @param out_samples Receives how many per channel.
+ */
+void gaud_silk_decode_fec(SILK_Decoder * decoder, OPUS_Range * range,
+    int16_t * out, int * out_samples);
+
+/**
  * @brief Conceal one SILK frame that was not received.
  *
  * Extrapolates from the last good frame: its pitch and spectrum carried

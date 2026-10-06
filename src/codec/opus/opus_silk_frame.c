@@ -187,6 +187,14 @@ void gaud_silk_decode_frame(SILK_Decoder * decoder, OPUS_Range * range,
   finish_frame(decoder, samples, decoder->stereo_pred_q13, out, out_samples);
 }
 
+/** One channel's frame, extrapolated from what came before it. */
+static void conceal_channel(SILK_Channel * channel, int16_t * frame, int length) {
+  gaud_silk_plc_conceal(channel, frame);
+  push_output(channel, frame);
+  gaud_silk_plc_glue(channel, frame, length);
+  gaud_silk_cng(channel, NULL, frame, length);
+}
+
 void gaud_silk_decode_lost(
     SILK_Decoder * decoder, int16_t * out, int * out_samples) {
   int internal = decoder->channels;
@@ -203,10 +211,7 @@ void gaud_silk_decode_lost(
   for (int c = 0; c < internal; ++c) {
     SILK_Channel * channel = &decoder->channel[c];
     if (c == 0 || has_side) {
-      gaud_silk_plc_conceal(channel, samples[c] + 2);
-      push_output(channel, samples[c] + 2);
-      gaud_silk_plc_glue(channel, samples[c] + 2, length);
-      gaud_silk_cng(channel, NULL, samples[c] + 2, length);
+      conceal_channel(channel, samples[c] + 2, length);
     } else {
       memset(samples[c] + 2, 0, (size_t)length * sizeof(int16_t));
     }
@@ -219,4 +224,68 @@ void gaud_silk_decode_lost(
   for (int c = 0; c < internal; ++c) {
     decoder->channel[c].prev_gain_index = SILK_RESET_GAIN_INDEX;
   }
+}
+
+void gaud_silk_decode_fec(SILK_Decoder * decoder, OPUS_Range * range,
+    int16_t * out, int * out_samples) {
+  int frame = decoder->channel[0].frames_decoded;
+  int internal = decoder->channels;
+  int length = decoder->channel[0].frame_length;
+  int16_t samples[2][2 + SILK_MAX_FRAME_LENGTH];
+  SILK_Parameters parameters;
+  int32_t pred_q13[2] = {0, 0};
+  bool mid_only = false;
+
+  if (frame == 0) {
+    gaud_silk_decode_header(decoder, range);
+  }
+  if (internal == 2) {
+    if (decoder->channel[0].lbrr[frame]) {
+      gaud_silk_decode_stereo_pred(range, pred_q13);
+      // As in the regular frames, the flag is only sent when the side
+      // channel has nothing of its own here to say it is present.
+      mid_only = !decoder->channel[1].lbrr[frame]
+          && gaud_silk_decode_mid_only(range);
+    }
+    else {
+      pred_q13[0] = decoder->pred_prev_q13[0];
+      pred_q13[1] = decoder->pred_prev_q13[1];
+    }
+  }
+  bool was_mid_only = decoder->prev_mid_only;
+  if (internal == 2 && !mid_only && was_mid_only) {
+    reset_side_channel(&decoder->channel[1]);
+  }
+  // A side channel that was absent is still concealed if the copy has
+  // nothing for it, but only a copy of its own brings it back.
+  bool has_side = !was_mid_only
+      || (internal == 2 && decoder->channel[1].lbrr[frame]);
+  for (int c = 0; c < internal; ++c) {
+    SILK_Channel * channel = &decoder->channel[c];
+    if (c == 0 || has_side) {
+      if (channel->lbrr[frame]) {
+        SILK_Coding coding = frame > 0 && channel->lbrr[frame - 1]
+            ? SILK_CODE_CONDITIONAL
+            : SILK_CODE_INDEPENDENT;
+        channel->coding = coding;
+        gaud_silk_decode_indices(channel, range, frame, true, coding);
+        gaud_silk_decode_pulses(channel, range);
+        gaud_silk_decode_parameters(channel, &parameters, coding);
+        gaud_silk_decode_core(channel, &parameters, samples[c] + 2);
+        gaud_silk_plc_update(channel, &parameters);
+        channel->loss_cnt = 0;
+        gaud_silk_plc_glue(channel, samples[c] + 2, length);
+        gaud_silk_cng(channel, &parameters, samples[c] + 2, length);
+      }
+      else {
+        conceal_channel(channel, samples[c] + 2, length);
+      }
+    }
+    else {
+      memset(samples[c] + 2, 0, (size_t)length * sizeof(int16_t));
+    }
+    ++channel->frames_decoded;
+  }
+  finish_frame(decoder, samples, pred_q13, out, out_samples);
+  decoder->prev_mid_only = mid_only;
 }
