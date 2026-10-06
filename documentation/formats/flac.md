@@ -129,11 +129,11 @@ framing:
   stream's frames, and in Ogg the frames are scattered through page
   bodies at positions no such table describes. Ogg's granule positions
   are what a seeker reads instead, which is what they are for.
-- **Seeking is linear.** Ogg is designed to be bisected and this does not
-  bisect; it rewinds and decodes forward. A bisection is subtly wrong
-  near the ends and on files with a false `OggS` inside a page body, and
-  it belongs with phase 6, where Vorbis and Opus will want the same code
-  and it can be written once against three codecs' worth of fixtures.
+- **Seeking bisects.** Ogg is designed to be bisected, and this finds a
+  page near the target with the Ogg layer's bisection (a page is found by
+  its checksum, so a false `OggS` inside a body costs a read and nothing
+  else) and decodes forward from it. FLAC frames are self-contained, so the
+  result is exactly what a straight read gives.
 
 The STREAMINFO MD5 still applies, because it is over the samples rather
 than over the file, so `flac -t --ogg` verifies an Ogg FLAC file the same
@@ -180,5 +180,4 @@ never enters.)
 | Bit depths outside 8/16/24/32 | No lossless sample format; a bit depth on ::GAUD_Track closes it. |
 | Variable-blocksize streams are read and never written | Nothing in the reference set writes one either, so the reading side is exercised only by hand-made fixtures. |
 | CUESHEET has no public model | Waiting for the second of its four spellings. |
-| Ogg seeking is linear | Waiting for phase 6, where bisection has three callers. |
 | FLAC in MP4 and Matroska | Phase 9. |

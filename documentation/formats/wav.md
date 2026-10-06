@@ -72,8 +72,11 @@ as a sample on the way back in.
   ::GAUD_ERR_UNSUPPORTED. Reading stays liberal.
 - `WAVE_FORMAT_EXTENSIBLE` wrapping a coded tag. The GUID form and the ADPCM
   extension both want the `cbSize` bytes and no reader expects both.
-- `cue `, `LIST`/`INFO`, `bext` and the other metadata chunks - phase 3. They
-  are skipped by length today, so they do not prevent a file from loading.
+- `cue ` points and `LIST`/`adtl` labels, and every chunk this library has no
+  model for (`smpl`, `inst`, `iXML` and the rest). They are skipped by
+  length - or, for an `adtl` list, kept raw - so they do not prevent a file
+  from loading. `LIST`/`INFO`, `bext` and an `id3 ` chunk are read and
+  written; see \ref metadata.
 
 ## Specification
 

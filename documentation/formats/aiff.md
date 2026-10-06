@@ -78,8 +78,9 @@ answer than saying no.
 ## Not implemented
 
 - Any compressed AIFF-C payload. Refused by name; see above.
-- `MARK`, `INST`, `COMT` and the other metadata chunks - phase 3. Skipped by
-  length today.
+- `MARK`, `INST`, `COMT`, `APPL` and the other chunks this library has no
+  model for. Skipped by length. `NAME`, `AUTH`, `(c) `, `ANNO` and an `ID3 `
+  chunk are read and written; see \ref metadata.
 - AIFF-C's `FVER` is written for float output and is not required on input,
   which is what every reader does in practice.
 

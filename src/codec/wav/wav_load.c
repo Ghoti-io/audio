@@ -371,8 +371,8 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
         }
         if (id_is(chunk, "LIST")) {
           /* A LIST may be any type; only INFO is metadata. An `adtl`
-           * list holds cue labels and is phase 3's out-of-scope
-           * neighbour, so it is kept raw rather than misread. */
+           * list holds cue labels, which have no model here,
+           * so it is kept raw rather than misread. */
           if (size >= 4 && id_is(block, "INFO")) {
             gaud_riff_info_parse(block + 4, (size_t)size - 4u, limits,
                 pending_meta, diagnostics);
@@ -458,7 +458,7 @@ GAUD_Result gaud_wav_open(const GAUD_Codec * codec, GAUD_Stream * stream,
       have_data = true;
       /* Chunks are padded to even length; the pad byte is not part of the
        * data. Seeking past it rather than stopping, because a WAV may carry
-       * metadata after the samples and phase 3 will want it. */
+       * metadata after the samples, and the loop below reads it. */
       uint64_t advance = data_length + (data_length & 1u);
       if (gaud_stream_seekable(stream)) {
         if (gaud_stream_seek(stream, (int64_t)advance, GAUD_SEEK_CUR)

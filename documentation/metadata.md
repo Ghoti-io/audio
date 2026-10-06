@@ -78,11 +78,11 @@ container said nothing" and "this build cannot check" are different
 facts - the difference between *your build is minimal* and *this file is
 corrupt*.
 
-**In phase 3 every picture is ::GAUD_PICTURE_NOT_STATED**, because
-ID3v2's `APIC` states no dimensions. FLAC's `PICTURE` block in phase 4 is
-the first scheme that does. The other three states are reached today only
-by the unit tests, which call the same two functions the FLAC reader will
-- rather than leaving written code that nothing has ever run.
+**An ID3v2 picture is always ::GAUD_PICTURE_NOT_STATED**, because `APIC`
+states no dimensions. FLAC's `PICTURE` block does state them, so a
+picture from a FLAC file is ::GAUD_PICTURE_UNVERIFIED in a build without
+`image` and ::GAUD_PICTURE_VERIFIED or ::GAUD_PICTURE_MISMATCH in one
+with it.
 
 ## Limits
 

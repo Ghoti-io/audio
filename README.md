@@ -393,10 +393,10 @@ The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
 its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-229 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+418 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
-`image` is linked for. 80.7% line coverage from the unit tests alone, which
+`image` is linked for. 86.4% line coverage from the unit tests alone, which
 is the figure that matters for a contributor without the oracle container:
 the gates above cover a great deal that those tests do not.
 
@@ -428,8 +428,8 @@ What is deliberately absent:
   interleave for it and ffmpeg refuses both directions, so writing one would
   produce a file the most widely deployed reader cannot open. Reading stays
   liberal.
-- **MP4 `ilst`, APEv2 and Matroska tags.** Vorbis comment arrived with FLAC
-  in phase 4; the rest arrive with the containers that hold them.
+- **MP4 `ilst`, APEv2 and Matroska tags.** They arrive with the
+  containers that hold them.
 - **LPC subframes on the writing side.** They are read, at every order the
   format allows. Writing them means an autocorrelation and a Levinson-Durbin
   recursion in floating point, and that would end the promise that this
