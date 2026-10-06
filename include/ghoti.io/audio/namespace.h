@@ -126,6 +126,7 @@
 #define GAUD_Encoder GHOTIIO_AUDIO(GAUD_Encoder)
 #define GAUD_Encoder_Vtable GHOTIIO_AUDIO(GAUD_Encoder_Vtable)
 #define GAUD_Ops_Measure GHOTIIO_AUDIO(GAUD_Ops_Measure)
+#define GAUD_Rate_Control GHOTIIO_AUDIO(GAUD_Rate_Control)
 #define GAUD_Sample_Format GHOTIIO_AUDIO(GAUD_Sample_Format)
 #define GAUD_Sample_Layout GHOTIIO_AUDIO(GAUD_Sample_Layout)
 #define GAUD_Track GHOTIIO_AUDIO(GAUD_Track)

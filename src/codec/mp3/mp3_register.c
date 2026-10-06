@@ -114,15 +114,15 @@ static const GAUD_Codec mp3_codec = {
     .size = sizeof(GAUD_Codec),
     .name = "mp3",
     .ctx = NULL,
-    .capabilities = GAUD_CAP_DECODE | GAUD_CAP_METADATA_READ,
-    .encoder_tier = GAUD_ENCODER_NONE,
+    .capabilities = GAUD_CAP_DECODE | GAUD_CAP_ENCODE | GAUD_CAP_METADATA_READ,
+    .encoder_tier = GAUD_ENCODER_STUB,
     .magics = NULL,
     .magic_count = 0,
     .probe = mp3_probe,
     .open = gaud_mp3_open,
     .close = gaud_mp3_close,
     .decoder_open = gaud_mp3_decoder_open,
-    .encoder_open = NULL,
+    .encoder_open = gaud_mp3_encoder_open,
 };
 
 /** @brief Register MPEG audio when the shared library is loaded. */

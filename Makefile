@@ -470,7 +470,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # must run on a machine without one; they are asked for by name, and an
 # absent engine is a failure rather than a skip - a machine with no podman
 # would otherwise look exactly like one where every reference agrees.
-TEST_GATES ?= check-symbols check-aliasing check-fixtures
+TEST_GATES ?= check-symbols check-aliasing check-fixtures check-mp3enc-tables
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 #
@@ -798,6 +798,12 @@ check-opus: ## Fail if a reference disagrees about what an Opus stream is
 check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
 		python3 $(ORACLE)/check_opus.py
+
+check-mp3enc-tables: ## Fail if the MP3 encoder's generated tables are not what its generator yields
+# Offline, because the encoder's tables are derived from the decoder's
+# committed ones and not from the standard; the decoder's own are what
+# check-mpeg's references vouch for.
+	@python3 tools/tables/gen_mp3enc_tables.py --check
 
 check-opus-tables: ## Fail if the generated Opus tables are not what the RFC yields
 # Needs the network, so it is asked for by name and is not in TEST_GATES.

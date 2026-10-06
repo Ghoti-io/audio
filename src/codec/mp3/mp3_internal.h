@@ -368,6 +368,11 @@ void gaud_mp3_close(const GAUD_Codec * codec, GAUD_Doc * doc);
 GAUD_Result gaud_mp3_decoder_open(
     const GAUD_Codec * codec, GAUD_Track * track, GAUD_Decoder ** out);
 
+/** Begin writing an MP3 file; \c mp3enc_encoder.c. */
+GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
+    GAUD_Stream * stream, const GAUD_Encode_Params * params,
+    GAUD_Encoder ** out_encoder);
+
 /**
  * @brief Find the first frame at or after @p start, and parse its header.
  *

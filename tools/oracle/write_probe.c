@@ -39,6 +39,7 @@
 
 #include <ghoti.io/audio/audio.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(int argc, char ** argv) {
@@ -82,6 +83,7 @@ int main(int argc, char ** argv) {
         {"ima-wav", GAUD_CODING_ADPCM_IMA_WAV},
         {"ima-qt", GAUD_CODING_ADPCM_IMA_QT},
         {"ms-adpcm", GAUD_CODING_ADPCM_MS},
+        {"mp3", GAUD_CODING_MPEG_LAYER3},
     };
     bool found = false;
     for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i) {
@@ -103,6 +105,29 @@ int main(int argc, char ** argv) {
        * happen to be s16 would shrink the population without saying so. */
       params.format = gaud_sample_coding_format(params.coding);
     }
+  }
+
+  /* The lossy encoders' settings: write_probe in out codec coding
+   * [kbit/s [cbr|abr|vbr [quality [min kbit/s]]]]. */
+  if (argc > 5) {
+    params.bitrate = (uint32_t)atoi(argv[5]) * 1000u;
+  }
+  if (argc > 6) {
+    if (strcmp(argv[6], "cbr") == 0) {
+      params.rate_control = GAUD_RATE_CBR;
+    }
+    else if (strcmp(argv[6], "abr") == 0) {
+      params.rate_control = GAUD_RATE_ABR;
+    }
+    else if (strcmp(argv[6], "vbr") == 0) {
+      params.rate_control = GAUD_RATE_VBR;
+    }
+  }
+  if (argc > 7) {
+    params.quality = (uint32_t)atoi(argv[7]);
+  }
+  if (argc > 8) {
+    params.min_bitrate = (uint32_t)atoi(argv[8]) * 1000u;
   }
 
   GAUD_Stream * out = NULL;

@@ -140,6 +140,20 @@ GAUD_API uint64_t gaud_decoder_tell(const GAUD_Decoder * decoder);
 GAUD_API GAUD_Track * gaud_decoder_track(const GAUD_Decoder * decoder);
 
 /**
+ * @brief How a lossy encoder spends its bits.
+ *
+ * Zero is "the codec's choice", which for MP3 is constant bit rate - the
+ * one every player and every hardware decoder reads - so a params struct
+ * filled in before this existed keeps meaning what it meant.
+ */
+typedef enum {
+  GAUD_RATE_DEFAULT = 0, ///< The codec's own default.
+  GAUD_RATE_CBR,         ///< Every frame the same size: `bitrate` exactly.
+  GAUD_RATE_ABR,         ///< Frames vary; the file averages `bitrate`.
+  GAUD_RATE_VBR          ///< Frames vary with the audio; `quality` decides.
+} GAUD_Rate_Control;
+
+/**
  * @brief What a file being written should look like.
  *
  * Zero-initialising this is not valid: a sample rate of zero is not a
@@ -190,6 +204,24 @@ typedef struct GAUD_Encode_Params {
    * struct that names metadata and nothing else writes all of it.
    */
   GAUD_Meta_Policy meta_policy;
+  /**
+   * Bits per second, for a lossy coding. Zero chooses a default for the
+   * rate and channel count (128 kbit/s for stereo MPEG-1, 64 for the lower
+   * rates). Ignored by lossless codings. For ::GAUD_RATE_VBR it is the
+   * ceiling a frame may reach, or zero for the format's own.
+   */
+  uint32_t bitrate;
+  /** How the bits are spent; see ::GAUD_Rate_Control. */
+  GAUD_Rate_Control rate_control;
+  /**
+   * For ::GAUD_RATE_VBR: 1 (smallest files) to 100 (best sound). Zero
+   * chooses a default. It states how much quantisation noise the encoder
+   * may leave under what the ear masks, not a bit rate.
+   */
+  uint32_t quality;
+  /** For ::GAUD_RATE_VBR and ::GAUD_RATE_ABR: the least a frame may be.
+   *  Zero is the format's own floor. */
+  uint32_t min_bitrate;
 } GAUD_Encode_Params;
 
 /** @brief 44.1 kHz stereo signed 16-bit, which every format here can write. */
