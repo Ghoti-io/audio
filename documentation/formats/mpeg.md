@@ -2,7 +2,8 @@
 
 MPEG-1, MPEG-2 and MPEG-2.5 audio, Layers I, II and III - which is to say
 MP3 and the two layers nobody calls by name. **Read, in all three
-layers.** There is no encoder; phase 8 brings those.
+layers; written, in Layer III.** See "Writing MP3" below for what the
+encoder does, how it is checked, and what it does not do.
 
 The codec is registered as `mp3`, because that is what the files are
 called. ::GAUD_Sample_Coding keeps the layers apart -
@@ -267,6 +268,146 @@ those fixtures' two channels were bit-identical, so every region of
 every granule saw the same maximum value. The fix was to the corpus's
 signal generator and not to any fixture written for the purpose.
 
+## Writing MP3 {#mpeg_writing}
+
+`gaud_encoder_create("mp3", ...)` with `coding = GAUD_CODING_MPEG_LAYER3`,
+signed 16-bit samples, one or two channels, and any of the nine sampling
+frequencies MPEG-1, 2 and 2.5 define. **It is a full encoder and not a
+stub**, which is a claim about measurement and not about intent; the
+section on checking says what was measured and how weak a proxy it is.
+
+**Settings.** ::GAUD_Encode_Params carries `rate_control`, `bitrate`,
+`min_bitrate` and `quality`:
+
+| `rate_control` | `bitrate` | What it writes |
+| --- | --- | --- |
+| `GAUD_RATE_CBR` (and the default) | the rate, from the version's table; 0 picks 128 kbit/s stereo or 64 mono for MPEG-1 and half that below | every frame the same size |
+| `GAUD_RATE_ABR` | the average wanted; must be in `[min_bitrate, the version's top]` | frames of any size, steered so the file's average lands on it (within about 4 per cent over twelve seconds, measured) |
+| `GAUD_RATE_VBR` | the ceiling, or 0 for the version's top | the smallest frame that holds what the audio needs; `quality` (1 to 100, 0 meaning 50) says how much noise may stand under what the ear masks, a point being 0.4 dB, and the default sits where LAME's `-V4` does on the same input |
+
+**Tags.** An ID3v2.4 tag at the front from the metadata, and a tag frame
+after it that says `Info` for a constant-rate file and `Xing` for any other.
+The tag states the file's frames and bytes, a hundred-entry table of
+contents for a variable-rate one, and - in the extension LAME added - the
+encoder's delay and padding, which are 528 and whatever the last frame
+leaves. The tag is rewritten at the end of the file, so the stream has to
+accept a seek. **The encoder's name field says `Ghoti.io`**, not `LAME`:
+ffmpeg and libmpg123 take the delay and padding only from a tag whose name
+begins `LAME`, `Lavf` or `Lavc`, so they play this encoder's 1,057 samples
+of delay as silence at the start. This library's own decoder, and
+libsndfile's, honour any tag that states one.
+
+**How a frame is made.** In the order a granule travels:
+
+1. A 32-band polyphase analysis and an MDCT of 36 lines or three of 12,
+   which are the decoder's synthesis run backwards - the decoder's window
+   and matrices, scaled by 1/9 and 1/3 so that the pair is the identity.
+2. A psychoacoustic model in the shape of ISO 11172-3's second one: a
+   windowed FFT of 1024 samples (256 for a short block), a per-bin measure of
+   how predictable the bin is from the two spectra before it, energy summed
+   into partitions a third of a Bark wide, Schroeder's spreading function,
+   and a threshold 18 dB under a tone and 6 under noise, never less than the
+   threshold of hearing (taken as 16 dB lower than the textbook curve, because
+   a listener turns a quiet passage up), and held to at least 24 dB of signal-to-noise below
+   600 Hz, falling to 10 at 3 kHz and 3 above. Out of it come the noise
+   each scalefactor band may carry.
+3. Block switching, from that model's thresholds: a window whose energy in a
+   band that matters is ten times that of the two before it, or a granule
+   whose loud window is far over the noise a long block would leave in a
+   band where another window is far under it, starts a transient, and the
+   legal sequences (start, short, stop) follow. A granule's type waits one
+   granule for its successor's, so the encoder runs one granule behind.
+4. Mid/side, per frame, when it costs fewer perceptual bits than left/right;
+   the thresholds of both are then the smaller of the two channels'.
+5. The quantiser, with its two loops, in integers: a table of thresholds
+   finds the value whose requantisation is nearest, the step is bisected to
+   fit the bits or the masking, and each band's scalefactor is moved toward
+   the median margin, both ways, so a surplus buys an even noise-to-mask
+   ratio.
+6. Every granule is first coded as coarsely as masking allows. What that
+   used is what it needed; a frame that can afford all of them is that frame,
+   one that cannot shares what it has in proportion to need, and one that
+   has more than the reservoir should keep spends the rest on finer steps.
+7. An exhaustive search of the Huffman regions and tables (prefix sums per
+   table, every split the format can state), the scalefactor field widths,
+   and scalefactor reuse between the two granules of an MPEG-1 frame.
+8. The bit reservoir: a frame is written once nothing more can land in its
+   main-data area, and what a frame saves is stuffed away only past 511
+   bytes (255 for MPEG-2 and 2.5).
+
+**The same bytes on every architecture.** Everything above is integer
+arithmetic, including the model: its FFT is fixed point with growth bounded
+by construction, the phase prediction is a complex product of unit vectors,
+the logarithm and the power of ten are table routines, and the Bark scale,
+the threshold of hearing and the spreading function are generated tables.
+`make check-golden` encodes seven MP3s - constant, average and variable
+rate, three MPEG versions, with block switching and mid/side - on s390x and
+powerpc64 under qemu and compares bytes with this machine's. It found the
+first thing that was not so: the tag's checksum summed 190 bytes of a frame
+that could be 156, which on one machine was whatever followed it in memory.
+
+**How it is checked**, in three layers, because no single one sees enough:
+
+- *Unit tests* state what a reference cannot be asked: every Huffman code
+  word decodes back through the decoder's own trees; the header writer and
+  the decoder's parser agree over every version, bit rate and rate; the
+  quantiser and the decoder's requantiser are inverses and the fast quantiser
+  agrees with a full search on twenty million values; the model's thresholds
+  sit where the constants say; a burst in silence has far less noise before
+  it than a long block would leave; an impulse comes back at its own sample at
+  every alignment; the file is a function of its samples and not of how they
+  were cut into writes.
+- `make check-mp3-encode` encodes 108 signals - full-scale noise and square
+  waves, the highest frequency the format holds, silence between bursts, a
+  channel silent or inverted, a recording one bit deep - at nine sampling
+  frequencies in all three modes, and requires ffmpeg's decoder, libsndfile's
+  and this library's to read each to the same samples, the tag to be true,
+  every frame's back-pointer and granule lengths to fit the bytes, and the
+  recording to be in the decode. Three deliberately broken files must be
+  rejected.
+- `make check-mp3-quality` scores the encoder against LAME and Shine at the
+  same bit rate with a neurogram similarity - the core of ViSQOL, which is
+  the metric planning/audio.md 11.3 names. **It is not ViSQOL**: no pinned
+  build could be had (it builds with Bazel, and the one PyPI wrapper
+  downloads a binary from a model hub), so this is the same similarity index
+  on a similar spectrogram, written from the published description. It
+  cannot hear, and it knows nothing of masking; what it can do is compare
+  three encoders on one input at one rate, where its calibration drops out.
+  On six signals ours is on average level with LAME and ahead of it on
+  three; on the sound effects of an office suite, which are real recordings,
+  it is ahead of LAME on six of eight at 32 kbit/s, and on two recorded
+  voices at 128 it is within 0.003 of it. Those are not in the repository.
+
+**What the gates found.** Each of these passed the unit tests and every
+comparison with a decoder, because a decoder reads a wrong stream
+faithfully, and so is worth knowing about:
+
+- *A granule's length is a twelve-bit field.* A masked impulse needs about
+  5,000 bits; the length wrapped, every decoder read the truncated granule as
+  written, and the click came back with a fifth of its energy.
+- *A pure tone is one line and silence.* The search for the finest step that
+  fits the bits picked one at which the line clamps, which costs almost
+  nothing and returned the tone at a quarter of its level.
+- *A sum was narrowed before it was scaled.* A full-scale low-frequency wave
+  puts the same sign in all 36 inputs of a subband and its first coefficient
+  is eleven times the largest input.
+- *Noise spread over a quiet window.* A long block spreads quantisation noise
+  evenly over 1,152 samples; a granule loud in one window and nearly silent
+  in another had its noise well over the signal in the quiet one, after an
+  attack as a decay.
+- *Reading past the end of a frame* in the tag's checksum.
+
+**What it does not do.** No intensity stereo and no mixed blocks (an encoder
+that wants them can write them; this one does not), no `subblock_gain`,
+`preflag` or `scalefac_scale` - the quantiser's scalefactors stop at what the
+field widths hold - no lowpass beyond what the model's threshold of hearing
+implies, no Layer I or II, no more than two channels, and no sampling
+frequency but the nine. It is not fast: about five times real time for
+stereo at 44.1 kHz on one core. And it was tuned against synthetic signals
+and eight low-rate sound effects, because no music could be had to tune
+against; a collection of real music is the first thing that would improve
+it.
+
 ## Known gaps
 
 Three entries left this list when MPEG-2.5 was implemented, and one of
@@ -295,8 +436,7 @@ stereo at 8 kHz agreed with both references to one bit while mono was
   that would settle it, so neither reading is implemented in preference:
   8 kHz mixed blocks take the same 36 lines as everything else and the
   disagreement is recorded here.
-- **No encoder.** Phase 8, with the two-gate harness perceptual output
-  needs.
+- **Layers I and II are not written.** The encoder is Layer III only.
 - **The free format**, which states no bitrate, so a frame's length is
   the distance to the next sync word. Refused by name.
 - **A non-seekable stream.** The length comes from the file's size and

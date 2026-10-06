@@ -2,9 +2,10 @@
 
 Sound in C, as a container of tracks with metadata, read and written.
 
-**Phases 1 through 5 of ten.** WAV, AIFF and FLAC read and write,
-losslessly, with tags and cover art; **MPEG audio - MP3 and its two
-sibling layers - reads**, in integer arithmetic, to the same bytes on
+**Phases 1 through 5 of ten, and the first encoder of phase 8.** WAV, AIFF
+and FLAC read and write, losslessly, with tags and cover art; **MPEG
+audio - MP3 and its two sibling layers - reads**, and **MP3 is written**,
+with a psychoacoustic model, in integer arithmetic, to the same bytes on
 every architecture. Over the base object, the pull decoder and the public
 codec SDK. [Status](#status) says precisely what that means, and
 `planning/audio.md` in the workspace is the design it is being built to.
@@ -55,6 +56,21 @@ This is what is implemented:
   own row is extracted from a CC0 implementation and calibrated on the
   twelve rows two standards also define. See \ref format_mpeg
   "formats/mpeg.md".
+
+  **MP3 is also written** - Layer III at every sampling frequency, mono or
+  stereo, as constant, average or variable bit rate (`rate_control`,
+  `bitrate`, `min_bitrate` and `quality` in ::GAUD_Encode_Params), with an
+  ID3v2.4 tag and an Info or Xing frame carrying the length, a seek table and
+  the encoder's delay and padding. It is a full encoder and not a stub: a
+  psychoacoustic model after ISO 11172-3's second, block switching, mid/side,
+  and the two loops of a rate-distortion quantiser, every step in integer
+  arithmetic, so that the file is **the same bytes on every architecture**
+  (`make check-golden`, on s390x and powerpc64). Read by ffmpeg, libsndfile
+  and this library to the same samples (`make check-mp3-encode`, 108
+  signals), and scored against LAME and Shine at the same rate
+  (`make check-mp3-quality`), with the metric's limits stated where it is
+  defined. Not yet: intensity stereo, mixed blocks, Layers I and II, and a
+  speed better than about five times real time.
 
 - **Vorbis** - Vorbis I in Ogg, **read and decoded**. The three header
   packets - including the whole setup header, which is the codebooks, both
@@ -199,6 +215,27 @@ int identify(const void * bytes, size_t length) {
 
 The format is recognised from the bytes. The extension is not consulted and is
 not available here, which is the point: a `.wav` holding MP3 frames exists.
+
+And the other direction - any readable file, written as MP3:
+
+```c
+GAUD_Encode_Params params;
+gaud_encode_params_default(&params);
+params.format = GAUD_SAMPLE_S16;               /* the encoder takes 16 bits */
+params.coding = GAUD_CODING_MPEG_LAYER3;
+params.sample_rate = 44100;                    /* any of the nine MPEG has */
+params.layout = gaud_channel_layout_default(2);
+params.rate_control = GAUD_RATE_VBR;           /* or _CBR, or _ABR */
+params.quality = 60;                           /* 1 to 100; 50 is about LAME -V4 */
+
+GAUD_Encoder * encoder = NULL;
+gaud_encoder_create("mp3", NULL, sink, &params, &encoder);
+/* ... gaud_encoder_write() as many buffers as there are ... */
+gaud_encoder_finish(encoder);   /* rewrites the tag frame: the sink must seek */
+```
+
+`examples/encode_mp3.c` is that, complete, with the 24-bit-to-16-bit
+conversion a caller is entitled to choose the dither for.
 
 ## Compile and link
 
@@ -373,7 +410,9 @@ How it is judged:
 | `make check-opus-vectors` | **RFC 6716 section 6, in full**, on its twelve conformance vectors (75 MB, fetched deliberately by `make opus-vectors`, pinned by hash): every one of 20,075 packets ends on exactly the reference's final range decoder state; `opus_compare` accepts every output; and every output is *identical to the bit* to what the RFC's own fixed-point decoder, patched as RFC 8251 says, writes, which section 6 does not ask for and which is pinned per vector. It was seen to fail: a single wrong all-pass coefficient in the resampler leaves every range state intact and is caught by the other two |
 | `make check-vorbis-synth` | The Vorbis decode of **eighteen streams written by hand** for the parts of the format no encoder writes - a floor of type 0 in every shape its parameters allow, residue type 0, books that state every vector, coupled pairs with one channel silent - against ffmpeg's native decoder and libvorbis, which are two implementations and agree with each other to one bit: 34 comparisons over 658,112 samples, none more than **two of 32,768** off. The fixtures are regenerated and compared byte for byte, the frame counts are the specification's own arithmetic, and three wrong answers must be rejected. One exclusion, asserted rather than assumed: ffmpeg's decoder refuses a lookup-type-2 book, so those two are scored against libvorbis alone |
 | `make check-vorbis` | The Vorbis decode against ffmpeg's native decoder, and what a Vorbis stream *is* against two independent readings of it. 66,321 samples compared, worst difference **one of 32,768**; 60 comparisons of rate, channels and length against `ffprobe`'s `duration_ts` and libsndfile, and 10 more against the frame count the generator fed each encoder, which involves no decoder at all. Nine wrong answers go through the same comparison and must be rejected, six decibels down and silence among them. **Two exclusions, and they point opposite ways**: ffmpeg's demuxer gets the length wrong, and libsndfile *wraps* on the samples that exceed full scale where ffmpeg clips - 60 of one fixture's 1,601 do, and ffmpeg's float output agrees with ours to five decimal places there. Two questions, two answers, the same two tools |
-| `make check-golden` | 124 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only. **Phase 5 is what this gate was built for**, and phase 6 is what it earned: an MPEG decoder is a filterbank and an inverse transform, a Vorbis decoder is a fast Fourier transform with its own rounding at every stage, and byte-identical output everywhere is a promise about this library that no floating-point reference can be asked to confirm |
+| `make check-mp3-encode` | **What the MP3 encoder writes, read by two decoders that are not ours.** 108 encodes - full-scale noise and square waves, the highest frequency the format holds, silence between bursts, a silent or inverted channel, a signal one bit deep - at nine sampling frequencies in all three rate modes, each decoded by ffmpeg's native decoder, libsndfile's minimp3 and this library to the same samples; the tag's frames, bytes, delay and padding checked against the file; every frame's back-pointer and granule lengths checked against what the bytes hold; and the recording correlated with the input, which no comparison between decoders can do, because a decoder reads a wrong stream faithfully. Three files that are wrong - a frame dropped, a back-pointer past the start, a granule longer than its frame - must be rejected |
+| `make check-mp3-quality` | **How the MP3 encoder sounds, against LAME and Shine at the same rate**, with a neurogram similarity - the core of ViSQOL, reimplemented, because no pinned ViSQOL could be had, and said so in the file that defines it. Six signals; ours within 0.03 of LAME on each and 0.01 on average (today the average is level), never behind Shine. The metric must also move with noise added and with LAME's bit rate and not with delay - three controls |
+| `make check-golden` | 127 fixtures decode to the same sample values on two big-endian targets, which is where each codec's byte-swapping actually runs - and 5 of them *re-encode* to identical bytes there, which is the same promise applied to the writer and why the FLAC encoder is integer-only; and **seven MP3 encodes** - constant, average and variable rate, three MPEG versions, block switching and mid/side - are byte-identical too, which is what a perceptual model written in integers is for. It is also what found the first thing wrong in the tag frame: a checksum over bytes past the end of the frame **Phase 5 is what this gate was built for**, and phase 6 is what it earned: an MPEG decoder is a filterbank and an inverse transform, a Vorbis decoder is a fast Fourier transform with its own rounding at every stage, and byte-identical output everywhere is a promise about this library that no floating-point reference can be asked to confirm |
 | `make check-outoftree` | A codec in another repository works |
 | `make fuzz` | Six harnesses asserting the caller-facing invariants, not merely the absence of a crash - `wav`, `aiff` and `flac` at the container boundary, `tags`, `coded`, which drives the block layer below any container because a container fuzzer must synthesise a valid header before it reaches a nibble and almost never does, and `mpeg`, where the opposite is true: MPEG audio has no container to synthesise, so nearly every input reaches the frame search. `coded` found a real defect in its first minute; `mpeg` found two in its first ten, and neither was a crash - a header struct whose padding made two parses of one header compare unequal, and a document whose audio began past the end of its own file. **It then found eight more on a corpus that had grown since**, all one defect: every addition in the Q28 pipeline was signed overflow on a frame that states a legal global_gain near the top of its eight-bit range. The corpus is tracked in the repository for exactly this - it is the population that walks the arithmetic, and a run against a bigger one is a different experiment |
 | `make mpeg-coverage` | The same instrument for MPEG audio, and the same reason: 63 of 72 named arms are reached by the corpus, and **no reachable arm is now unreached**. Two of the remaining nine are unreachable by construction (the standard marks those Huffman tables unused), five need an encoder nothing in the image is - LAME has never implemented intensity stereo, and nothing emits a mixed block - and two are covered by unit tests on hand-built frames instead. The last five Huffman tables fell to one change: giving the stereo noise and transient fixtures channels that actually differ |
@@ -399,7 +438,7 @@ The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
 its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-418 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+470 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
 `image` is linked for. 86.4% line coverage from the unit tests alone, which
