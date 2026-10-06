@@ -807,9 +807,9 @@ check-opus-tables: ## Fail if the generated Opus tables are not what the RFC yie
 # properties every distribution has to have.
 	@python3 tools/tables/gen_opus_tables.py --check
 
-opus-vectors: ## Fetch RFC 6716's conformance vectors (39 MB, deliberate)
+opus-vectors: ## Fetch RFC 8251's conformance vectors (75 MB, deliberate)
 # Separate from the gate that reads them, and for the same reason `corpus`
-# is separate from `check-corpus`: a gate that downloads 39 MB the first
+# is separate from `check-corpus`: a gate that downloads 75 MB the first
 # time it runs means something different on its first run than on its
 # second. The hash is checked before anything is unpacked.
 	@python3 $(ORACLE)/opus_vectors.py --fetch

@@ -772,9 +772,32 @@ void gaud_celt_quant_all_bands(OPUS_Range * range, const CELT_Mode * mode,
       bits = 0;
     }
 
-    if ((int32_t)band_start - n >= (int32_t)(m * (uint32_t)mode->edges[start])
+    // RFC 8251 section 9. In a hybrid frame at a low bit rate only one
+    // CELT band may be coded, and the second is wider than it, so it had
+    // nothing to fold from and fell back to noise - audible as pre-echo
+    // on a transient. The second band is therefore always allowed to
+    // fold, from the first band repeated far enough to cover it. For a
+    // CELT-only frame the first two bands are the same width and nothing
+    // is copied.
+    if (((int32_t)band_start - n >= (int32_t)(m * (uint32_t)mode->edges[start])
+            || i == start + 1u)
         && (update_lowband || lowband_offset == 0)) {
       lowband_offset = i;
+    }
+    if (i == start + 1u) {
+      int32_t n1 = (int32_t)(m
+          * (uint32_t)(mode->edges[start + 1u] - mode->edges[start]));
+      int32_t n2 = (int32_t)(m
+          * (uint32_t)(mode->edges[start + 2u] - mode->edges[start + 1u]));
+      int32_t offset = (int32_t)(m * (uint32_t)mode->edges[start]);
+      if (n2 > n1) {
+        memmove(&norm[offset + n1], &norm[offset + 2 * n1 - n2],
+            (size_t)(n2 - n1) * sizeof *norm);
+        if (channels == 2u) {
+          memmove(&norm2[offset + n1], &norm2[offset + 2 * n1 - n2],
+              (size_t)(n2 - n1) * sizeof *norm2);
+        }
+      }
     }
 
     // What the bands being folded from can offer. Over-estimating is
@@ -791,8 +814,9 @@ void gaud_celt_quant_all_bands(OPUS_Range * range, const CELT_Mode * mode,
           > effective_lowband) {
       }
       fold_end = lowband_offset - 1u;
-      while ((int32_t)(m * (uint32_t)mode->edges[++fold_end])
-          < effective_lowband + n) {
+      while (++fold_end < i
+          && (int32_t)(m * (uint32_t)mode->edges[fold_end])
+              < effective_lowband + n) {
       }
       x_mask = 0;
       y_mask = 0;

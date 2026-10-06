@@ -68,8 +68,14 @@ given: SILK runs at 8, 12 or 16 kHz and is resampled up by the same
 filter the reference uses, and that filter is part of what conformance
 compares.
 
-**It is bit-identical to RFC 6716's own decoder**, which is the fixed-point
-build of the code printed in Appendix A, and not merely close. Section 6
+**It is bit-identical to RFC 6716's own decoder**, the fixed-point build of
+the code printed in Appendix A with **RFC 8251's update applied**, and not
+merely close. The update's five decoder changes are all here: SILK's
+stereo state is cleared on a mode switch; the second band of a hybrid
+frame can always fold, from the first band repeated; the inverse
+prediction gain treats a recursion that leaves 32 bits as unstable; the
+LSF stabilisation's fallback saturates; and the band-energy cap, which
+is a no-op in fixed point because the quantity is already 16 bits. Section 6
 asks for two things: that `opus_compare` accepts the output, and that the
 decoder's final range decoder state after every packet is the
 reference's. The second is an exact equality over every symbol a frame
@@ -124,12 +130,11 @@ successor. The decoder reads and discards it, as it must, and never uses
 it: a file has no lost packets, and the live-stream API that would ask
 for it does not exist here.
 
-**RFC 8251's corrections.** The decoder is RFC 6716's reference, bit
-for bit. RFC 8251 changes how hybrid frames fold the second CELT band
-and zeroes SILK's stereo state on a mode switch, both of which alter
-output for the streams they touch, and tightens several checks that
-matter only for invalid input. None is applied; doing so is a decision
-to re-pin against a patched reference, not a defect fix.
+**RFC 8251's optional downmix.** Section 10 lets a decoder skip the
+180-degree phase shift of intensity stereo when it is downmixing to
+mono. This one always applies it, which is the plain set of 8251's
+vectors; the `m` set is the other half of that choice and `opus_compare`
+is run against it too if the plain one fails.
 
 **Custom modes**, RFC 6716's `opus_custom`: frame sizes and sample rates
 outside the 32 configurations. No encoder in common use makes them.
@@ -140,7 +145,7 @@ outside the 32 configurations. No encoder in common use makes them.
 
 `make check-opus-vectors` is section 6 of RFC 6716 as a gate, and the
 strictest in the library. It decodes the twelve conformance vectors
-(39 MB, fetched deliberately by `make opus-vectors` and pinned by hash)
+(75 MB, fetched deliberately by `make opus-vectors` and pinned by hash)
 and requires, for each: every packet accepted; every one of the 20,075
 final range decoder states equal to the vector's; `opus_compare`, run in
 the pinned reference image, accepting the output; and the output equal

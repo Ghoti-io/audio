@@ -4299,7 +4299,7 @@ TEST(OpusBands, EveryFrameDecodesToTheReferencesSpectrum) {
     }
   }
   EXPECT_EQ(cases, 18432u);
-  EXPECT_EQ(digest, 0x99D999DC77FB9A79ull);
+  EXPECT_EQ(digest, 0x5BD1B9FEE3F117CFull);
 }
 
 TEST(OpusBands, TheHadamardReorderingIsItsOwnInverse) {
@@ -5480,12 +5480,12 @@ TEST(OpusDecode, EveryFixtureDecodesToExactlyTheReferencesSamples) {
   } cases[] = {
       {"opus_celt_5dot1.opus", 4800, 6, 10768649527793295339ULL},
       {"opus_celt_lowdelay_2ms5.opus", 9600, 2, 17750459195125432731ULL},
-      {"opus_celt_mono_60ms.opus", 9600, 1, 88819465325557002ULL},
+      {"opus_celt_mono_60ms.opus", 9600, 1, 10490442963237132543ULL},
       {"opus_celt_mono_swb.opus", 9600, 1, 497828282014136728ULL},
       {"opus_celt_silence.opus", 4800, 2, 15262894102733591427ULL},
       {"opus_celt_stereo_10ms.opus", 9600, 2, 15024168989242230706ULL},
       {"opus_celt_stereo_96k.opus", 9600, 2, 11511743838953620795ULL},
-      {"opus_hybrid_mono_fb.opus", 9600, 1, 14444781928337212210ULL},
+      {"opus_hybrid_mono_fb.opus", 9600, 1, 11185602311325859669ULL},
       {"opus_hybrid_mono_swb.opus", 9600, 1, 8769112344589667408ULL},
       {"opus_silk_mono_40ms.opus", 9600, 1, 3098424118183910357ULL},
       {"opus_silk_mono_mb.opus", 9600, 1, 6213081264931631977ULL},
@@ -5834,6 +5834,77 @@ struct Digest {
 
 }  // namespace
 
+TEST(Opus8251, LsfDecodingOnExtremeIndicesMatchesTheUpdatedReference) {
+  // RFC 8251 section 7. Stage-2 indices out to +-10 are the ones that
+  // reach the extension symbol, and so the fallback's saturating add.
+  // The digest is of the patched reference's output, and the harness
+  // (notes/audio/opus-harness/silk8251.c) compared every vector too.
+  Digest digest;
+  long cases = 0;
+  for (int wb = 0; wb < 2; ++wb) {
+    int order = wb ? 16 : 10;
+    for (int cb1 = 0; cb1 < 32; ++cb1) {
+      for (uint32_t s = 0; s < 4000; ++s) {
+        int8_t index[17];
+        index[0] = (int8_t)cb1;
+        HarnessRandom random = {s * 40503u + (uint32_t)(cb1 * 131 + wb)};
+        auto next = [&random]() {
+          random.state = random.state * 1103515245u + 12345u;
+          return random.state >> 8;
+        };
+        int range = (int)(s % 11);
+        for (int i = 0; i < order; ++i) {
+          index[i + 1] = (int8_t)((int)(next() % (uint32_t)(2 * range + 1))
+              - range);
+        }
+        int16_t nlsf[16];
+        gaud_silk_nlsf_decode(nlsf, index, wb != 0);
+        for (int i = 0; i < order; ++i) {
+          digest.Fold(nlsf[i]);
+        }
+        ++cases;
+      }
+    }
+  }
+  EXPECT_EQ(cases, 256000);
+  EXPECT_EQ(digest.value, 16428528555729022787ULL);
+}
+
+TEST(Opus8251, InverseGainOnOverflowingFiltersMatchesTheUpdatedReference) {
+  // RFC 8251 section 6: filters whose recursion leaves 32 bits are
+  // unstable rather than undefined. Half of these are.
+  Digest digest;
+  long stable = 0;
+  long cases = 0;
+  for (int wb = 0; wb < 2; ++wb) {
+    int order = wb ? 16 : 10;
+    for (uint32_t s = 0; s < 60000; ++s) {
+      int16_t lpc[16];
+      uint32_t state = s * 7919u + (uint32_t)wb;
+      auto next = [&state]() {
+        state = state * 1103515245u + 12345u;
+        return state >> 8;
+      };
+      int mode = (int)(s % 4);
+      for (int i = 0; i < order; ++i) {
+        int v;
+        if (mode == 0) v = (int)(next() % 65536) - 32768;
+        else if (mode == 1) v = (int)(next() % 8192) - 4096;
+        else if (mode == 2) v = (int)(next() % 1200) - 600;
+        else v = (int)(next() % 400) - 200 + (i == 0 ? 3000 : 0);
+        lpc[i] = (int16_t)v;
+      }
+      int32_t gain = gaud_silk_lpc_inverse_gain(lpc, order);
+      digest.Fold(gain);
+      stable += gain != 0;
+      ++cases;
+    }
+  }
+  EXPECT_EQ(cases, 120000);
+  EXPECT_EQ(stable, 59855);
+  EXPECT_EQ(digest.value, 10507341320392156988ULL);
+}
+
 TEST(OpusSilkOutput, TheResamplerMatchesTheReferenceAtEveryRate) {
   // 9,000 frames of 10 and 20 ms at the three SILK rates, with white
   // noise, quiet noise, a full-scale square wave and a slow square
@@ -6097,7 +6168,7 @@ TEST(OpusDecoder, RandomPacketsDecodeToExactlyTheReferencesSamples) {
   EXPECT_EQ(run.redundancy[1], 388);
   EXPECT_EQ(run.redundancy[2], 443);
   EXPECT_EQ(run.mono, 50);
-  EXPECT_EQ(run.digest.value, 982450114296123256ULL);
+  EXPECT_EQ(run.digest.value, 14400973265117624860ULL);
 }
 
 TEST(OpusDecoder, ConcealedPacketsDecodeToExactlyTheReferencesSamples) {
@@ -6114,7 +6185,7 @@ TEST(OpusDecoder, ConcealedPacketsDecodeToExactlyTheReferencesSamples) {
   EXPECT_EQ(run.modes[3], 2842);
   EXPECT_EQ(run.redundancy[1], 365);
   EXPECT_EQ(run.redundancy[2], 368);
-  EXPECT_EQ(run.digest.value, 7171383989736018314ULL);
+  EXPECT_EQ(run.digest.value, 4703203084191092546ULL);
 }
 
 TEST(OpusDecoder, ARefusedPacketStillTellsTheDecoderHowLongItsFramesWere) {

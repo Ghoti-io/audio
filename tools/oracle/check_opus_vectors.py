@@ -8,7 +8,7 @@
 # Ghoti.io Audio is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""RFC 6716's conformance vectors, decoded with this library's Opus decoder.
+"""RFC 8251's conformance vectors, decoded with this library's Opus decoder.
 
 Section 6 of RFC 6716 defines compliance in two parts, and this is the
 only gate in the library whose standard is set by a document rather than
@@ -36,7 +36,7 @@ What this gate asserts, for each of the twelve vectors:
   - `opus_compare`, run in the pinned reference image, says the output
     passes against the vector's `.dec` file; and
   - the output is *identical*, bit for bit, to what RFC 6716's own
-    fixed-point decoder writes. That last is stronger than section 6
+    fixed-point decoder writes with RFC 8251's patch applied. That last is stronger than section 6
     asks and is pinned in `opus_vectors.DECODED_SHA256`, with the reason
     those hashes are not the `.dec` files'.
 
@@ -105,17 +105,28 @@ def decode(probe, where, name, out_dir):
 
 
 def opus_compare(where, name, pcm, out_dir):
-    """What `opus_compare` says of our output, in the pinned image."""
-    reference = os.path.join(where, name + ".dec")
-    command = oracle_env.command(
-        "opus_compare", ["opus_compare", "-s", reference, pcm],
-        scratch=[where, out_dir])
-    result = subprocess.run(command, capture_output=True, text=True)
-    # opus_compare reports on stderr; the engine adds a banner of its own.
-    lines = [line for line in (result.stdout + result.stderr).splitlines()
-             if line.startswith(("Test vector", "Opus quality"))]
-    passed = result.returncode == 0 and "Test vector PASSES" in lines
-    return passed, lines[-1:] or ["no verdict"]
+    """What `opus_compare` says of our output, in the pinned image.
+
+    RFC 8251 section 11: a decoder is compliant if it passes against
+    either decoded output of a vector, the plain one or the one (`m`)
+    made without intensity stereo's 180-degree phase shift. Ours applies
+    the shift, so the plain one is tried first; the other is tried only
+    if it fails, and the verdict names which.
+    """
+    said = []
+    for suffix in (".dec", "m.dec"):
+        reference = os.path.join(where, name + suffix)
+        command = oracle_env.command(
+            "opus_compare", ["opus_compare", "-s", reference, pcm],
+            scratch=[where, out_dir])
+        result = subprocess.run(command, capture_output=True, text=True)
+        # opus_compare reports on stderr; the engine adds a banner.
+        lines = [line for line in (result.stdout + result.stderr).splitlines()
+                 if line.startswith(("Test vector", "Opus quality"))]
+        if result.returncode == 0 and "Test vector PASSES" in lines:
+            return True, [suffix] + lines[-1:]
+        said = lines[-1:] or ["no verdict"]
+    return False, said
 
 
 def main(argv):

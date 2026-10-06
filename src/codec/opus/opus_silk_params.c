@@ -267,30 +267,27 @@ static void nlsf_stabilize(
   // another - so the fallback sorts and then walks the whole vector
   // once, which always succeeds and sounds worse.
   //
-  // **The forward pass is held to int16 range here and is not in
-  // Appendix A, and that is a deliberate difference.** A normalized
-  // LSF is a frequency between zero and one and `silk_NLSF2A` asserts
-  // as much, but the reference's own fallback writes
-  // `NLSF[i-1] + spacing[i]` into an int16 without a ceiling: when the
-  // vector has been pushed up against 32767 the sum wraps, the last
-  // coefficient comes out at -32766, and `silk_NLSF2A` then indexes
-  // its 129-entry cosine table at -128. That is reachable from a legal
-  // bitstream - it needs a stage-2 index of five or more, which means
-  // the extension symbol, and it happened in 1,706 of 256,000
-  // synthetic vectors here. Section 6 makes the reference normative
-  // where its behaviour is defined, and reading before the start of an
-  // array is not; so the wrap is removed rather than reproduced.
+  // **The forward pass saturates at 32767, as RFC 8251 section 7
+  // requires.** RFC 6716's reference wrote `NLSF[i-1] + spacing[i]` into
+  // an int16 unchecked: when the vector had been pushed up against
+  // 32767 the sum wrapped, the last coefficient came out at -32766, and
+  // `silk_NLSF2A` then indexed its 129-entry cosine table at -128. That
+  // is reachable from a legal bitstream - it needs a stage-2 index of
+  // five or more, which means the extension symbol, and it happened in
+  // 1,706 of 256,000 synthetic vectors - and this decoder removed the
+  // wrap with a ceiling of its own before RFC 8251 stated the fix. The
+  // fix is a saturating add, which is what this is now.
   insertion_sort(nlsf_q15, order);
-  int32_t ceiling = (1 << 15) - spacing[order];
   if (nlsf_q15[0] < spacing[0]) {
     nlsf_q15[0] = spacing[0];
   }
   for (int i = 1; i < order; ++i) {
-    int32_t least = nlsf_q15[i - 1] + spacing[i];
+    int32_t least = gaud_silk_sat16(nlsf_q15[i - 1] + spacing[i]);
     if (nlsf_q15[i] < least) {
-      nlsf_q15[i] = (int16_t)(least < ceiling ? least : ceiling);
+      nlsf_q15[i] = (int16_t)least;
     }
   }
+  int32_t ceiling = (1 << 15) - spacing[order];
   if (nlsf_q15[order - 1] > ceiling) {
     nlsf_q15[order - 1] = (int16_t)ceiling;
   }
@@ -424,11 +421,21 @@ int32_t gaud_silk_lpc_inverse_gain(const int16_t * lpc_q12, int order) {
     int32_t * previous = current;
     current = work[k & 1];
     for (int n = 0; n < k; ++n) {
-      int32_t step = previous[n]
-          - (int32_t)gaud_silk_rshift_round64(
-              (int64_t)previous[k - n - 1] * (int64_t)rc_q31, 31);
-      current[n] = (int32_t)gaud_silk_rshift_round64(
+      // RFC 8251 section 6: a bitstream can push these past 32 bits, so
+      // the difference saturates and a product that does not fit marks
+      // the filter unstable instead of wrapping.
+      int32_t product = (int32_t)gaud_silk_rshift_round64(
+          (int64_t)previous[k - n - 1] * (int64_t)rc_q31, 31);
+      int64_t difference = (int64_t)previous[n] - (int64_t)product;
+      int32_t step = difference > INT32_MAX
+          ? INT32_MAX
+          : (difference < INT32_MIN ? INT32_MIN : (int32_t)difference);
+      int64_t scaled = gaud_silk_rshift_round64(
           (int64_t)step * (int64_t)inverse, (unsigned)scale);
+      if (scaled > INT32_MAX || scaled < INT32_MIN) {
+        return 0;
+      }
+      current[n] = (int32_t)scaled;
     }
   }
   if (current[0] > SILK_RC_LIMIT_QA || current[0] < -SILK_RC_LIMIT_QA) {

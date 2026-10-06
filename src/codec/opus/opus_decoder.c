@@ -211,6 +211,12 @@ static int decode_frame(OPUS_Decoder * st, const unsigned char * data,
     if (st->prev_mode == MODE_CELT) {
       memset(&st->silk.channel, 0, sizeof st->silk.channel);
       memset(st->silk.resampler, 0, sizeof st->silk.resampler);
+      // RFC 8251 section 3: the stereo history goes too. Left over from
+      // before the CELT frames, it produced a one-sample impulse.
+      memset(st->silk.pred_prev_q13, 0, sizeof st->silk.pred_prev_q13);
+      memset(st->silk.s_mid, 0, sizeof st->silk.s_mid);
+      memset(st->silk.s_side, 0, sizeof st->silk.s_side);
+      st->silk.prev_mid_only = false;
     }
     int payload_ms = (int)(audiosize * 1000u / 48000u);
     if (payload_ms < 10) {
