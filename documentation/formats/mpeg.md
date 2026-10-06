@@ -291,11 +291,14 @@ The tag states the file's frames and bytes, a hundred-entry table of
 contents for a variable-rate one, and - in the extension LAME added - the
 encoder's delay and padding, which are 528 and whatever the last frame
 leaves. The tag is rewritten at the end of the file, so the stream has to
-accept a seek. **The encoder's name field says `Ghoti.io`**, not `LAME`:
-ffmpeg and libmpg123 take the delay and padding only from a tag whose name
-begins `LAME`, `Lavf` or `Lavc`, so they play this encoder's 1,057 samples
-of delay as silence at the start. This library's own decoder, and
-libsndfile's, honour any tag that states one.
+accept a seek. **The encoder's name field says `LAME(G1)`**: ffmpeg takes the delay and
+padding only from a tag whose name begins `LAME`, `Lavf` or `Lavc` (checked
+case-sensitively on the first four bytes, with nothing after them read), so
+without those letters a file from this encoder plays 1,057 samples late and
+ends with 609 of padding. They are the prefix a reader requires and not a
+claim to be LAME's code; the rest of the nine bytes says what wrote the file
+and its major generation. libsndfile and this library's own decoder honour
+any tag that states a delay. libmpg123's rule is not tested here.
 
 **How a frame is made.** In the order a granule travels:
 

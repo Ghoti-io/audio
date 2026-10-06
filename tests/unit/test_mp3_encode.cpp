@@ -1240,6 +1240,11 @@ TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
       const unsigned char * lame = a + head + (tag.vbr ? 8 + 8 + 100 + 4 : 8 + 8);
       uint16_t stated = (uint16_t)((lame[34] << 8) | lame[35]);
       EXPECT_EQ(stated, gaud_mp3e_crc16(a, (size_t)(lame + 34 - a), 0));
+      /* The name begins with the four letters ffmpeg tests before it will
+       * trim by the delay and padding stated beside it, and is the nine
+       * bytes the extension keeps. */
+      EXPECT_EQ(std::memcmp(lame, "LAME", 4), 0);
+      EXPECT_EQ(std::memcmp(lame, MP3E_TAG_ENCODER, 9), 0);
     }
   }
 }

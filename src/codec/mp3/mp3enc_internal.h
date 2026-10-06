@@ -417,6 +417,13 @@ typedef struct {
   unsigned lowpass_100hz;  ///< The lowpass the encoder applied, in 100 Hz.
 } MP3E_Tag;
 
+/**
+ * The nine bytes the LAME extension keeps for the encoder's name. The first
+ * four must be `LAME` for ffmpeg to apply the delay and padding the tag
+ * states; the rest says this encoder and its major generation.
+ */
+#define MP3E_TAG_ENCODER "LAME(G1) "
+
 /** Write the tag frame into @p frame, which has room for its length. */
 void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame);
 

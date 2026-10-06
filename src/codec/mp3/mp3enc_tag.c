@@ -37,13 +37,19 @@
  * decodes it as one granule pair of silence. A tag for a constant-rate file
  * says `Info`, one for any other `Xing`; the layout is the same.
  *
- * **The encoder's name is its own.** ffmpeg and libmpg123 take the delay
- * and padding from this extension only when the name begins `LAME`,
- * `Lavf` or `Lavc`. This encoder is none of those and does not claim to
- * be: the field says `Ghoti.io`, which this library's own decoder honours
- * (it accepts any printable name) and those two do not. The cost is that
- * they play the encoder's delay as silence at the start and its padding at
- * the end.
+ * **The encoder's name starts `LAME`, and says no more of LAME than that.**
+ * ffmpeg takes the delay and padding from this extension only when the
+ * name's first four bytes are `LAME`, `Lavf` or `Lavc` - case-sensitive, at
+ * the start, and nothing after them is read (measured against the pinned
+ * ffmpeg in `check-mp3-encode`: `LAME` and spaces gives the recording's exact
+ * length, `lame` or `XLAME` gives the delay as silence). Without it a file
+ * from this encoder plays 1057 samples late and ends with 609 of padding.
+ * So the field says `LAME(G1)`: the four letters the readers test, then what
+ * did write it and its major generation, in the nine bytes the format
+ * allows. It is a prefix a reader requires and not a claim to be LAME's
+ * code; nothing here parses a version, and the digits are this encoder's.
+ * This library's own decoder honours any printable name. libmpg123's rule
+ * has not been tested here.
  */
 
 #include "mp3enc_internal.h"
@@ -83,7 +89,7 @@ void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame) {
     field += 4;
   }
   unsigned char * lame = field;
-  memcpy(lame, "Ghoti.io ", 9);
+  memcpy(lame, MP3E_TAG_ENCODER, 9);
   lame[9] = (unsigned char)((0u << 4) | (tag->vbr_method & 0xFu));
   lame[10] = (unsigned char)tag->lowpass_100hz;
   lame[20] = (unsigned char)(tag->bitrate_byte > 255u ? 255u : tag->bitrate_byte);

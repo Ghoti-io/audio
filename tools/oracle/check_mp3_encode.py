@@ -374,13 +374,14 @@ def run_case(label, wav, mp3, rate, channels, mode_args, floor, signal_name):
     if pcm["ours"] is None:
         return bad + ["%s: our decoder could not read the file" % label]
     meta = check_mpeg.ours_meta(mp3)
-    # ffmpeg returns the file's contents: it honours the delay only from a
-    # tag written by LAME or libavformat, and this is neither. libsndfile
-    # honours any tag that states one, so it returns the recording. Each is
-    # compared with our decode cut to match.
+    # Both references return the recording: ffmpeg honours the delay and
+    # padding of a tag whose encoder name begins LAME (ours does, on purpose;
+    # see mp3enc_tag.c) and libsndfile honours any tag that states them. Each
+    # is compared with our decode cut to match, and the cut has to leave
+    # exactly the frames that were given.
     trimmed = check_mpeg.trim(pcm["ours"], int(meta["delay"]),
                               int(meta["padding"]), channels)
-    expected = {"ffmpeg": pcm["ours"], "libsndfile": trimmed}
+    expected = {"ffmpeg": trimmed, "libsndfile": trimmed}
     if len(trimmed) != n * channels:
         bad.append("%s: the tag's delay and padding leave %d frames of the "
                    "%d that were given" % (label, len(trimmed) // channels, n))
