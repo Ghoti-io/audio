@@ -458,6 +458,9 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
     for (unsigned ch = 0; ch < channels; ++ch) {
       MP3E_Granule * g = &enc->coded[gr][ch];
       size_t before = bits.bits;
+      if (g->side.part2_3_length > MP3E_MAX_PART23) {
+        return GAUD_ERR_INTERNAL; /* Its field is twelve bits wide. */
+      }
       gaud_mp3e_scalefactor_write(&bits, g, enc->version);
       gaud_mp3e_huffman_write(&bits, g, enc->row);
       if (bits.overflow || bits.bits - before != g->side.part2_3_length) {
@@ -566,8 +569,16 @@ static bool detect_attack(MP3_Encoder * enc, Analysed * slot, unsigned ch) {
   const MP3E_Layout * layout = &enc->layout[1];
   bool attack = false;
   const uint16_t * bounds = gaud_mp3_sfb_short[enc->row];
+  uint64_t window[3][14];
+  uint64_t noise_of[14];
+  for (unsigned b = 0; b < layout->sfb_count; ++b) {
+    uint64_t noise = 0;
+    for (unsigned k = 3u * bounds[b]; k < 3u * bounds[b + 1u]; ++k) {
+      noise += slot->psy[ch].allowed_line[k];
+    }
+    noise_of[b] = noise;
+  }
   for (unsigned w = 0; w < 3u; ++w) {
-    uint64_t energy[14];
     for (unsigned b = 0; b < layout->sfb_count; ++b) {
       const MP3E_Band * band = &layout->band[3u * b + w];
       uint64_t e = 0;
@@ -576,20 +587,33 @@ static bool detect_attack(MP3_Encoder * enc, Analysed * slot, unsigned ch) {
             / (1 << MP3E_ENERGY_SHIFT);
         e += (uint64_t)(scaled * scaled);
       }
-      energy[b] = e;
-      uint64_t noise = 0;
-      for (unsigned k = 3u * bounds[b]; k < 3u * bounds[b + 1u]; ++k) {
-        noise += slot->psy[ch].allowed_line[k];
-      }
+      window[w][b] = e;
       uint64_t before = enc->window_energy[ch][0][b] > enc->window_energy[ch][1][b]
           ? enc->window_energy[ch][0][b]
           : enc->window_energy[ch][1][b];
-      if (e > 4u * noise && e / 10u > before + noise / 4u) {
+      if (e > 4u * noise_of[b] && e / 10u > before + noise_of[b] / 4u) {
         attack = true;
       }
     }
-    memcpy(enc->window_energy[ch][1], enc->window_energy[ch][0], sizeof(energy));
-    memcpy(enc->window_energy[ch][0], energy, sizeof(energy));
+    memcpy(enc->window_energy[ch][1], enc->window_energy[ch][0], sizeof(window[w]));
+    memcpy(enc->window_energy[ch][0], window[w], sizeof(window[w]));
+  }
+  /* The same thing from the other side. A granule that is loud in one of its
+   * windows and nearly silent in another has its quantisation noise, which a
+   * long window spreads evenly over all of them, well over the signal in
+   * the quiet one - after an attack, as a decay; before one, as a rise. The
+   * attack test above sees only the rise, and only against what came
+   * before the granule. */
+  for (unsigned b = 0; b < layout->sfb_count && !attack; ++b) {
+    uint64_t loud = 0;
+    uint64_t quiet = UINT64_MAX;
+    for (unsigned w = 0; w < 3u; ++w) {
+      loud = window[w][b] > loud ? window[w][b] : loud;
+      quiet = window[w][b] < quiet ? window[w][b] : quiet;
+    }
+    if (loud > 16u * noise_of[b] && quiet * 4u < noise_of[b]) {
+      attack = true;
+    }
   }
   return attack;
 }

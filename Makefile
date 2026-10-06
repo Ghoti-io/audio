@@ -794,6 +794,14 @@ vorbis-coverage: ## Count which arms of the Vorbis setup parser the corpus reach
 vorbis-coverage: $(VORBIS_PROBE)
 	@GAUD_VORBIS_PROBE=$(VORBIS_PROBE) python3 $(ORACLE)/vorbis_coverage.py
 
+check-mp3-encode: ## Fail if a reference decodes what the MP3 encoder writes differently than we do
+check-mp3-encode: $(WRITE_PROBE) $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_mp3_encode.py
+
+check-mp3-quality: ## Fail if the MP3 encoder sounds worse than it should against LAME and Shine
+check-mp3-quality: $(WRITE_PROBE) $(DUMP_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/mp3_quality.py
+
 check-opus: ## Fail if a reference disagrees about what an Opus stream is
 check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
@@ -979,6 +987,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: oracle-build oracle-probe oracle-version check-tags
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
 .PHONY: vorbis-coverage check-opus check-vorbis-synth
+.PHONY: check-mp3-encode check-mp3-quality check-mp3enc-tables
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands

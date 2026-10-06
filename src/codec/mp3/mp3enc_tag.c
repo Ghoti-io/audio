@@ -95,7 +95,15 @@ void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame) {
   put32(lame + 28, tag->music_length);
   lame[32] = (unsigned char)(tag->music_crc >> 8);
   lame[33] = (unsigned char)tag->music_crc;
-  uint16_t tag_crc = gaud_mp3e_crc16(frame, 190u, 0);
+  /* The checksum covers every byte of the frame before its own field. In
+   * the layout LAME writes - side information, 120 bytes of Xing fields and
+   * the 36 of the extension - that is the first 190, which is where the
+   * rule "the first 190 bytes" comes from; the layouts here differ by
+   * channel count and MPEG version, and the rule that survives is the
+   * general one. (An earlier draft summed 190 bytes whatever the frame's
+   * length, which read past the end of a short frame into whatever was
+   * there, and the cross-architecture gate found it: the bytes differed.) */
+  uint16_t tag_crc = gaud_mp3e_crc16(frame, (size_t)(lame + 34 - frame), 0);
   lame[34] = (unsigned char)(tag_crc >> 8);
   lame[35] = (unsigned char)tag_crc;
 }

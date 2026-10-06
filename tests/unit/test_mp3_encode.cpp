@@ -430,6 +430,51 @@ TEST(Mp3EncodeRoundTrip, AnImpulseComesBackAtTheSampleItWentInAt) {
   }
 }
 
+TEST(Mp3EncodeRoundTrip, AClickKeepsItsEnergyWhereverItFallsInAGranule) {
+  /* A single loud sample is the worst thing a granule can hold: a flat
+   * spectrum, every line occupied. Masked, it needs more bits than the
+   * twelve-bit length field can state; the encoder once let the length
+   * wrap, wrote a field a quarter of the true size, and every decoder read
+   * the truncated granule as it was written - so the click came back with a
+   * fifth of its energy and nothing complained. Whatever the alignment,
+   * most of it has to be there. */
+  for (size_t position : {11900u, 12000u, 12100u, 12200u, 12300u, 12500u, 12800u}) {
+    size_t frames = 22050;
+    Pcm pcm(frames, 0);
+    pcm[position] = 20000;
+    Decoded d = Decode(Encode(pcm, 1, 44100, 128000));
+    ASSERT_EQ(d.frames, frames);
+    double energy = 0;
+    for (size_t i = 0; i < frames; ++i) {
+      energy += (double)d.pcm[i] * d.pcm[i];
+    }
+    EXPECT_GT(energy / (20000.0 * 20000.0), 0.9) << "at " << position;
+    EXPECT_LT(energy / (20000.0 * 20000.0), 1.2) << "at " << position;
+  }
+}
+
+TEST(Mp3EncodeRoundTrip, APureToneIsCodedAccuratelyAndALoudSquareWaveSurvives) {
+  /* Two things a tone with a noise floor and a half-scale level do not
+   * reach. A pure tone is one huge line and silence: a step search that
+   * does not stop where that line would clamp picks the finest step there
+   * is, which costs almost nothing in bits and returns the tone at a
+   * quarter of its level. And a full-scale low-frequency wave puts the same
+   * sign in every input of a subband's transform, whose first coefficient
+   * is then eleven times the largest input - which an int32 does not hold
+   * until the scale that brings it back has been applied. */
+  size_t frames = 44100;
+  Pcm tone(frames * 2);
+  Pcm square(frames * 2);
+  for (size_t i = 0; i < frames; ++i) {
+    int16_t t = (int16_t)std::lround(16000.0 * std::sin(2 * M_PI * 1000.0 * i / 44100.0));
+    int16_t q = (i % 441) < 220 ? 32767 : -32768;
+    tone[2 * i] = tone[2 * i + 1] = t;
+    square[2 * i] = square[2 * i + 1] = q;
+  }
+  EXPECT_GT(SnrDb(tone, Decode(Encode(tone, 2, 44100, 128000)).pcm), 40.0);
+  EXPECT_GT(SnrDb(square, Decode(Encode(square, 2, 44100, 128000)).pcm), 15.0);
+}
+
 TEST(Mp3EncodeRoundTrip, SilenceAndAVeryShortInputBothWork) {
   for (size_t frames : {1u, 100u, 575u, 576u, 577u, 1151u, 1152u, 1153u}) {
     Pcm pcm(frames * 2u, 0);
@@ -977,6 +1022,49 @@ TEST(Mp3EncodeRate, ImpossibleRequestsAreRefused) {
   params.quality = 101;
   EncodeWith(pcm, params, &result);
   EXPECT_EQ(result, GAUD_ERR_INVALID);
+}
+
+TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
+  /* The tag's checksum once read 190 bytes of a frame that could be
+   * shorter, and so depended on what happened to be in memory after it -
+   * which a big-endian machine under qemu showed by writing a different
+   * byte. Whatever surrounds the buffer, the frame is the same. */
+  for (unsigned version = 0; version < 3u; ++version) {
+    for (unsigned channels = 1; channels <= 2u; ++channels) {
+      MP3E_Tag tag = {};
+      tag.version = (MP3_Version)version;
+      tag.rate_index = 0;
+      tag.channels = channels;
+      tag.bitrate_index = 6;
+      tag.vbr = version != 1u;
+      tag.frames = 1234;
+      tag.bytes = 56789;
+      tag.delay = 528;
+      tag.padding = 700;
+      tag.music_crc = 0xBEEF;
+      tag.music_length = 56789;
+      tag.vbr_method = 1;
+      tag.bitrate_byte = 64;
+      unsigned char toc[100];
+      for (unsigned i = 0; i < 100; ++i) {
+        toc[i] = (unsigned char)i;
+      }
+      tag.toc = tag.vbr ? toc : nullptr;
+      uint32_t head = 4 + gaud_mp3e_side_bytes(tag.version, channels);
+      tag.frame_bytes = head + (tag.vbr ? 156 : 52);
+      unsigned char a[4000];
+      unsigned char b[4000];
+      std::memset(a, 0x00, sizeof(a));
+      std::memset(b, 0xFF, sizeof(b));
+      gaud_mp3e_tag_build(&tag, a);
+      gaud_mp3e_tag_build(&tag, b);
+      EXPECT_EQ(std::memcmp(a, b, tag.frame_bytes), 0) << version << " x" << channels;
+      /* And the checksum is over the bytes before its own field. */
+      const unsigned char * lame = a + head + (tag.vbr ? 8 + 8 + 100 + 4 : 8 + 8);
+      uint16_t stated = (uint16_t)((lame[34] << 8) | lame[35]);
+      EXPECT_EQ(stated, gaud_mp3e_crc16(a, (size_t)(lame + 34 - a), 0));
+    }
+  }
 }
 
 /* ------------------------------------------------------------ refusals */

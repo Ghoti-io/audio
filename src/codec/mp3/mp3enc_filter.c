@@ -56,6 +56,22 @@ static int32_t mul(int32_t a, int32_t b) {
   return (int32_t)((product + (1 << (MP3_Q - 1))) >> MP3_Q);
 }
 
+/**
+ * A transform's accumulated sum, scaled by 1/9 or 1/3 (Q28) into a line.
+ *
+ * **The scale has to be applied before the value is narrowed.** A full-scale
+ * low-frequency wave puts the same sign in all 36 inputs of a subband and
+ * its first coefficient is their sum, which is eleven times the largest
+ * input: 2^32.5 where an int32 holds 2^31, before the 1/9 that brings it
+ * back inside. A first draft narrowed first. Sine tones at half scale and
+ * everything in the unit tests fit; a full-scale square wave came back as
+ * something else, and the validity check that gave it one found it.
+ */
+static int32_t scale(int64_t sum, int32_t factor) {
+  int64_t line = (sum + (1 << 27)) >> MP3_Q;
+  return (int32_t)((line * factor + (1 << 27)) >> MP3_Q);
+}
+
 void gaud_mp3e_filter_reset(MP3E_Filter * filter) {
   memset(filter, 0, sizeof(*filter));
 }
@@ -124,8 +140,7 @@ void gaud_mp3e_filter_transform(
           for (unsigned i = 0; i < 12u; ++i) {
             sum += (int64_t)z[i] * gaud_mp3_imdct12[i][k];
           }
-          lines[w * 6u + k] = mul((int32_t)((sum + (1 << 27)) >> MP3_Q),
-              SCALE_SHORT);
+          lines[w * 6u + k] = scale(sum, SCALE_SHORT);
         }
       }
     }
@@ -140,7 +155,7 @@ void gaud_mp3e_filter_transform(
         for (unsigned i = 0; i < 36u; ++i) {
           sum += (int64_t)z[i] * gaud_mp3_imdct36[i][k];
         }
-        lines[k] = mul((int32_t)((sum + (1 << 27)) >> MP3_Q), SCALE_LONG);
+        lines[k] = scale(sum, SCALE_LONG);
       }
     }
   }

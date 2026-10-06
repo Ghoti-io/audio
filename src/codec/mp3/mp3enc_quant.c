@@ -130,6 +130,7 @@ typedef struct {
   bool preflag;
   bool scale;
   unsigned gain_floor; ///< The finest step that does not clamp the loudest line.
+  unsigned run_floor[MP3E_MAX_BANDS]; ///< The same, for each band with no amplification.
   MP3E_Granule scratch; ///< A second granule to try a step in.
 } Work;
 
@@ -192,6 +193,17 @@ static uint32_t finish(const Work * w, unsigned global_gain, MP3E_Granule * g) {
   return side->part2_3_length;
 }
 
+/** The finest step no line is clamped at, given the amplification so far:
+ *  each unit of a band's scalefactor lowers its step by two. */
+static unsigned unclamped_floor(const Work * w) {
+  unsigned floor_gain = 0;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    unsigned need = w->run_floor[r] + (w->scale ? 4u : 2u) * (unsigned)(w->sf[r] + pretab_for(w, r));
+    floor_gain = need > floor_gain ? need : floor_gain;
+  }
+  return floor_gain > 255u ? 255u : floor_gain;
+}
+
 /** Part 2 and an estimate of part 3 at @p gain, with @p g quantised. */
 static uint32_t estimate_bits(const Work * w, unsigned gain, MP3E_Granule * g) {
   quantize_all(w, gain, g);
@@ -220,7 +232,8 @@ static uint32_t estimate_bits(const Work * w, unsigned gain, MP3E_Granule * g) {
  * exact count - which is never more - claim a step or two back. */
 static unsigned fit_gain(Work * w, uint32_t budget, MP3E_Granule * g,
     bool * out_fits) {
-  unsigned lo = 0;
+  unsigned floor_gain = unclamped_floor(w);
+  unsigned lo = floor_gain;
   unsigned hi = 255;
   while (lo < hi) {
     unsigned mid = (lo + hi) >> 1;
@@ -235,7 +248,7 @@ static unsigned fit_gain(Work * w, uint32_t budget, MP3E_Granule * g,
   quantize_all(w, lo, g);
   uint32_t bits = finish(w, lo, g);
   bool fits = bits <= budget;
-  for (unsigned step = 0; fits && lo > 0 && step < 4u; ++step) {
+  for (unsigned step = 0; fits && lo > floor_gain && step < 4u; ++step) {
     MP3E_Granule * probe = &w->scratch;
     quantize_all(w, lo - 1u, probe);
     uint32_t finer = finish(w, lo - 1u, probe);
@@ -323,7 +336,7 @@ static unsigned masked_over(const Work * w, unsigned gain, MP3E_Granule * g) {
 /** The largest gain at which no band is over its threshold. The caller has
  *  shown the finest useful gain is masked. */
 static unsigned coarsest_masked(const Work * w, MP3E_Granule * g) {
-  unsigned low = w->gain_floor;
+  unsigned low = unclamped_floor(w);
   unsigned high = 255;
   while (low < high) {
     unsigned mid = (low + high + 1u) >> 1;
@@ -456,6 +469,19 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
       && gaud_mp3e_quantize_one(loudest, (int)w.gain_floor - 210) >= QUANT_MAX) {
     ++w.gain_floor;
   }
+  for (unsigned r = 0; r < w.runs; ++r) {
+    const MP3E_Band * band = &layout->band[r];
+    int32_t peak = 0;
+    for (unsigned i = band->start; i < (unsigned)band->start + band->width; ++i) {
+      int32_t magnitude = w.xs[i] < 0 ? -w.xs[i] : w.xs[i];
+      peak = magnitude > peak ? magnitude : peak;
+    }
+    unsigned g = 0;
+    while (g < 255u && gaud_mp3e_quantize_one(peak, (int)g - 210) >= QUANT_MAX) {
+      ++g;
+    }
+    w.run_floor[r] = g;
+  }
 
   MP3E_Granule * trial = out;
   uint32_t budget = input->target_bits;
@@ -486,6 +512,14 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
       quantize_all(&w, gain, trial);
       bits = finish(&w, gain, trial);
       fits = bits <= budget;
+      if (!fits) {
+        /* Masking is not affordable: more than the budget - and a
+         * granule's length is a twelve-bit field, so more than 4095 is not
+         * a bigger granule but a corrupt one. The rest of the loop is then
+         * the budget's, not masking's. */
+        masks = false;
+        continue;
+      }
     }
     int32_t excess[MP3E_MAX_BANDS];
     unsigned over = measure_excess(&w, gain, trial, excess);

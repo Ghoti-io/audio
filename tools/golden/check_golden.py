@@ -160,6 +160,25 @@ ENCODE_FIXTURES = [
     "flac_lib_s32_stereo_96000.flac",
 ]
 
+# MP3 encodes, which are the hardest case of the promise and the reason it
+# was made: a perceptual encoder's choices - the block types, the stereo
+# mode, how many bits each granule gets, which scalefactors, which Huffman
+# tables - all rest on a model, and a model in floating point makes those
+# choices differently on a different machine and writes a different file
+# that decodes just as well. Each case is (source, coding args as
+# write_probe takes them after the codec name), chosen to reach a different
+# part: constant, average and variable rate; MPEG-1, 2 and 2.5; stereo with
+# block switching and mid/side, and mono bursts out of silence.
+MP3_ENCODES = [
+    ("mp3enc_mix_44100.wav", "cbr128", ["mp3", "128", "cbr"]),
+    ("mp3enc_mix_44100.wav", "vbr50", ["mp3", "0", "vbr", "50"]),
+    ("mp3enc_mix_44100.wav", "abr96", ["mp3", "96", "abr"]),
+    ("mp3enc_clicks_22050.wav", "cbr48", ["mp3", "48", "cbr"]),
+    ("mp3enc_clicks_22050.wav", "vbr70", ["mp3", "0", "vbr", "70"]),
+    ("mp3enc_voice_11025.wav", "cbr24", ["mp3", "24", "cbr"]),
+    ("mp3enc_voice_11025.wav", "vbr40", ["mp3", "0", "vbr", "40"]),
+]
+
 
 def host_hashes():
     """What this machine decodes, and what it encodes, per fixture."""
@@ -185,6 +204,18 @@ def host_hashes():
         with open(target, "rb") as handle:
             out["encode " + name] = hashlib.sha256(handle.read()).hexdigest()
         os.remove(target)
+    for name, label, args in MP3_ENCODES:
+        source = os.path.join(ROOT, "tests", "data", name)
+        target = os.path.join(scratch, "golden-host.mp3")
+        finished = subprocess.run([WRITE_PROBE, source, target, "mp3"] + args,
+                                  capture_output=True)
+        if finished.returncode != 0:
+            raise SystemExit("write_probe failed on %s %s:\n%s"
+                             % (name, label, finished.stderr.decode()[-600:]))
+        with open(target, "rb") as handle:
+            out["mp3 %s/%s" % (name, label)] = hashlib.sha256(
+                handle.read()).hexdigest()
+        os.remove(target)
     return out
 
 
@@ -209,6 +240,7 @@ for f in %(globs)s; do
     %(qemu)s -L /usr/%(triple)s %(out)s/dump_probe "$f" --pcm-le | sha256sum \
         | cut -d' ' -f1
 done
+%(mp3)s
 for f in %(encode)s; do
     printf 'encode %%s ' "$(basename "$f")"
     %(qemu)s -L /usr/%(triple)s %(out)s/write_probe \
@@ -218,6 +250,12 @@ done
 """ % {"out": out, "root": ROOT, "cc": compiler, "qemu": qemu,
        "triple": triple, "shim": SHIM,
        "encode": " ".join(ENCODE_FIXTURES),
+       "mp3": "\n".join(
+           'printf \'mp3 %s/%s \'; %s -L /usr/%s %s/write_probe '
+           'tests/data/%s %s/out.mp3 mp3 %s >/dev/null; '
+           'sha256sum %s/out.mp3 | cut -d" " -f1'
+           % (name, label, qemu, triple, out, name, out, " ".join(args), out)
+           for name, label, args in MP3_ENCODES),
        "globs": " ".join("tests/data/*" + one for one in EXTENSIONS),
        "skip": " ".join(sorted(UNDECODABLE)),
        "md5": os.path.join(WORKSPACE, "libs", "security", "src", "md5",
@@ -234,12 +272,14 @@ def main():
             "the oracle probes are not built. Run `make oracle-probe`.")
     names = ["decode " + name for name in fixtures()]
     names += ["encode " + name for name in ENCODE_FIXTURES]
+    names += ["mp3 %s/%s" % (name, label) for name, label, _ in MP3_ENCODES]
     if not names:
         raise SystemExit("tests/data is empty, so this gate measures nothing.")
 
     host = host_hashes()
-    print("host (%s): %d fixtures decoded, %d re-encoded"
-          % (os.uname().machine, len(fixtures()), len(ENCODE_FIXTURES)))
+    print("host (%s): %d fixtures decoded, %d re-encoded, %d MP3 encodes"
+          % (os.uname().machine, len(fixtures()), len(ENCODE_FIXTURES),
+             len(MP3_ENCODES)))
 
     wanted = sys.argv[1:] or list(TARGETS)
     bad = []
@@ -285,8 +325,12 @@ def main():
     print("\n%d fixtures decode identically on %d big-endian target(s) and "
           "here, and %d re-encode to identical BYTES - which is section "
           "11.1's promise applied to the writer, and what the FLAC "
-          "encoder's integer-only predictors are for."
-          % (len(fixtures()), len(wanted), len(ENCODE_FIXTURES)))
+          "encoder's integer-only predictors are for. %d MP3 encodes "
+          "(constant, average and variable rate, three MPEG versions, "
+          "block switching and mid/side) are byte-identical too, which is "
+          "what the psychoacoustic model being integers is for."
+          % (len(fixtures()), len(wanted), len(ENCODE_FIXTURES),
+             len(MP3_ENCODES)))
     if UNDECODABLE:
         print("\n%d fixture(s) are identified and not decoded, so they are "
               "not in that number:" % len(UNDECODABLE))
