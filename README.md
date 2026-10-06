@@ -438,7 +438,7 @@ The trap is that `ldd` on the ffmpeg binary *does* list libFLAC, by a path
 its demuxer never enters, so the obvious check gives the wrong answer.
 `make oracle-build` builds the pinned image; `make corpus` regenerates it.
 
-470 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
+473 tests, clean under ASan, UBSan and Valgrind, from an empty build tree
 serially and under `-j`, in both `?image` arms - and the arms genuinely
 differ from phase 3 on, because cover-art verification is the one thing
 `image` is linked for. 86.4% line coverage from the unit tests alone, which
