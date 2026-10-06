@@ -66,6 +66,16 @@ The vendor string is read past and deliberately not turned into a tag;
 src/meta/vorbis_comment.c says why, and the short version is that a field
 the writer overwrites must not be a field the reader collects.
 
+**The first block.** A stream's first block produces nothing to lap with,
+but it is not silent: from its centre to where the next overlap begins it
+is the signal, and a granule position starts counting at that centre. That
+is nothing when the next block is the same size and a quarter of the
+difference when a long block is followed by a short one, which is how a
+stream that begins that way loses its first 448 frames to a decoder that
+drops them. No encoder here begins a stream that way, so the fixtures never
+showed it; a fixture rotated to begin at such a block did, against ffmpeg's
+count (see `notes/audio/vorbis.md`).
+
 **The length.** See below; it is the only interesting thing on this page.
 
 ## What is not
@@ -81,12 +91,19 @@ fixed-point approximation of a transcendental curve is exactly the kind
 of code whose error nobody notices without a reference. A refusal that
 says so is better than an approximation nobody can check.
 
-**Seeking is linear.** The bisection exists in
-src/container/ogg/ogg_seek.c and Ogg FLAC uses it; Vorbis does not yet,
-because a Vorbis block's output depends on the block before it, so
-landing on a page means decoding a packet whose output is wrong and
-reconciling the position against the page's granule rather than counting
-samples. Correct and slow first.
+**Seeking bisects, and is exact.** Nothing a Vorbis block carries to the
+next is state except its lap, so a seek lands on a page near the target
+(src/container/ogg/ogg_seek.c's bisection), decodes the first block there
+to provide the lap, and from the second block on what it hands out is what
+a straight read hands out, to the bit. There is no pre-roll, which is the
+difference from Opus. The one piece of arithmetic is the numbering: this
+decoder hands frames out up to the start of the next overlap, and a granule
+position counts to a block's centre, so the position of a landing is
+counted back from the end of the landing page, where a granule position is
+stated, by adding up what its blocks produce. That makes a page that
+begins with the tail of a packet unremarkable, and rules out the stream's
+last page as the anchor, since its position is the length and may be less
+than what it decodes to.
 
 **Writing.** Phase 8 brings the perceptual encoders with the two-gate
 harness their output needs.

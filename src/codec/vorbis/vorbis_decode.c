@@ -96,6 +96,23 @@ typedef struct {
   int32_t * tail;     ///< channels by long_block/2, the lap.
   uint32_t tail_length;  ///< How much of it is live.
   bool have_previous;    ///< Whether a block has been decoded at all.
+  /**
+   * The next block is the first after a seek landed mid-stream: it has no
+   * block before it to lap with, so its output cannot be handed out, but
+   * its length still counts and its right half is the lap for the next.
+   */
+  bool landing;
+  /**
+   * What to add to a page's granule position, plus the shape of the last
+   * block on it, to get the frame number this decoder gives the same
+   * place. They differ because the decoder hands frames out up to the
+   * start of the *next* overlap and the granule position counts to the
+   * block's centre. See ::land_near. Worked out on the first seek.
+   */
+  int64_t bias;
+  bool bias_known; ///< Whether @p bias has been worked out.
+  /** The last decoded block's n/4 - right_n/4: how far past its centre it went. */
+  uint32_t last_slack;
   uint32_t previous_right_n; ///< The previous block's right slope length.
 
   /**
@@ -313,6 +330,43 @@ static void apply_window(int32_t * block, uint32_t n, uint32_t left_n,
   }
 }
 
+/**
+ * A packet's block size and its two window slopes, without decoding it.
+ *
+ * The same reading decode_packet() starts with: the mode number, and for a
+ * long block the two flags that say whether its neighbours are long.
+ *
+ * @return ::GAUD_OK; ::GAUD_ERR_FORMAT for a header packet, which has no
+ *   shape; ::GAUD_ERR_CORRUPT for a mode number the setup does not have.
+ */
+static GAUD_Result packet_shape(const VORBIS_Decoder * state,
+    const unsigned char * data, size_t size, uint32_t * n, uint32_t * left_n,
+    uint32_t * right_n) {
+  const VORBIS_Setup * setup = &state->doc_state->setup;
+  VORBIS_Bits bits;
+  gaud_vorbis_bits_init(&bits, data, size);
+  if (gaud_vorbis_bits_read(&bits, 1) != 0) {
+    return GAUD_ERR_FORMAT;
+  }
+  uint32_t mode_number = gaud_vorbis_bits_read(&bits, setup->mode_bits);
+  if (mode_number >= setup->mode_count || bits.past_end) {
+    return GAUD_ERR_CORRUPT;
+  }
+  const VORBIS_Mode * mode = &setup->modes[mode_number];
+  *n = mode->block_flag ? state->long_block : state->short_block;
+  *left_n = *n;
+  *right_n = *n;
+  if (mode->block_flag) {
+    if (gaud_vorbis_bits_read(&bits, 1) == 0) {
+      *left_n = state->short_block;
+    }
+    if (gaud_vorbis_bits_read(&bits, 1) == 0) {
+      *right_n = state->short_block;
+    }
+  }
+  return GAUD_OK;
+}
+
 /** Decode one audio packet; produces frames into @p state->pending. */
 static GAUD_Result decode_packet(VORBIS_Decoder * state,
     const unsigned char * data, size_t size) {
@@ -507,8 +561,16 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
      * stream where they disagree cannot be lapped. */
     return GAUD_ERR_CORRUPT;
   }
-  uint32_t produced
-      = state->have_previous ? right_start - left_start : 0;
+  bool emit = state->have_previous;
+  // The stream's first block has no block before it to lap with, and
+  // hands out only what is left of it before the next overlap: from its
+  // centre, which is where a granule position starts counting, to where
+  // that begins. Nothing at all when the next block is its own size, and a
+  // quarter of a long block less a quarter of a short one when it is not.
+  bool first = !state->have_previous && !state->landing;
+  uint32_t produced = emit || state->landing
+      ? right_start - left_start
+      : (first ? right_start - n / 2u : 0);
   if (produced > state->pending_stride) {
     return GAUD_ERR_CORRUPT;
   }
@@ -606,6 +668,11 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
         out[j] = state->block[left_start + j];
       }
     }
+    else if (first) {
+      for (uint32_t j = 0; j < produced; ++j) {
+        out[j] = state->block[n / 2u + j];
+      }
+    }
     for (uint32_t j = 0; j < right_n / 2u; ++j) {
       tail[j] = state->block[right_start + j];
     }
@@ -613,8 +680,10 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
   state->tail_length = right_n / 2u;
   state->previous_right_n = right_n;
   state->have_previous = true;
+  state->landing = false;
+  state->last_slack = n / 4u - right_n / 4u;
   state->pending_base = state->decoded;
-  state->pending_frames = produced;
+  state->pending_frames = emit || first ? produced : 0;
   state->pending_used = 0;
   state->decoded += produced;
   return GAUD_OK;
@@ -655,8 +724,11 @@ static GAUD_Result decode_next(VORBIS_Decoder * state) {
      */
     if (!state->first_page_seen && granule != OGG_NO_GRANULE) {
       state->first_page_seen = true;
-      if (state->decoded > granule) {
-        uint64_t drop = state->decoded - granule;
+      // In the granule position's terms, which count to a block's centre
+      // and not to the start of the next overlap.
+      uint64_t centre = state->decoded - state->last_slack;
+      if (centre > granule) {
+        uint64_t drop = centre - granule;
         if (drop >= state->pending_frames) {
           state->decoded -= state->pending_frames;
           state->pending_frames = 0;
@@ -733,6 +805,7 @@ static GAUD_Result rewind_to_audio(VORBIS_Decoder * state) {
   state->pending_used = 0;
   state->pending_base = 0;
   state->have_previous = false;
+  state->landing = false;
   state->tail_length = 0;
   state->previous_right_n = 0;
   state->first_page_seen = false;
@@ -740,17 +813,213 @@ static GAUD_Result rewind_to_audio(VORBIS_Decoder * state) {
   return gaud_ogg_reader_seek(&state->reader, state->doc_state->audio_offset);
 }
 
+/** What reading packets up to the end of a page that states a position found. */
+typedef struct {
+  uint64_t produced;       ///< Frames the packets would hand out, in total.
+  uint64_t produced_first; ///< The same at the first packet to state one.
+  uint32_t slack_first;    ///< That packet's n/4 - right_n/4.
+  uint32_t last_slack;     ///< The last block's n/4 - right_n/4.
+  uint64_t granule;        ///< The page's granule position.
+  bool end_of_stream;      ///< The page is the stream's last.
+} VORBIS_Scan;
+
 /**
- * Seek by rewinding and decoding forward.
+ * Read packets from the reader's place to the end of the next page that
+ * states a granule position, adding up what they would produce.
  *
- * **Linear, and the bisection is deliberately not used yet.** The seek
- * layer is there and Ogg FLAC uses it, but a Vorbis seek has a second
- * problem a FLAC seek does not: a block's output depends on the block
- * before it, so landing on a page means decoding one packet whose output
- * is wrong and discarding it - and getting the *position* right then
- * means reconciling against the page's granule position rather than
- * counting samples. That is a second piece of arithmetic to get right
- * and nothing yet scores it. Correct and slow first.
+ * @param reader A reader of its own, so that the decoder's is not moved.
+ * @param first_has_no_previous Whether the first packet read is the
+ *   stream's first, which produces nothing; a landing's is not, since
+ *   the block before it exists, only unread.
+ */
+static GAUD_Result scan_to_anchor(const VORBIS_Decoder * state,
+    OGG_Reader * reader, bool first_has_no_previous, VORBIS_Scan * scan) {
+  bool first = first_has_no_previous;
+  bool stated = false;
+  memset(scan, 0, sizeof *scan);
+  for (;;) {
+    const unsigned char * data = NULL;
+    size_t size = 0;
+    uint64_t granule = 0;
+    GAUD_Result result
+        = gaud_ogg_reader_packet(reader, &data, &size, &granule, NULL);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    uint32_t n = 0;
+    uint32_t left_n = 0;
+    uint32_t right_n = 0;
+    result = size == 0 ? GAUD_ERR_FORMAT
+                       : packet_shape(state, data, size, &n, &left_n, &right_n);
+    if (result == GAUD_ERR_FORMAT) {
+      continue; // A header, or nothing.
+    }
+    if (result != GAUD_OK) {
+      return result;
+    }
+    if (first) {
+      scan->produced += window_right_start(n, right_n) - n / 2u;
+    }
+    else {
+      scan->produced
+          += window_right_start(n, right_n) - window_left_start(n, left_n);
+    }
+    first = false;
+    scan->last_slack = n / 4u - right_n / 4u;
+    if (!stated && granule != OGG_NO_GRANULE) {
+      stated = true;
+      scan->produced_first = scan->produced;
+      scan->slack_first = scan->last_slack;
+    }
+    bool page_done = reader->next_segment >= reader->segments;
+    if (page_done && granule != OGG_NO_GRANULE) {
+      scan->granule = granule;
+      scan->end_of_stream = (reader->flags & OGG_FLAG_EOS) != 0;
+      return GAUD_OK;
+    }
+  }
+}
+
+/**
+ * Work out ::VORBIS_Decoder::bias from the first page that states a
+ * position, decoding nothing: what the decoder's own numbering is there
+ * is the sum of what its packets produce, less any head trim.
+ */
+static GAUD_Result find_bias(VORBIS_Decoder * state) {
+  OGG_Reader probe;
+  gaud_ogg_reader_init(&probe, state->reader.stream, state->allocator);
+  probe.serial = state->reader.serial;
+  probe.have_serial = true;
+  GAUD_Result result
+      = gaud_ogg_reader_seek(&probe, state->doc_state->audio_offset);
+  VORBIS_Scan scan;
+  if (result == GAUD_OK) {
+    result = scan_to_anchor(state, &probe, true, &scan);
+  }
+  gaud_ogg_reader_free(&probe);
+  if (result != GAUD_OK) {
+    return result == GAUD_ERR_FORMAT ? GAUD_ERR_CORRUPT : result;
+  }
+  // The head trim decode_next() applies, at the first packet that states
+  // a position: what it decoded beyond that position is not the stream's.
+  int64_t trim = 0;
+  if (scan.produced_first - scan.slack_first > scan.granule) {
+    trim = (int64_t)(scan.produced_first - scan.slack_first - scan.granule);
+  }
+  state->bias = (int64_t)scan.produced - trim - (int64_t)scan.granule
+      - (int64_t)scan.last_slack;
+  state->bias_known = true;
+  return GAUD_OK;
+}
+
+/** The most earlier pages a landing that cannot be numbered is moved back by. */
+#define VORBIS_LAND_TRIES 4u
+
+/**
+ * Put the decoder on a page from which decoding forward reaches @p frame
+ * with nothing wrong, or at the start where that is no better.
+ *
+ * **Nothing about a Vorbis block depends on the ones before it except
+ * the lap**, so there is no pre-roll to run and no state to converge: the
+ * first block decoded on the landing page produces no output, because the
+ * block it laps with is not there, but its right half is exactly the lap
+ * the next block wants, and from the second block on the output is
+ * bit-identical to a straight read's. What the first block does have to do
+ * is count: it advances the position by what it would have produced, so
+ * that the next one is numbered as the granule positions number it.
+ *
+ * The landing is two blocks' worth of frames early, because the first
+ * block's own output is the part that cannot be handed out, and it is
+ * never longer than the longest block.
+ *
+ * **The place is numbered from the end of the landing page and not from
+ * its beginning**, which is why a page that begins with the tail of a
+ * packet needs no special case here as it does for Opus: the page's own
+ * granule position says where its last block ends, the blocks on it add
+ * up to how long they are, and that is the number the first of them
+ * starts at, whatever came before. The decoder hands frames out up to the
+ * start of the next overlap and a granule position counts to a block's
+ * centre, so the end of the last block is its granule position plus the
+ * difference, `n/4 - right_n/4`, plus whatever constant the stream's
+ * first page showed (::find_bias). A last page cannot be the anchor: its
+ * position is the length, which may be less than what it decodes to.
+ *
+ * Does nothing when the landing is no nearer than where the decoder is.
+ */
+static GAUD_Result land_near(VORBIS_Decoder * state, uint64_t frame) {
+  if (!state->bias_known) {
+    GAUD_Result found = find_bias(state);
+    if (found != GAUD_OK) {
+      return found;
+    }
+  }
+  uint64_t margin = 2u * (uint64_t)state->long_block;
+  uint64_t target = frame > margin ? frame - margin : 0;
+  uint64_t offset = 0;
+  uint64_t granule = 0;
+  for (unsigned tries = 0; tries < VORBIS_LAND_TRIES && target > 0; ++tries) {
+    if (gaud_ogg_bisect(&state->reader, target, state->doc_state->audio_offset,
+            &offset, &granule)
+            != GAUD_OK
+        || granule == 0) {
+      break;
+    }
+    // Number the place backwards from the end of the page, where a
+    // position is stated: what the blocks on it add up to is how far
+    // before that the page's first block starts. A page that begins with
+    // the tail of a packet needs no special case, because the reader
+    // drops that fragment here and in the decoder alike, and what is
+    // counted back from the end is only what both go on to read.
+    OGG_Reader probe;
+    gaud_ogg_reader_init(&probe, state->reader.stream, state->allocator);
+    probe.serial = state->reader.serial;
+    probe.have_serial = true;
+    VORBIS_Scan scan;
+    GAUD_Result scanned = gaud_ogg_reader_seek(&probe, offset);
+    if (scanned == GAUD_OK) {
+      scanned = scan_to_anchor(state, &probe, false, &scan);
+    }
+    gaud_ogg_reader_free(&probe);
+    if (scanned != GAUD_OK || scan.end_of_stream) {
+      // The last page's position is the length, which may be less than
+      // what its blocks decode to, so it cannot number anything.
+      target = granule - 1u;
+      continue;
+    }
+    int64_t at = (int64_t)scan.granule + (int64_t)scan.last_slack
+        + state->bias - (int64_t)scan.produced;
+    if (at < 0 || (uint64_t)at + state->long_block > frame) {
+      target = granule - 1u;
+      continue;
+    }
+    if (frame >= state->pending_base && (uint64_t)at <= state->decoded) {
+      return GAUD_OK; // Decoding on is already as near and is exact.
+    }
+    state->position = (uint64_t)at;
+    state->decoded = (uint64_t)at;
+    state->pending_frames = 0;
+    state->pending_used = 0;
+    state->pending_base = (uint64_t)at;
+    state->have_previous = false;
+    state->landing = true;
+    state->tail_length = 0;
+    state->previous_right_n = 0;
+    state->first_page_seen = true;
+    state->ended = false;
+    return gaud_ogg_reader_seek(&state->reader, offset);
+  }
+  if (frame < state->pending_base) {
+    return rewind_to_audio(state);
+  }
+  return GAUD_OK; // Nothing nearer was found; decode on from here.
+}
+
+/**
+ * Seek by bisecting the file to a page and decoding forward from it.
+ *
+ * Exact: what is read after a seek is what a straight read gives, to the
+ * bit, because the only thing a block carries to the next is its lap and
+ * the landing decodes the block that provides it. See ::land_near.
  */
 static GAUD_Result decoder_seek(
     GAUD_Decoder * decoder, uint64_t frame, uint64_t * out_landed) {
@@ -758,6 +1027,17 @@ static GAUD_Result decoder_seek(
   uint64_t total = gaud_track_frames(gaud_decoder_track(decoder));
   if (total != UINT64_MAX && frame > total) {
     frame = total;
+  }
+  // A target behind the decoder, or a long way ahead of it, is reached by
+  // landing on a page near it rather than by decoding from the start or
+  // through everything between.
+  if (frame < state->pending_base
+      || (frame > state->decoded
+          && frame - state->decoded > 4u * state->long_block)) {
+    GAUD_Result jump = land_near(state, frame);
+    if (jump != GAUD_OK) {
+      return jump;
+    }
   }
   /*
    * Three cases, and the first draft had only two. The packet already

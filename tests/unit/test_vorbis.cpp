@@ -298,6 +298,396 @@ TEST(VorbisLoad, TheTagsComeOutOfTheCommentHeader) {
   EXPECT_STREQ(gaud_meta_get(bare, GAUD_TAG_ENCODER, 0), "Lavc libvorbis");
 }
 
+namespace {
+
+/** One Ogg page holding one whole packet, with the right checksum. */
+std::vector<unsigned char> OggPage(uint32_t serial, uint32_t sequence,
+    unsigned flags, uint64_t granule, const std::vector<unsigned char> & packet) {
+  std::vector<unsigned char> page(27, 0);
+  memcpy(page.data(), "OggS", 4);
+  page[5] = (unsigned char)flags;
+  for (int i = 0; i < 8; ++i) page[6 + i] = (unsigned char)(granule >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[14 + i] = (unsigned char)(serial >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[18 + i] = (unsigned char)(sequence >> (8 * i));
+  size_t left = packet.size();
+  std::vector<unsigned char> table;
+  while (left >= 255u) {
+    table.push_back(255);
+    left -= 255u;
+  }
+  table.push_back((unsigned char)left);
+  page[26] = (unsigned char)table.size();
+  page.insert(page.end(), table.begin(), table.end());
+  page.insert(page.end(), packet.begin(), packet.end());
+  uint32_t crc = gaud_ogg_crc32(page.data(), page.size());
+  for (int i = 0; i < 4; ++i) page[22 + i] = (unsigned char)(crc >> (8 * i));
+  return page;
+}
+
+/** Every packet of an Ogg file, in order. */
+std::vector<std::vector<unsigned char>> Packets(const char * name) {
+  std::vector<std::vector<unsigned char>> packets;
+  FILE * file = fopen(Fixture(name).c_str(), "rb");
+  if (!file) {
+    return packets;
+  }
+  std::vector<unsigned char> bytes;
+  unsigned char block[4096];
+  size_t got;
+  while ((got = fread(block, 1, sizeof block, file)) > 0) {
+    bytes.insert(bytes.end(), block, block + got);
+  }
+  fclose(file);
+  std::vector<unsigned char> current;
+  for (size_t at = 0; at + 27 <= bytes.size();) {
+    size_t segments = bytes[at + 26];
+    size_t body = at + 27 + segments;
+    for (size_t k = 0; k < segments; ++k) {
+      size_t length = bytes[at + 27 + k];
+      current.insert(current.end(), bytes.begin() + body,
+          bytes.begin() + body + length);
+      body += length;
+      if (length < 255u) {
+        packets.push_back(current);
+        current.clear();
+      }
+    }
+    at = body;
+  }
+  return packets;
+}
+
+/**
+ * A page that may begin with the tail of a packet, and then holds either
+ * one whole packet or the first 255 bytes of one that goes on.
+ */
+std::vector<unsigned char> OggPageSplit(uint32_t sequence, unsigned flags,
+    uint64_t granule, const std::vector<unsigned char> & tail,
+    const std::vector<unsigned char> & body, bool open) {
+  std::vector<unsigned char> page(27, 0);
+  memcpy(page.data(), "OggS", 4);
+  page[5] = (unsigned char)flags;
+  for (int i = 0; i < 8; ++i) page[6 + i] = (unsigned char)(granule >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[14 + i] = (unsigned char)(9u >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[18 + i] = (unsigned char)(sequence >> (8 * i));
+  std::vector<unsigned char> table;
+  auto lace = [&table](size_t length) {
+    while (length >= 255u) {
+      table.push_back(255);
+      length -= 255u;
+    }
+    table.push_back((unsigned char)length);
+  };
+  if (!tail.empty()) {
+    lace(tail.size());
+  }
+  if (open) {
+    table.push_back(255);
+  }
+  else if (!body.empty()) {
+    lace(body.size());
+  }
+  page[26] = (unsigned char)table.size();
+  page.insert(page.end(), table.begin(), table.end());
+  page.insert(page.end(), tail.begin(), tail.end());
+  page.insert(page.end(), body.begin(), body.end());
+  uint32_t crc = gaud_ogg_crc32(page.data(), page.size());
+  for (int i = 0; i < 4; ++i) page[22 + i] = (unsigned char)(crc >> (8 * i));
+  return page;
+}
+
+/** A fixture's audio looped @p repeats times, a page to every packet. */
+struct Looped {
+  std::vector<unsigned char> file;
+  uint64_t frames = 0;
+  uint64_t pages = 0;
+};
+
+/**
+ * The granule position after each packet is the one before it plus a
+ * quarter of each of the two block sizes, and the first packet produces
+ * nothing - which is the specification's arithmetic and not this
+ * decoder's, so the file's page positions are right whatever the decoder
+ * does with them. The block sizes come from each packet's mode number.
+ */
+bool LoopVorbis(const char * name, int repeats, bool straddle,
+    size_t per_page, uint64_t trim, size_t skip, Looped * out) {
+  auto packets = Packets(name);
+  if (packets.size() < 5) {
+    return false;
+  }
+  Loaded loaded;
+  if (OpenFile(loaded, name) != GAUD_OK) {
+    return false;
+  }
+  const VORBIS_File * info
+      = (const VORBIS_File *)gaud_track_private(loaded.track());
+  std::vector<unsigned char> file;
+  uint32_t sequence = 0;
+  for (int k = 0; k < 3; ++k) {
+    auto page = OggPage(9, sequence++, k == 0 ? 2u : 0u, 0, packets[k]);
+    file.insert(file.end(), page.begin(), page.end());
+  }
+  // The audio, looped, with the window flags at each join made to say
+  // what the neighbours really are: a long block states whether the one
+  // after it is long and whether the one before it was, and the end of a
+  // stream rarely agrees with its own beginning. Everything else in each
+  // packet is as the encoder wrote it.
+  std::vector<std::vector<unsigned char>> audio;
+  for (int r = 0; r < repeats; ++r) {
+    audio.insert(audio.end(), packets.begin() + 3, packets.end());
+  }
+  // Begin part-way through, so that the first block can be a long one
+  // whose successor is short: the one arrangement in which the decoder's
+  // numbering starts a quarter of a block away from the granule's.
+  audio.erase(audio.begin(), audio.begin() + (ptrdiff_t)skip);
+  auto is_long = [&](const std::vector<unsigned char> & packet) {
+    uint32_t mode = (packet[0] >> 1) & ((1u << info->setup.mode_bits) - 1u);
+    return info->setup.modes[mode].block_flag;
+  };
+  auto set_bit = [](std::vector<unsigned char> & packet, unsigned at,
+                     bool value) {
+    if (value) {
+      packet[at / 8u] |= (unsigned char)(1u << (at % 8u));
+    }
+    else {
+      packet[at / 8u] &= (unsigned char)~(1u << (at % 8u));
+    }
+  };
+  unsigned flag_at = 1u + info->setup.mode_bits;
+  for (size_t k = 1; k < audio.size(); ++k) {
+    if (is_long(audio[k - 1])) {
+      set_bit(audio[k - 1], flag_at + 1u, is_long(audio[k]));
+    }
+    if (is_long(audio[k])) {
+      set_bit(audio[k], flag_at, is_long(audio[k - 1]));
+    }
+  }
+  uint64_t granule = 0;
+  uint32_t previous = 0;
+  std::vector<uint64_t> after(audio.size());
+  for (size_t k = 0; k < audio.size(); ++k) {
+    uint32_t n = is_long(audio[k]) ? info->info.blocksize_long
+                                   : info->info.blocksize_short;
+    if (previous != 0) {
+      granule += previous / 4u + n / 4u;
+    }
+    previous = n;
+    after[k] = granule;
+  }
+  if (!straddle) {
+    // Pages of several packets, the last of which states a position
+    // `trim` frames short of where its blocks end - which is what an
+    // encoder does to say the recording ended before its last block did.
+    for (size_t first = 0; first < audio.size(); first += per_page) {
+      size_t end = std::min(audio.size(), first + per_page);
+      bool last = end == audio.size();
+      std::vector<unsigned char> body;
+      std::vector<unsigned char> lacing;
+      for (size_t k = first; k < end; ++k) {
+        size_t length = audio[k].size();
+        while (length >= 255u) {
+          lacing.push_back(255);
+          length -= 255u;
+        }
+        lacing.push_back((unsigned char)length);
+        body.insert(body.end(), audio[k].begin(), audio[k].end());
+      }
+      std::vector<unsigned char> page(27, 0);
+      memcpy(page.data(), "OggS", 4);
+      page[5] = last ? 4u : 0u;
+      uint64_t position = after[end - 1] - (last ? trim : 0u);
+      for (int i = 0; i < 8; ++i) {
+        page[6 + i] = (unsigned char)(position >> (8 * i));
+      }
+      for (int i = 0; i < 4; ++i) page[14 + i] = (unsigned char)(9u >> (8 * i));
+      for (int i = 0; i < 4; ++i) {
+        page[18 + i] = (unsigned char)(sequence >> (8 * i));
+      }
+      ++sequence;
+      page[26] = (unsigned char)lacing.size();
+      page.insert(page.end(), lacing.begin(), lacing.end());
+      page.insert(page.end(), body.begin(), body.end());
+      uint32_t crc = gaud_ogg_crc32(page.data(), page.size());
+      for (int i = 0; i < 4; ++i) page[22 + i] = (unsigned char)(crc >> (8 * i));
+      file.insert(file.end(), page.begin(), page.end());
+    }
+  }
+  else {
+    // A packet longer than 255 bytes is cut there, and its tail starts
+    // the next page, so that a page a bisection can land on begins with
+    // the tail of a packet. A shorter one is a page of its own, since a
+    // page cannot end in the middle of it.
+    std::vector<unsigned char> tail;
+    bool continues = false;
+    for (size_t k = 0; k < audio.size(); ++k) {
+      bool cut = audio[k].size() > 255u;
+      std::vector<unsigned char> body
+          = cut ? std::vector<unsigned char>(
+                audio[k].begin(), audio[k].begin() + 255)
+                : audio[k];
+      // What finishes on this page: the packet whose tail it starts with,
+      // and this one unless it is cut.
+      uint64_t granule_here = ~0ULL;
+      if (continues) {
+        granule_here = after[k - 1];
+      }
+      if (!cut) {
+        granule_here = after[k];
+      }
+      auto page = OggPageSplit(sequence++,
+          (continues ? 1u : 0u) | (!cut && k + 1 == audio.size() ? 4u : 0u),
+          granule_here, tail, body, cut);
+      file.insert(file.end(), page.begin(), page.end());
+      tail.clear();
+      continues = cut;
+      if (cut) {
+        tail.assign(audio[k].begin() + 255, audio[k].end());
+      }
+    }
+    if (continues) {
+      auto page = OggPageSplit(
+          sequence++, 1u | 4u, after[audio.size() - 1], tail, {}, false);
+      file.insert(file.end(), page.begin(), page.end());
+    }
+  }
+  uint64_t index = audio.size();
+  out->file = file;
+  out->frames = after[audio.size() - 1] - (straddle ? 0u : trim);
+  out->pages = index;
+  return true;
+}
+
+}  // namespace
+
+namespace {
+
+/** Seek around a looped fixture and compare every read with a straight one. */
+void CheckSeeks(const char * name, int repeats, bool straddle,
+    size_t per_page = 1, uint64_t trim = 0, size_t skip = 0) {
+  {
+    Looped looped;
+    ASSERT_TRUE(
+        LoopVorbis(name, repeats, straddle, per_page, trim, skip, &looped))
+        << name;
+    GAUD_Stream * stream = nullptr;
+    ASSERT_EQ(gaud_stream_create_memory(
+                  looped.file.data(), looped.file.size(), &stream),
+        GAUD_OK);
+    GAUD_Diagnostics diagnostics;
+    gaud_diagnostics_init(&diagnostics, nullptr);
+    GAUD_Doc * doc = nullptr;
+    ASSERT_EQ(gaud_doc_load(nullptr, stream, nullptr, &diagnostics, &doc),
+        GAUD_OK)
+        << name;
+    GAUD_Track * track = gaud_doc_track(doc, 0);
+    unsigned channels = gaud_track_layout(track).channels;
+    ASSERT_EQ(gaud_track_frames(track), looped.frames) << name;
+    std::vector<int16_t> all;
+    {
+      GAUD_Decoder * straight = nullptr;
+      ASSERT_EQ(gaud_decoder_create(track, &straight), GAUD_OK);
+      GAUD_Buffer * buffer = nullptr;
+      ASSERT_EQ(gaud_decoder_buffer_create(straight, nullptr, 4096, &buffer),
+          GAUD_OK);
+      for (;;) {
+        ASSERT_EQ(gaud_decoder_read(straight, buffer), GAUD_OK) << name;
+        size_t frames = gaud_buffer_frames(buffer);
+        if (frames == 0) {
+          break;
+        }
+        const int16_t * data
+            = (const int16_t *)gaud_buffer_data_const(buffer);
+        all.insert(all.end(), data, data + frames * channels);
+      }
+      gaud_buffer_destroy(buffer);
+      gaud_decoder_destroy(straight);
+    }
+    ASSERT_EQ(all.size(), looped.frames * channels) << name;
+
+    GAUD_Decoder * decoder = nullptr;
+    ASSERT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK);
+    GAUD_Buffer * buffer = nullptr;
+    ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 3000, &buffer),
+        GAUD_OK);
+    uint64_t frames = looped.frames;
+    for (uint64_t target : std::initializer_list<uint64_t>{frames / 2,
+             frames / 3, frames / 5, 1u, 100u, 0u, frames - 77u, frames - 1500u,
+             frames - 3000u, frames - 5000u, frames - 9000u,
+             frames + 5u, frames / 2 + 1u, frames / 7, frames / 7 + 3000u,
+             frames / 7 + 3001u + 8192u * 3u}) {
+      uint64_t landed = 0;
+      ASSERT_EQ(gaud_decoder_seek(decoder, target, &landed), GAUD_OK) << name;
+      uint64_t expect = std::min(target, frames);
+      EXPECT_EQ(landed, expect) << name << " " << target;
+      ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK) << name;
+      size_t got = gaud_buffer_frames(buffer);
+      EXPECT_EQ(got, std::min<uint64_t>(3000u, frames - expect))
+          << name << " " << target;
+      const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+      for (size_t i = 0; i < got * channels; ++i) {
+        ASSERT_EQ(data[i], all[expect * channels + i])
+            << name << " target " << target << " sample " << i;
+      }
+    }
+    gaud_buffer_destroy(buffer);
+    gaud_decoder_destroy(decoder);
+    gaud_doc_destroy(doc);
+    gaud_stream_destroy(stream);
+    gaud_diagnostics_destroy(&diagnostics);
+  }
+}
+
+}  // namespace
+
+TEST(VorbisDecode, ASeekLandsOnAPageAndReadsExactlyWhatAStraightReadReads) {
+  // Nothing in a block depends on those before it except the lap, so the
+  // seek decodes the block that provides it and the rest is the same to
+  // the bit. Each fixture is looped until it has hundreds of pages to
+  // bisect; the loop's joins are made legal by setting the window flags
+  // at them to what the neighbours are, which is the one change made to
+  // any packet.
+  for (const char * name : {"vorbis_lib_mono_8000.ogg",
+           "vorbis_lib_mono_22050.ogg", "vorbis_lib_stereo_44100.ogg",
+           "vorbis_lib_5dot1_48000.ogg", "vorbis_lib_transient_44100.ogg"}) {
+    CheckSeeks(name, 40, false);
+  }
+}
+
+TEST(VorbisDecode, ASeekIntoPagesOfSeveralPacketsAndAShortenedLastOne) {
+  // Several packets to a page, so a landing page has blocks to add up,
+  // and a last page whose position is 100 frames short of what its blocks
+  // decode to. That page cannot number anything, and a seek into the
+  // last frames is where a decoder that let it would be wrong.
+  for (const char * name : {"vorbis_lib_stereo_44100.ogg",
+           "vorbis_lib_transient_44100.ogg", "vorbis_lib_mono_22050.ogg"}) {
+    CheckSeeks(name, 40, false, 7, 100);
+    CheckSeeks(name, 40, false, 7, 0);
+    CheckSeeks(name, 40, false, 60, 100);
+  }
+}
+
+TEST(VorbisDecode, ASeekDoesNotDependOnWhichBlockTheStreamBeginsWith) {
+  // Rotated, so that the stream begins at every one of the first dozen
+  // packets: some of those are long blocks followed by short ones, whose
+  // first output is not where a granule position would put it.
+  for (const char * name : {"vorbis_lib_stereo_44100.ogg",
+           "vorbis_lib_transient_44100.ogg", "vorbis_lib_mono_22050.ogg"}) {
+    for (size_t skip = 1; skip <= 12; ++skip) {
+      SCOPED_TRACE(skip);
+      CheckSeeks(name, 12, false, 1 + skip % 5, 0, skip);
+    }
+  }
+}
+
+TEST(VorbisDecode, ASeekOntoAPageThatContinuesAPacketIsStillExact) {
+  // A page here that is not the stream's first begins with the end of a
+  // packet, which the reader drops, so the first packet a landing decodes
+  // is the one after it. The position is counted back from the end of
+  // the page, so it does not matter which packet that is.
+  CheckSeeks("vorbis_lib_noise_48000.ogg", 20, true);
+}
+
 TEST(VorbisDecode, EveryFixtureDecodesToTheLengthItStated) {
   /*
    * **The frame count asserted exactly, before anything else is
