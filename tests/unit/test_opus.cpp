@@ -5816,17 +5816,16 @@ TEST(OpusDecode, ASeekNeverLandsOnAPageThatContinuesAPacket) {
   Opened opened;
   ASSERT_EQ(OpenLooped(opened, split, 9600), GAUD_OK);
   EXPECT_EQ(gaud_track_frames(opened.track()), frames);
-  // The straight read has a stream of its own: the decoders of one
-  // document share its stream, and one reading would move the other's.
-  Opened straight;
-  ASSERT_EQ(OpenLooped(straight, split, 9600), GAUD_OK);
-  std::vector<int16_t> all = DecodeAll(straight.track());
+  // The straight read is the document's own track and so its stream:
+  // decoders of one document share it, and neither may notice the other.
+  std::vector<int16_t> all = DecodeAll(opened.track());
   ASSERT_EQ(all.size(), frames);
   {
     // A decoder that has read nothing has no page in hand, and a refused
     // landing has to leave it as it was.
     Opened fresh;
     ASSERT_EQ(OpenLooped(fresh, split, 9600), GAUD_OK);
+    EXPECT_EQ(DecodeAll(fresh.track()).size(), frames);
     uint64_t landed = 0;
     ASSERT_EQ(gaud_decoder_seek(fresh.decoder, 400000u, &landed), GAUD_OK);
     EXPECT_EQ(landed, 400000u);
@@ -5850,6 +5849,50 @@ TEST(OpusDecode, ASeekNeverLandsOnAPageThatContinuesAPacket) {
       ASSERT_EQ(got[i], all[target + i]) << target << " sample " << i;
     }
   }
+}
+
+TEST(OpusDecode, TwoDecodersOfOneDocumentDoNotMoveEachOther) {
+  // They share the document's stream. Alternating small reads, with a
+  // seek in one, must give each what it would have read alone.
+  Looped looped = Loop("opus_celt_stereo_96k.opus", 2);
+  Opened a;
+  ASSERT_EQ(OpenLooped(a, looped, 700), GAUD_OK);
+  GAUD_Decoder * other = nullptr;
+  ASSERT_EQ(gaud_decoder_create(a.track(), &other), GAUD_OK);
+  GAUD_Buffer * buffer = nullptr;
+  ASSERT_EQ(gaud_decoder_buffer_create(other, nullptr, 1100, &buffer), GAUD_OK);
+  Opened alone;
+  ASSERT_EQ(OpenLooped(alone, looped, 9600), GAUD_OK);
+  std::vector<int16_t> all = DecodeAll(alone.track());
+  std::vector<int16_t> first;
+  std::vector<int16_t> second;
+  for (int i = 0; i < 20; ++i) {
+    auto x = ReadSome(a, 2);
+    first.insert(first.end(), x.begin(), x.end());
+    ASSERT_EQ(gaud_decoder_read(other, buffer), GAUD_OK);
+    const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+    second.insert(second.end(), data, data + gaud_buffer_frames(buffer) * 2);
+    if (i == 9) {
+      uint64_t landed = 0;
+      ASSERT_EQ(gaud_decoder_seek(other, 400000u, &landed), GAUD_OK);
+      second.clear();
+    }
+  }
+  ASSERT_EQ(first.size(), 20u * 700u * 2u);
+  EXPECT_TRUE(std::equal(first.begin(), first.end(), all.begin()));
+  ASSERT_EQ(second.size(), 10u * 1100u * 2u);
+  Opened solo;
+  ASSERT_EQ(OpenLooped(solo, looped, 1100), GAUD_OK);
+  uint64_t landed = 0;
+  ASSERT_EQ(gaud_decoder_seek(solo.decoder, 400000u, &landed), GAUD_OK);
+  std::vector<int16_t> expect;
+  for (int i = 0; i < 10; ++i) {
+    auto x = ReadSome(solo, 2);
+    expect.insert(expect.end(), x.begin(), x.end());
+  }
+  EXPECT_EQ(second, expect);
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(other);
 }
 
 TEST(OpusDecode, ASeekFarAwayReadsWhatARestartedReferenceDecoderReads) {

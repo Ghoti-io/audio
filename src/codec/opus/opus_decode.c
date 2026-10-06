@@ -86,7 +86,6 @@ typedef struct {
   uint32_t pending_used;            ///< How much of it was handed out.
   uint64_t position;                ///< Frames handed out so far.
   uint64_t skip;                    ///< Pre-skip frames still to drop.
-  uint64_t seeked_to;               ///< Where the reader was last put.
   bool ended;                       ///< The stream has no more packets.
   /** For output channel `slot`: which stream and which of its channels. */
   struct {
@@ -123,8 +122,7 @@ static GAUD_Result rewind_player(OPUS_Player * player) {
   player->position = 0;
   player->skip = player->file->head.pre_skip;
   player->ended = false;
-  player->seeked_to = player->file->audio_offset;
-  return gaud_ogg_reader_seek(&player->reader, player->seeked_to);
+  return gaud_ogg_reader_seek(&player->reader, player->file->audio_offset);
 }
 
 /**
@@ -253,15 +251,6 @@ static GAUD_Result player_read(GAUD_Decoder * decoder, GAUD_Buffer * buffer) {
   return gaud_buffer_set_frames(buffer, filled);
 }
 
-/** Undo a search that moved the stream: the reader goes on as it was. */
-static GAUD_Result put_back(
-    OPUS_Player * player, bool mid_page, int64_t resume) {
-  if (mid_page) {
-    return gaud_stream_seek(player->reader.stream, resume, GAUD_SEEK_SET);
-  }
-  return gaud_ogg_reader_seek(&player->reader, (uint64_t)resume);
-}
-
 /**
  * Put the decoders where a seek to @p frame can begin: the last page at
  * least ::OPUS_PREROLL before it, every decoder reset there, or the
@@ -275,15 +264,6 @@ static GAUD_Result land_near(OPUS_Player * player, uint64_t frame) {
   uint64_t target = want > OPUS_PREROLL ? want - OPUS_PREROLL : 0u;
   uint64_t offset = 0;
   uint64_t granule = 0;
-  // Searching moves the stream under the reader, so where the reader will
-  // read next is worked out to be put back when the search comes to
-  // nothing. The stream's own position is not it: the document's stream
-  // is shared with every other decoder of the track.
-  const OGG_Reader * reader = &player->reader;
-  bool mid_page = reader->page_live;
-  int64_t resume = (int64_t)(mid_page
-          ? reader->page_offset + 27u + reader->segments + reader->body_size
-          : player->seeked_to);
   // A page whose first packet began on the page before cannot be landed
   // on, because that packet is dropped and its samples would be missing
   // from the position; step back to an earlier page instead.
@@ -307,8 +287,7 @@ static GAUD_Result land_near(OPUS_Player * player, uint64_t frame) {
     }
     uint64_t landed = granule - pre_skip;
     if (frame >= player->position && landed <= player->position) {
-      // Decoding on is already as near and is exact.
-      return put_back(player, mid_page, resume);
+      return GAUD_OK; // Decoding on is already as near and is exact.
     }
     for (uint32_t i = 0; i < player->stream_count; ++i) {
       gaud_opus_decoder_reset(player->streams[i]);
@@ -318,13 +297,12 @@ static GAUD_Result land_near(OPUS_Player * player, uint64_t frame) {
     player->position = landed;
     player->skip = 0;
     player->ended = false;
-    player->seeked_to = offset;
     return gaud_ogg_reader_seek(&player->reader, offset);
   }
   if (frame < player->position) {
     return rewind_player(player);
   }
-  return put_back(player, mid_page, resume);
+  return GAUD_OK;
 }
 
 static GAUD_Result player_seek(

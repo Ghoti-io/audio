@@ -67,6 +67,7 @@ void gaud_ogg_reader_init(OGG_Reader * reader, GAUD_Stream * stream,
   reader->stream = stream;
   reader->allocator = allocator;
   reader->granule = UINT64_MAX;
+  reader->next_page = gaud_stream_tell(stream);
 }
 
 void gaud_ogg_reader_free(OGG_Reader * reader) {
@@ -108,7 +109,12 @@ static bool reserve(const GAUD_Allocator * allocator, unsigned char ** buffer,
  */
 static GAUD_Result read_page(OGG_Reader * reader) {
   unsigned char header[OGG_HEADER_FIXED];
-  uint64_t began_at = gaud_stream_tell(reader->stream);
+  uint64_t began_at = reader->next_page;
+  if (gaud_stream_tell(reader->stream) != began_at
+      && gaud_stream_seek(reader->stream, (int64_t)began_at, GAUD_SEEK_SET)
+          != GAUD_OK) {
+    return GAUD_ERR_IO;
+  }
   size_t got = gaud_stream_read(reader->stream, header, sizeof(header));
   if (got == 0) {
     return GAUD_ERR_FORMAT;
@@ -174,6 +180,7 @@ static GAUD_Result read_page(OGG_Reader * reader) {
   reader->body_size = body;
   reader->next_body = 0;
   reader->page_offset = began_at;
+  reader->next_page = began_at + want + body;
   reader->page_live = true;
   reader->eos = (reader->flags & OGG_FLAG_EOS) != 0;
   if (serial == reader->serial && reader->drop_continued) {
@@ -271,6 +278,7 @@ GAUD_Result gaud_ogg_reader_seek(OGG_Reader * reader, uint64_t offset) {
       != GAUD_OK) {
     return GAUD_ERR_IO;
   }
+  reader->next_page = offset;
   reader->page_live = false;
   reader->segments = 0;
   reader->next_segment = 0;

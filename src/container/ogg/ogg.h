@@ -127,6 +127,13 @@ typedef struct {
    * after the header.
    */
   uint64_t page_offset;
+  /**
+   * Where the next page begins, which the reader moves the stream to
+   * before reading it. The stream is not the reader's alone - every
+   * decoder of a document shares it, and so does a bisection - so its
+   * position says where somebody read last, not where this reader is.
+   */
+  uint64_t next_page;
   size_t body_at;          ///< Where the body starts within @p page.
   size_t body_size;        ///< How many body bytes the page holds.
   unsigned char table[OGG_MAX_SEGMENTS]; ///< The lacing values.
