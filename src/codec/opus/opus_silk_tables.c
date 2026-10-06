@@ -594,3 +594,21 @@ const uint8_t gaud_opus_silk_sign_icdf[42] = {
 const int16_t gaud_opus_silk_quantization_offsets_q10[4] = {
     100, 240, 32, 100,
 };
+
+/** The even output's three all-pass coefficients, Q16. */
+const int16_t gaud_opus_silk_resampler_up2_hq_0[3] = {
+    1746, 14986, -26453,
+};
+
+/** The odd output's three all-pass coefficients, Q16. */
+const int16_t gaud_opus_silk_resampler_up2_hq_1[3] = {
+    6854, 25769, -9994,
+};
+
+/** Twelve polyphase rows of four taps; a row and its mirror make eight, Q15. */
+const int16_t gaud_opus_silk_resampler_frac_fir_12[48] = {
+    189, -600, 617, 30567, 117, -159, -1070, 29704, 52, 221, -2392, 28276,
+    -4, 529, -3350, 26341, -48, 758, -3956, 23973, -80, 905, -4235, 21254,
+    -99, 972, -4222, 18278, -107, 967, -3957, 15143, -103, 896, -3487, 11950,
+    -91, 773, -2865, 8798, -71, 611, -2143, 5784, -46, 425, -1375, 2996,
+};

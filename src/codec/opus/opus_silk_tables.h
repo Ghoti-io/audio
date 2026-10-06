@@ -228,6 +228,15 @@ extern const uint8_t gaud_opus_silk_sign_icdf[42];
 /** The excitation's quantization offset, Q10. */
 extern const int16_t gaud_opus_silk_quantization_offsets_q10[4];
 
+/** The even output's three all-pass coefficients, Q16. */
+extern const int16_t gaud_opus_silk_resampler_up2_hq_0[3];
+
+/** The odd output's three all-pass coefficients, Q16. */
+extern const int16_t gaud_opus_silk_resampler_up2_hq_1[3];
+
+/** Twelve polyphase rows of four taps; a row and its mirror make eight, Q15. */
+extern const int16_t gaud_opus_silk_resampler_frac_fir_12[48];
+
 
 #ifdef __cplusplus
 }

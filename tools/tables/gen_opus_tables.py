@@ -1067,12 +1067,78 @@ class SilkCheck:
                    "Table 53, times four")
         self.emit("quantization_offsets_q10", "int16_t", reference)
 
+    def expression_array(self, relative, name):
+        """An array whose entries are sums, as `39083 - 65536` is.
+
+        read_array refuses these on purpose, because reading the two
+        numbers of "39083 - 65536" as a list would be silently wrong.
+        This one takes only integers, plus and minus, and evaluates each
+        entry.
+        """
+        text = open(os.path.join(self.root, relative), encoding="utf-8",
+                    errors="replace").read()
+        match = re.search(
+            r"\b" + re.escape(name) + r"\s*(\[[^\]]*\]\s*)+=\s*\{", text)
+        if not match:
+            raise SystemExit(f"gen_opus_tables: {relative} has no {name}")
+        start = match.end()
+        end = text.index("};", start)
+        body = re.sub(r"/\*.*?\*/", " ", text[start:end], flags=re.S)
+        values = []
+        for entry in re.split(r"[,{}]", body):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if not re.fullmatch(r"[-+0-9 ]+", entry):
+                raise SystemExit(
+                    f"gen_opus_tables: {name} has an entry {entry!r} that is "
+                    "not integers and signs")
+            values.append(sum(int(term.replace(" ", "")) for term in
+                              re.findall(r"[-+]?\s*\d+", entry)))
+        return values
+
+    # -- section 4.2.10: the resampler -------------------------------
+
+    def resampler(self):
+        """The two tables the decoder's 48 kHz resampler needs.
+
+        Section 4.2.10 says the resampler is not normative, so there is
+        no prose copy to hold these against. What can be checked is what
+        the numbers are for: each pair of rows of the interpolation
+        table is one polyphase filter's eight taps, and a filter that
+        passes DC at unity has taps summing to 32768 in Q15, to within
+        the rounding of its own design.
+        """
+        rom = "silk/resampler_rom.c"
+        for name in ("silk_resampler_up2_hq_0", "silk_resampler_up2_hq_1"):
+            values = self.expression_array(rom, name)
+            if len(values) != 3 or values[0] <= 0 or values[1] <= 0 \
+                    or values[2] >= 0:
+                raise SystemExit(
+                    f"gen_opus_tables: {name} is {values}, not two "
+                    "positive coefficients and a negative one")
+            self.emit(name[5:], "int16_t", values)
+        table = self.expression_array(rom, "silk_resampler_frac_FIR_12")
+        if len(table) != 48:
+            raise SystemExit(
+                f"gen_opus_tables: the interpolation table has {len(table)} "
+                "entries, not 12 rows of 4")
+        for row in range(12):
+            taps = table[4 * row:4 * row + 4] \
+                + table[4 * (11 - row):4 * (11 - row) + 4]
+            if abs(sum(taps) - 32768) > 8:
+                raise SystemExit(
+                    f"gen_opus_tables: interpolation row {row} sums to "
+                    f"{sum(taps)}, not 32768: a coefficient was misread")
+        self.emit("resampler_frac_fir_12", "int16_t", table)
+
     def run(self):
         self.header()
         self.nlsf()
         self.lsf_to_lpc()
         self.ltp()
         self.excitation()
+        self.resampler()
         print(f"gen_opus_tables: {self.checked} SILK tables read twice - "
               "once from section 4.2's prose and once from Appendix A - "
               "and the two readings agree")
@@ -1483,6 +1549,9 @@ CELT_NOTES = {
 
 
 SILK_NOTES = {
+    "silk_resampler_up2_hq_0": "The even output's three all-pass coefficients, Q16.",
+    "silk_resampler_up2_hq_1": "The odd output's three all-pass coefficients, Q16.",
+    "silk_resampler_frac_fir_12": "Twelve polyphase rows of four taps; a row and its mirror make eight, Q15.",
     "silk_lbrr_flags_2_icdf": "Which of a 40 ms frame's two LBRR frames are coded.",
     "silk_lbrr_flags_3_icdf": "The same for 60 ms, over three frames.",
     "silk_stereo_pred_joint_icdf": "The stereo weights' shared high-order index.",
