@@ -649,6 +649,55 @@ TEST(Mp3EncodePsy, AThresholdMayNotMoreThanDoubleBetweenGranules) {
   EXPECT_LT(worst, 2.6);
 }
 
+TEST(Mp3EncodePsy, ATonePastThreeKilohertzIsMaskedByEighteenDecibelsNotSix) {
+  /* Below about 1.5 kHz the model's least ratio (24 dB falling to 10 at
+   * 3 kHz) is already stricter than a tone's 18, so tonality can only be
+   * seen above that; the unpredictability measure is what tells the two
+   * masker kinds apart, and replacing it by "everything is noise" leaves
+   * every band at the noise figure. */
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  int32_t spectrum[576];
+  uint32_t state = 7;
+  auto tone = [&](unsigned n) {
+    state = state * 1664525u + 1013904223u;
+    double noise = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+    return (int16_t)std::lround(10000.0 * std::sin(2 * M_PI * 6000.0 * n / 44100.0) + 20.0 * noise);
+  };
+  MP3E_Psy_Result r = RunPsy(tone, 90, rate, spectrum);
+  const uint16_t * bounds = gaud_mp3_sfb_long[0];
+  unsigned line = (unsigned)(6000.0 / 22050.0 * 576.0);
+  unsigned band = 0;
+  while (bounds[band + 1] <= line) {
+    ++band;
+  }
+  double signal = BandEnergy(spectrum, bounds[band], bounds[band + 1]);
+  double db = 10.0 * std::log10(signal / (double)r.allowed_long[band]);
+  EXPECT_GT(db, 13.0) << "a tone is masked less than that";
+  EXPECT_LT(db, 24.0) << "and more than that is not the model";
+}
+
+TEST(Mp3EncodePsy, RaisingTheHearingThresholdLowersWhatQuietBandsMayCarry) {
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  auto run = [&](int ath_offset_q8) {
+    MP3E_Psy_Channel channel;
+    gaud_mp3e_psy_channel_reset(&channel);
+    MP3E_Psy_Result r{};
+    int16_t silence[576] = {};
+    for (unsigned g = 0; g < 10; ++g) {
+      gaud_mp3e_psy_analyze(&rate, &channel, silence, 0, ath_offset_q8, &r);
+    }
+    return r;
+  };
+  MP3E_Psy_Result base = run(0);
+  MP3E_Psy_Result lowered = run(10 * 256);
+  for (unsigned b = 4; b < 20; ++b) {
+    double db = 10.0 * std::log10((double)lowered.allowed_long[b] / (double)base.allowed_long[b]);
+    EXPECT_NEAR(db, -10.0, 1.0) << "band " << b;
+  }
+}
+
 TEST(Mp3EncodePsy, SilenceIsLeftToTheThresholdOfHearing) {
   MP3E_Psy_Rate rate;
   gaud_mp3e_psy_rate_init(&rate, 0, 0);
@@ -1090,6 +1139,18 @@ TEST(Mp3EncodeRate, AverageRateLandsNearItsTarget) {
   unsigned lo = *std::min_element(f.kbps.begin(), f.kbps.end());
   unsigned hi = *std::max_element(f.kbps.begin(), f.kbps.end());
   EXPECT_LT(lo, hi) << "an average-rate file is not a constant one";
+}
+
+TEST(Mp3EncodeFile, AnEasySignalAtAHighRateSpendsItsSurplusOnFinerCoding) {
+  /* A tone needs a few hundred bits a frame; 320 kbit/s offers a thousand
+   * times that, and the reservoir is full after a few frames. What it holds
+   * beyond five eighths is put into finer steps rather than stuffed. */
+  Pcm pcm = Tone(1, 44100 * 3, 44100);
+  Decoded d = Decode(Encode(pcm, 1, 44100, 320000));
+  double snr = SnrDb(pcm, d.pcm);
+  /* Measured 52.6 dB; leaving the surplus unspent gives 49.8. The encoder is
+   * deterministic, so the figure is exact and the bound sits between. */
+  EXPECT_GT(snr, 51.0);
 }
 
 TEST(Mp3EncodeRate, ConstantRateAt44100PadsToTheExactAverage) {
