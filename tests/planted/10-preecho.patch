@@ -1,0 +1,15 @@
+# 10 preecho
+# defect: a threshold may rise by any factor between granules
+# caught by: Mp3EncodePsy.AThresholdMayNotMoreThanDoubleBetweenGranules
+#
+--- a/src/codec/mp3/mp3enc_psy.c
++++ b/src/codec/mp3/mp3enc_psy.c
+@@ -325,7 +325,7 @@
+     uint64_t thr = nb;
+     if (previous) {
+       uint64_t cap = previous[j] > UINT64_MAX / 4u ? UINT64_MAX / 2u : previous[j] * 2u;
+-      thr = nb < cap ? nb : cap;
++      thr = nb; (void)cap;
+     }
+     out_mask[j] = thr;
+     if (thr < floor_power) {

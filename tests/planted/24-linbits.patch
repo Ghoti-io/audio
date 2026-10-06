@@ -1,0 +1,15 @@
+# 24 linbits
+# defect: the escape extension of a large value is written one too small
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_huff.c
++++ b/src/codec/mp3/mp3enc_huff.c
+@@ -528,7 +528,7 @@
+       gaud_mp3e_bits_put(
+           bits, gaud_mp3enc_huff_code[index], gaud_mp3enc_huff_len[index]);
+       if (x >= 15) {
+-        gaud_mp3e_bits_put(bits, (uint32_t)(x - 15), table->linbits);
++        gaud_mp3e_bits_put(bits, (uint32_t)(x - 14), table->linbits);
+       }
+       if (x != 0) {
+         gaud_mp3e_bits_put(bits, is[at] < 0 ? 1u : 0u, 1u);

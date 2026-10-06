@@ -1,0 +1,15 @@
+# 02 quant-refine
+# defect: the exact refinement of the step may walk below the floor
+# caught by: Mp3EncodeRoundTrip.APureToneIsCodedAccuratelyAndALoudSquareWaveSurvives
+#
+--- a/src/codec/mp3/mp3enc_quant.c
++++ b/src/codec/mp3/mp3enc_quant.c
+@@ -249,7 +249,7 @@
+   quantize_all(w, lo, g);
+   uint32_t bits = finish(w, lo, g);
+   bool fits = bits <= budget;
+-  for (unsigned step = 0; fits && lo > floor_gain && step < 4u; ++step) {
++  for (unsigned step = 0; fits && lo > 0 && step < 4u; ++step) {
+     MP3E_Granule * probe = &w->scratch;
+     quantize_all(w, lo - 1u, probe);
+     uint32_t finer = finish(w, lo - 1u, probe);

@@ -1,0 +1,15 @@
+# 08 norm
+# defect: the spreading normalisation is wrong by a factor of three
+# caught by: Mp3EncodePsy.ATonesMaskingIsEighteenDecibelsDownAndNoiseSixIsNot
+#
+--- a/src/codec/mp3/mp3enc_psy.c
++++ b/src/codec/mp3/mp3enc_psy.c
+@@ -319,7 +319,7 @@
+     }
+     snr_q8 += snr_offset_q8;
+     uint32_t bc = gaud_mp3e_exp2_q8((int32_t)(-(snr_q8 * 85) / 256));
+-    uint64_t en = ecb / norm[j];
++    uint64_t en = ecb / (norm[j] * 3u);
+     uint64_t nb = ((en * bc) >> 16) << shift;
+     uint64_t floor_power = scaled(ath[j] * (uint64_t)(hi[j] - lo[j]), ath_scale);
+     uint64_t thr = nb;

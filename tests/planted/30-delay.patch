@@ -1,0 +1,15 @@
+# 30 delay
+# defect: the tag states a delay one sample too long
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -151,7 +151,7 @@
+   tag->frames = (uint32_t)enc->audio_frames;
+   tag->bytes = (uint32_t)(enc->bytes_out + enc->tag_bytes);
+   uint64_t decoded = enc->audio_frames * enc->granules * MP3E_LINES;
+-  tag->delay = TOTAL_DELAY - MP3_DECODER_DELAY;
++  tag->delay = TOTAL_DELAY - MP3_DECODER_DELAY + 1u;
+   uint64_t padding_total = decoded >= TOTAL_DELAY + enc->samples_in
+       ? decoded - TOTAL_DELAY - enc->samples_in
+       : 0u;

@@ -1,0 +1,15 @@
+# 25 bigvalues
+# defect: the count of value pairs is written one too large
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_frame.c
++++ b/src/codec/mp3/mp3enc_frame.c
+@@ -144,7 +144,7 @@
+     for (unsigned ch = 0; ch < channels; ++ch) {
+       const MP3_Granule * g = &granule[gr][ch].side;
+       gaud_mp3e_bits_put(&bits, g->part2_3_length, 12u);
+-      gaud_mp3e_bits_put(&bits, g->big_values, 9u);
++      gaud_mp3e_bits_put(&bits, g->big_values + 1u, 9u);
+       gaud_mp3e_bits_put(&bits, g->global_gain, 8u);
+       gaud_mp3e_bits_put(&bits, g->scalefac_compress, lsf ? 9u : 4u);
+       gaud_mp3e_bits_put(&bits, g->window_switching ? 1u : 0u, 1u);

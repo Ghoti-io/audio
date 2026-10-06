@@ -1,0 +1,15 @@
+# 17 keep
+# defect: a reservoir surplus is kept instead of spent on finer steps
+# caught by: Mp3EncodeFile.AnEasySignalAtAHighRateSpendsItsSurplusOnFinerCoding
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -399,7 +399,7 @@
+     uint64_t left = area + reservoir - used_bytes;
+     /* Keep enough in the reservoir for a granule that needs more than its
+      * share - five eighths of what it can hold - and spend the rest. */
+-    uint64_t keep = enc->reservoir_max * 5u / 8u;
++    uint64_t keep = enc->reservoir_max * 9u / 8u;
+     if (left > keep) {
+       grant = needed + 8u * (left - keep);
+       recode = true;

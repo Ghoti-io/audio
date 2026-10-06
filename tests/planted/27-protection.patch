@@ -1,0 +1,15 @@
+# 27 protection
+# defect: the protection bit is inverted, so the CRC flag lies
+# caught by: Mp3EncodeHeader.TheParserReadsBackWhatTheWriterWritesForEveryCombination
+#
+--- a/src/codec/mp3/mp3enc_frame.c
++++ b/src/codec/mp3/mp3enc_frame.c
+@@ -97,7 +97,7 @@
+   static const unsigned char version_bits[3] = {3u, 2u, 0u};
+   out[0] = 0xFFu;
+   out[1] = (unsigned char)(0xE0u | (version_bits[h->version] << 3) | (1u << 1)
+-      | (h->crc ? 0u : 1u));
++      | (h->crc ? 1u : 0u));
+   out[2] = (unsigned char)((h->bitrate_index << 4) | (h->rate_index << 2)
+       | (h->padding ? 2u : 0u));
+   /* The "original" bit is set, as every encoder does. */

@@ -1,0 +1,15 @@
+# 21 abr-steer
+# defect: the average-rate controller stops steering toward its target
+# caught by: Mp3EncodeRate.AverageRateLandsNearItsTarget
+#
+--- a/src/codec/mp3/mp3enc_rate.c
++++ b/src/codec/mp3/mp3enc_rate.c
+@@ -102,7 +102,7 @@
+     if (frame < 1) {
+       frame = 1;
+     }
+-    int64_t factor = 65536 + error * 65536 / (8 * frame);
++    int64_t factor = 65536 + 0 * error * 65536 / (8 * frame);
+     if (factor < 26214) {
+       factor = 26214; /* 0.4 */
+     }

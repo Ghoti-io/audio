@@ -1,0 +1,15 @@
+# 09 minsnr
+# defect: the minimum signal-to-noise table is ignored
+# caught by: Mp3EncodePsy.ATonesMaskingIsEighteenDecibelsDownAndNoiseSixIsNot
+#
+--- a/src/codec/mp3/mp3enc_psy.c
++++ b/src/codec/mp3/mp3enc_psy.c
+@@ -314,7 +314,7 @@
+     }
+     int64_t snr_q8 = SNR_NOISE_Q8
+         + (((int64_t)(SNR_TONE_Q8 - SNR_NOISE_Q8) * tb15) >> 15);
+-    if (snr_q8 < minimum_snr[j]) {
++    if (false) {
+       snr_q8 = minimum_snr[j];
+     }
+     snr_q8 += snr_offset_q8;

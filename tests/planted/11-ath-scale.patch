@@ -1,0 +1,15 @@
+# 11 ath-scale
+# defect: the hearing-threshold offset of the quality setting is ignored
+# caught by: Mp3EncodePsy.RaisingTheHearingThresholdLowersWhatQuietBandsMayCarry
+#
+--- a/src/codec/mp3/mp3enc_psy.c
++++ b/src/codec/mp3/mp3enc_psy.c
+@@ -409,7 +409,7 @@
+   memcpy(channel->long_im[0], im, 513u * sizeof(int32_t));
+   memcpy(channel->long_mag[0], mag, sizeof(mag));
+ 
+-  uint32_t ath_scale = gaud_mp3e_exp2_q8((int32_t)(-((int64_t)ath_offset_q8 * 85) / 256));
++  uint32_t ath_scale = 65536u; (void)ath_offset_q8;
+   uint64_t long_thr[MP3E_MAX_LONG_PARTS];
+   uint64_t long_mask[MP3E_MAX_LONG_PARTS];
+   thresholds(rate->long_count, gaud_mp3enc_long_lo[rate->psy_row],

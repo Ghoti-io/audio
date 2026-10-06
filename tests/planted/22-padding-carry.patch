@@ -1,0 +1,15 @@
+# 22 padding-carry
+# defect: the average-length padding accumulator is reset every frame
+# caught by: Mp3EncodeRate.ConstantRateAt44100PadsToTheExactAverage
+#
+--- a/src/codec/mp3/mp3enc_rate.c
++++ b/src/codec/mp3/mp3enc_rate.c
+@@ -76,7 +76,7 @@
+ void gaud_mp3e_rate_commit(MP3E_Rate * rate, unsigned index) {
+   uint64_t k = per_frame(rate, index);
+   uint32_t size = gaud_mp3e_rate_size(rate, index, NULL);
+-  rate->pad_accumulator = (rate->pad_accumulator + k) % rate->sample_rate;
++  rate->pad_accumulator = 0 * k;
+   rate->actual_bytes += size;
+   if (rate->mode == GAUD_RATE_ABR) {
+     uint64_t slots = rate->version == MP3_MPEG1 ? 144u : 72u;

@@ -1,0 +1,15 @@
+# 19 stuff
+# defect: a reservoir surplus is never stuffed, so main data can run past what the format holds
+# caught by: Mp3EncodeRoundTrip.AnImpulseComesBackAtTheSampleItWentInAt
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -477,7 +477,7 @@
+     return GAUD_ERR_INTERNAL;
+   }
+   uint64_t leftover = area + reservoir - data_bytes;
+-  if (leftover > enc->reservoir_max) {
++  if (false) {
+     /* Stuff: more than the back-pointer can reach is no use to anyone. */
+     data_bytes += (uint32_t)(leftover - enc->reservoir_max);
+   }

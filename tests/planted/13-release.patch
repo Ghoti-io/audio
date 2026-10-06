@@ -1,0 +1,15 @@
+# 13 release
+# defect: an abrupt stop is never recognised as an event, so no short block follows it
+# caught by: Mp3EncodeBlocks.AnAbruptStopIsAnEventToo
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -616,7 +616,7 @@
+       loud = window[w][b] > loud ? window[w][b] : loud;
+       quiet = window[w][b] < quiet ? window[w][b] : quiet;
+     }
+-    if (loud > 16u * noise_of[b] && quiet * 4u < noise_of[b]) {
++    if (false) {
+       attack = true;
+     }
+   }

@@ -1,0 +1,15 @@
+# 12 attack
+# defect: a rise in energy is never recognised as an onset
+# caught by: Mp3EncodeBlocks.ARiseOfTwelveDecibelsAmongSteadyNoiseIsAnOnset
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -596,7 +596,7 @@
+       uint64_t before = enc->window_energy[ch][0][b] > enc->window_energy[ch][1][b]
+           ? enc->window_energy[ch][0][b]
+           : enc->window_energy[ch][1][b];
+-      if (e > 4u * noise_of[b] && e / 10u > before + noise_of[b] / 4u) {
++      if (e > 4u * noise_of[b] && e / 10u > before + noise_of[b] / 4u + (1ull << 62)) {
+         attack = true;
+       }
+     }

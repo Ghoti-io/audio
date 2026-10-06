@@ -1,0 +1,15 @@
+# 20 rate-vbr
+# defect: variable rate is treated as constant rate
+# caught by: *
+#
+--- a/src/codec/mp3/mp3enc_rate.c
++++ b/src/codec/mp3/mp3enc_rate.c
+@@ -86,7 +86,7 @@
+ 
+ unsigned gaud_mp3e_rate_choose(const MP3E_Rate * rate, uint64_t need_bits,
+     uint64_t reservoir_bytes, uint32_t head_bytes) {
+-  if (rate->mode == GAUD_RATE_CBR || rate->mode == GAUD_RATE_DEFAULT) {
++  if (rate->mode == GAUD_RATE_CBR || rate->mode == GAUD_RATE_DEFAULT || rate->mode == GAUD_RATE_VBR) {
+     return rate->fixed_index;
+   }
+   uint64_t scaled = need_bits;

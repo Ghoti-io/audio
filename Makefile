@@ -802,6 +802,29 @@ check-mp3-quality: ## Fail if the MP3 encoder sounds worse than it should agains
 check-mp3-quality: $(WRITE_PROBE) $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/mp3_quality.py
 
+####################################################################
+# Planted defects in the MP3 encoder
+#
+# tools/check-planted.sh builds a throwaway copy under build/planted/, applies
+# one patch from tests/planted/ at a time, and requires the test named for it
+# to fail and, with the patch out, to pass. Nothing in this tree is changed.
+# Thirty-one patches at about half a minute each, so it is asked for by name
+# and is not in `make test`.
+####################################################################
+
+PLANTED_ENV = PLANTED_PREFIX="$(PREFIX)" PLANTED_LIBDIR="$(LIB_INSTALL_PATH)/$(SUITE)"
+
+ifeq ($(OS_NAME), Windows)
+check-planted check-planted-selftest: ## Skipped on Windows
+	@printf '%s: skipped on Windows (the planted defects need patch and sh)\n' "$@"
+else
+check-planted: ## Plant each of 31 defects in the MP3 encoder: its test must fail, and pass with the defect out
+	@$(PLANTED_ENV) tools/check-planted.sh
+
+check-planted-selftest: ## The script fails on a patch that matches nothing and on one that breaks nothing
+	@$(PLANTED_ENV) tools/check-planted.sh --selftest
+endif
+
 check-opus: ## Fail if a reference disagrees about what an Opus stream is
 check-opus: $(DUMP_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 GAUD_DUMP_PROBE=$(DUMP_PROBE) \
@@ -988,6 +1011,7 @@ check-fixtures: ## Fail if a test input is excluded from the repository
 .PHONY: check-mpeg check-mpeg-input mpeg-coverage check-vorbis
 .PHONY: vorbis-coverage check-opus check-vorbis-synth
 .PHONY: check-mp3-encode check-mp3-quality check-mp3enc-tables
+.PHONY: check-planted check-planted-selftest
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands

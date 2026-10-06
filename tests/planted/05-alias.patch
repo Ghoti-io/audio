@@ -1,0 +1,15 @@
+# 05 alias
+# defect: the inverse alias butterflies add where they subtract
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_filter.c
++++ b/src/codec/mp3/mp3enc_filter.c
+@@ -173,7 +173,7 @@
+       int32_t below = lower[-1 - (int)i];
+       lower[-1 - (int)i]
+           = mul(below, gaud_mp3_cs[i]) + mul(above, gaud_mp3_ca[i]);
+-      lower[i] = mul(above, gaud_mp3_cs[i]) - mul(below, gaud_mp3_ca[i]);
++      lower[i] = mul(above, gaud_mp3_cs[i]) + mul(below, gaud_mp3_ca[i]);
+     }
+   }
+ }

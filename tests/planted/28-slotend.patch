@@ -1,0 +1,15 @@
+# 28 slotend
+# defect: a frame is released one byte late
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -488,7 +488,7 @@
+   frame->total = total;
+   frame->head = head;
+   frame->slot_start = enc->slot_end;
+-  frame->slot_end = enc->slot_end + area;
++  frame->slot_end = enc->slot_end + area + 1u;
+   gaud_mp3e_header_write(frame->bytes, &header);
+   gaud_mp3e_side_write(frame->bytes + 4u, &header, (uint32_t)reservoir, scfsi,
+       (const MP3E_Granule (*)[2])enc->coded);

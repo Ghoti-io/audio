@@ -1,0 +1,16 @@
+# 03 quant-nofallback
+# defect: a granule over budget with masking honoured is kept rather than recoded without it
+# caught by: Mp3EncodeRoundTrip.AClickKeepsItsEnergyWhereverItFallsInAGranule
+#
+--- a/src/codec/mp3/mp3enc_quant.c
++++ b/src/codec/mp3/mp3enc_quant.c
+@@ -518,8 +518,7 @@
+          * granule's length is a twelve-bit field, so more than 4095 is not
+          * a bigger granule but a corrupt one. The rest of the loop is then
+          * the budget's, not masking's. */
+-        masks = false;
+-        continue;
++        ;
+       }
+     }
+     int32_t excess[MP3E_MAX_BANDS];

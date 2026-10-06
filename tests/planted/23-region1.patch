@@ -1,0 +1,15 @@
+# 23 region1
+# defect: the second Huffman region boundary is written one band short
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_huff.c
++++ b/src/codec/mp3/mp3enc_huff.c
+@@ -404,7 +404,7 @@
+     }
+   }
+   side->region0_count = (uint8_t)best_r0;
+-  side->region1_count = (uint8_t)best_r1;
++  side->region1_count = (uint8_t)(best_r1 ? best_r1 - 1u : 0u);
+   for (unsigned i = 0; i < 3u; ++i) {
+     side->table_select[i] = (uint8_t)best_t[i];
+   }

@@ -1,0 +1,15 @@
+# 07 unpredict
+# defect: the unpredictability measure is replaced by a constant, so every band reads as noise
+# caught by: Mp3EncodePsy.ATonePastThreeKilohertzIsMaskedByEighteenDecibelsNotSix
+#
+--- a/src/codec/mp3/mp3enc_psy.c
++++ b/src/codec/mp3/mp3enc_psy.c
+@@ -232,7 +232,7 @@
+   if (scale == 0) {
+     return 32768u;
+   }
+-  uint64_t c = (distance << 15) / scale;
++  uint64_t c = 32768u + 0 * distance / scale;
+   return c > 32768u ? 32768u : (uint32_t)c;
+ }
+ 

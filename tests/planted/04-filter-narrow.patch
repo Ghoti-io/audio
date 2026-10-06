@@ -1,0 +1,17 @@
+# 04 filter-narrow
+# defect: the polyphase scale narrows its sum to 32 bits before multiplying
+# caught by: Mp3EncodeRoundTrip.APureToneIsCodedAccuratelyAndALoudSquareWaveSurvives
+#
+--- a/src/codec/mp3/mp3enc_filter.c
++++ b/src/codec/mp3/mp3enc_filter.c
+@@ -69,8 +69,8 @@
+  * something else, and the validity check that gave it one found it.
+  */
+ static int32_t scale(int64_t sum, int32_t factor) {
+-  int64_t line = (sum + (1 << 27)) >> MP3_Q;
+-  return (int32_t)((line * factor + (1 << 27)) >> MP3_Q);
++  int32_t line = (int32_t)((sum + (1 << 27)) >> MP3_Q);
++  return (int32_t)(((int64_t)line * factor + (1 << 27)) >> MP3_Q);
+ }
+ 
+ /** Clear a filter's history: the start of a stream. */

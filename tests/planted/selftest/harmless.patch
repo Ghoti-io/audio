@@ -1,0 +1,13 @@
+# caught by: Mp3EncodeTag.TheFrameIsAFunctionOfItsFieldsAlone
+# A patch that changes only a comment: it applies, nothing fails, and the script must say it was not caught.
+--- a/src/codec/mp3/mp3enc_tag.c
++++ b/src/codec/mp3/mp3enc_tag.c
+@@ -21,7 +21,7 @@
+ /**
+  * @file
+  *
+- * The Info and Xing tag frame: the first frame of the file, which is not
++ * The Info and Xing tag frame (a comment edited by the self-test): the first frame of the file, which is not
+  * audio.
+  *
+  * Players read three things from it that nothing else in an MP3 states:

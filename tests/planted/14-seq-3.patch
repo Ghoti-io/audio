@@ -1,0 +1,15 @@
+# 14 seq-3
+# defect: a short block is followed by a long one without a stop block
+# caught by: Mp3EncodeRoundTrip.APureToneIsCodedAccuratelyAndALoudSquareWaveSurvives
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -538,7 +538,7 @@
+     type = previous == 2 ? 2 : 1;
+   }
+   else {
+-    type = previous == 2 ? 3 : 0;
++    type = 0;
+   }
+   slot->type = type;
+   enc->previous_type = type;

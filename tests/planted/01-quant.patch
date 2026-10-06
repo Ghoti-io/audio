@@ -1,0 +1,15 @@
+# 01 quant
+# defect: the quantiser search starts below the cheapest legal step instead of the floor
+# caught by: Mp3EncodeRoundTrip.APureToneIsCodedAccuratelyAndALoudSquareWaveSurvives
+#
+--- a/src/codec/mp3/mp3enc_quant.c
++++ b/src/codec/mp3/mp3enc_quant.c
+@@ -234,7 +234,7 @@
+ static unsigned fit_gain(Work * w, uint32_t budget, MP3E_Granule * g,
+     bool * out_fits) {
+   unsigned floor_gain = unclamped_floor(w);
+-  unsigned lo = floor_gain;
++  unsigned lo = 0;
+   unsigned hi = 255;
+   while (lo < hi) {
+     unsigned mid = (lo + hi) >> 1;

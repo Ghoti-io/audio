@@ -1,0 +1,15 @@
+# 16 equalise
+# defect: noise is never moved from a quiet band to the loudest
+# caught by: Mp3EncodeRate.AverageRateLandsNearItsTarget
+#
+--- a/src/codec/mp3/mp3enc_quant.c
++++ b/src/codec/mp3/mp3enc_quant.c
+@@ -427,7 +427,7 @@
+     if (excess[r] == INT32_MIN) {
+       continue;
+     }
+-    if (excess[r] > median + 128 && w->sf[r] < w->sf_cap[r]) {
++    if (excess[r] > median + 1000000 && w->sf[r] < w->sf_cap[r]) {
+       ++w->sf[r];
+       changed = true;
+     }

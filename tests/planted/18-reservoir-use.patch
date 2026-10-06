@@ -1,0 +1,15 @@
+# 18 reservoir-use
+# defect: a frame never draws on the reservoir for a hard granule
+# caught by: Mp3EncodeFile.AHardFrameDrawsOnWhatEasyOnesSaved
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -387,7 +387,7 @@
+   header.bitrate = gaud_mp3e_bitrate_kbps(enc->version, bitrate_index) * 1000u;
+   header.padding = padding;
+   uint64_t base = 8u * (uint64_t)area;
+-  uint64_t available = base + 8u * reservoir * 9u / 10u;
++  uint64_t available = base + 0u;
+   uint64_t grant = 0;
+   bool recode = false;
+   if (needed > available) {

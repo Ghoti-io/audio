@@ -1,0 +1,15 @@
+# 26 scfsi
+# defect: every scalefactor band is declared shared with the previous granule
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -441,7 +441,7 @@
+         for (unsigned sfb = start[group]; sfb < start[group + 1u]; ++sfb) {
+           same = same && g0->sf_long[sfb] == g1->sf_long[sfb];
+         }
+-        g1->scfsi_reused[group] = same;
++        g1->scfsi_reused[group] = true;
+         if (same) {
+           scfsi[ch] |= (uint8_t)(8u >> group);
+           any = true;

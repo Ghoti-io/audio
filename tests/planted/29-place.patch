@@ -1,0 +1,15 @@
+# 29 place
+# defect: main data is copied one byte off into its frame
+# caught by: Mp3EncodeRoundTrip.EveryRateAndChannelCountDecodesToTheRightLength
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -236,7 +236,7 @@
+     size_t offset = (size_t)(at - frame->slot_start);
+     size_t room = (size_t)(frame->slot_end - at);
+     size_t take = size - done < room ? size - done : room;
+-    memcpy(frame->bytes + frame->head + offset, data + done, take);
++    memcpy(frame->bytes + frame->head + offset + 1u, data + done, take);
+     done += take;
+   }
+   enc->cursor += size;

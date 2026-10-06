@@ -1,0 +1,15 @@
+# 31 tag-crc
+# defect: the tag frame checksum covers a fixed 190 bytes and not the bytes before its own field
+# caught by: Mp3EncodeTag.TheFrameIsAFunctionOfItsFieldsAlone
+#
+--- a/src/codec/mp3/mp3enc_tag.c
++++ b/src/codec/mp3/mp3enc_tag.c
+@@ -139,7 +139,7 @@
+    * general one. (An earlier draft summed 190 bytes whatever the frame's
+    * length, which read past the end of a short frame into whatever was
+    * there, and the cross-architecture gate found it: the bytes differed.) */
+-  uint16_t tag_crc = gaud_mp3e_crc16(frame, (size_t)(lame + 34 - frame), 0);
++  uint16_t tag_crc = gaud_mp3e_crc16(frame, 190u, 0);
+   lame[34] = (unsigned char)(tag_crc >> 8);
+   lame[35] = (unsigned char)tag_crc;
+ }
