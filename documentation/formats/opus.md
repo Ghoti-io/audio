@@ -1,12 +1,8 @@
 # Opus {#format_opus}
 
-Opus in Ogg, as RFC 6716 and RFC 7845 define them. **Identified, not yet
-decoded.** The codec is registered as `opus`, and ::GAUD_Sample_Coding
-spells it `GAUD_CODING_OPUS`.
-
-This page is written to be rewritten. What is here is the half of the
-format with no decoder in it, which planning/audio.md section 11.18
-argues is a commit of its own and warns must not become a resting place.
+Opus in Ogg, as RFC 6716 and RFC 7845 define them, **read and decoded**.
+The codec is registered as `opus`, and ::GAUD_Sample_Coding spells it
+`GAUD_CODING_OPUS`.
 
 ## Four things with no analogue elsewhere here
 
@@ -62,15 +58,89 @@ comment header ends with, which RFC 7845 drops. That costs nothing
 because the reader stops where the comment list ends rather than at the
 end of its buffer.
 
+## The decoder
+
+**SILK, CELT and hybrid**, mono and stereo, at every one of the 32
+configurations (2.5 to 60 ms frames, narrow band to full band), with the
+mode changing from one packet to the next as it does in a real stream.
+The output is always 16-bit at 48 kHz, whatever rate the encoder was
+given: SILK runs at 8, 12 or 16 kHz and is resampled up by the same
+filter the reference uses, and that filter is part of what conformance
+compares.
+
+**It is bit-identical to RFC 6716's own decoder**, which is the fixed-point
+build of the code printed in Appendix A, and not merely close. Section 6
+asks for two things: that `opus_compare` accepts the output, and that the
+decoder's final range decoder state after every packet is the
+reference's. The second is an exact equality over every symbol a frame
+contained and cannot be approximated. Both hold for all twelve
+conformance vectors, and so does something section 6 does not ask for:
+every output sample equals the reference's.
+
+**Redundancy frames.** At a switch between CELT and SILK or hybrid an
+encoder may include a 5 ms CELT copy of the audio around the switch, and
+the decoder cross-fades with it. When it did not, the decoder conceals a
+packet that was never lost to make the boundary smooth anyway, so
+concealment is part of decoding a stream that loses nothing.
+
+**Packet-loss concealment**, in all three modes, in the reference's
+exact arithmetic. SILK repeats the last pitch pulse through the last
+filter with noise drawn from its own excitation, faded; CELT either does
+that or, from the fifth consecutive loss, generates noise with the
+background spectrum; and a good frame after a loss is blended in rather
+than cut in. RFC 6716 calls this informative, and a decoder is free to do
+something else - but then it would not reproduce the transitions above.
+The decoder entry point conceals a packet when asked for one with no
+data, which the track decoder does not do: Ogg Opus stores every packet,
+and a gap in a *file* is corruption rather than loss.
+
+**Multistream.** Mapping family 1 (the Vorbis channel orders up to
+eight, mapped onto the WAV order the rest of the library uses) and
+family 255 (channels with no defined positions) multiplex up to 255
+Opus streams in one Ogg packet, all but the last in Appendix B's
+self-delimiting framing. Streams may be coupled pairs or single channels,
+and a channel mapped to 255 is silent.
+
+**The output gain** in `OpusHead` is applied, as RFC 7845 section 5.1
+says a decoder should, in the fixed-point form libopus uses: the gain in
+Q7.8 decibels becomes a base-two logarithm, then a multiplier, and the
+result is rounded and clamped to plus or minus 32,767.
+
+**Seeking decodes from the start.** An Opus decoder's state converges
+rather than resets, which is why RFC 7845 suggests 80 ms of pre-roll
+before the target. Starting part-way through would give samples that
+differ in their last bits from a straight read's, and nothing here could
+then say which was right. So a seek decodes forward from the beginning
+and reads exactly what reading would have read, at the cost of a seek
+taking as long as decoding to the target. The page bisection in the Ogg
+layer would remove the cost, and using it is a decision about giving up
+that guarantee.
+
 ## What is not
 
-**The decoder.** `GAUD_CAP_DECODE` is not declared, so
-`gaud_decoder_create()` answers ::GAUD_ERR_UNSUPPORTED. A caller can ask
-rather than read a paragraph.
+**Forward error correction.** An Opus packet may carry a low-bitrate copy
+of the *previous* frame so that a lost one can be recovered from its
+successor. The decoder reads and discards it, as it must, and never uses
+it: a file has no lost packets, and the live-stream API that would ask
+for it does not exist here.
+
+**Custom modes**, RFC 6716's `opus_custom`: frame sizes and sample rates
+outside the 32 configurations. No encoder in common use makes them.
 
 **Writing.** Phase 8.
 
-## The gate, and the one that is waiting
+## The gates
+
+`make check-opus-vectors` is section 6 of RFC 6716 as a gate, and the
+strictest in the library. It decodes the twelve conformance vectors
+(39 MB, fetched deliberately by `make opus-vectors` and pinned by hash)
+and requires, for each: every packet accepted; every one of the 20,075
+final range decoder states equal to the vector's; `opus_compare`, run in
+the pinned reference image, accepting the output; and the output equal
+to the bit to what the RFC's fixed-point reference writes, which is
+pinned per vector. It was seen to fail on purpose: one wrong all-pass
+coefficient in the SILK resampler leaves every range state intact - the
+resampler reads no symbols - and is caught by the other two.
 
 `make check-opus` scores the identification against **three** readers,
 and unusually for this library there is nothing to exclude: the three
@@ -85,15 +155,18 @@ disagree, and the disagreement reconciles.
   is the stronger thing to do with a disagreement whose shape is known.
 
 And a fourth reading with no decoder in it: every fixture is made from
-raw PCM of a length the generator knows.
+raw PCM of a length the generator knows. Then, since the decoder exists,
+the samples: each mono and stereo fixture is decoded by `opusdec` and by
+this library and put to `opus_compare`, with controls that must be
+rejected.
 
-**`opus_compare` is in the oracle image and is called by nothing.** RFC
-6716 does not define Opus by a bitstream and a transform; it defines a
-conforming decoder as one whose output that tool accepts against the
-reference decoder's. It is the only normative reference in this tree -
-planning/audio.md section 11.15 is the long apology for MPEG audio not
-having one, because ISO/IEC 11172-4's vectors cannot be obtained - and
-it will have something to accept when the decoder lands.
+**The unit tests go further than either gate**, because they can run
+RFC 6716's decoder on the same bytes. They hold the digests of its output
+for every fixture (the six-channel one included, which `opus_compare`
+cannot take), and for 15,000 random packets - with and without losses,
+through every mode change, every redundancy form and every stereo
+transition - from a harness that compared each sample and each final
+range state to the reference's before the digest was recorded.
 
 ## The corpus
 

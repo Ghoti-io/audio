@@ -374,6 +374,7 @@ GAUD_Result gaud_celt_decode_frame(CELT_Decoder * decoder, OPUS_Range * range,
   }
   gaud_celt_deemphasis(
       deemph_in, pcm, n, cc, decoder->downsample, decoder->preemph_memory);
+  decoder->loss_count = 0;
 
   if ((int32_t)gaud_opus_tell(range) > (int32_t)(bytes * 8u)) {
     return GAUD_ERR_CORRUPT;

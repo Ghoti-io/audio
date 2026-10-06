@@ -711,6 +711,9 @@ void gaud_celt_denormalise_bands(const CELT_Mode * mode, const int16_t * x,
 void gaud_celt_imdct(const int32_t * in, int32_t * out, const int16_t * window,
     uint32_t overlap, int shift, uint32_t stride);
 
+/** Order of the short-term predictor concealment fits to the history. */
+#define CELT_LPC_ORDER 24
+
 /** The longest post-filter period, and so the history it needs. */
 #define CELT_COMB_MAX_PERIOD 1024
 
@@ -812,6 +815,9 @@ typedef struct {
   unsigned postfilter_tapset;               ///< This frame's tap set.
   unsigned postfilter_tapset_old;           ///< Last frame's.
   int32_t preemph_memory[2];                ///< The de-emphasis pole.
+  int loss_count;                           ///< Frames lost in a row, so far.
+  int last_pitch_index;                     ///< The period concealment repeats.
+  int16_t lpc[2 * CELT_LPC_ORDER];          ///< Concealment's LPC, per channel.
 } CELT_Decoder;
 
 /**
@@ -873,6 +879,22 @@ void gaud_celt_decoder_init(
 GAUD_Result gaud_celt_decode_frame(CELT_Decoder * decoder, OPUS_Range * range,
     uint32_t bytes, uint32_t stream_channels, unsigned lm, int16_t * pcm,
     CELT_Scratch * scratch);
+
+/**
+ * @brief Conceal one CELT frame that never arrived.
+ *
+ * Section 4.4. Either noise shaped by the last envelope, faded, or
+ * the last pitch period repeated, depending on how many frames in a
+ * row have been lost and on whether a band range below 0 was in use.
+ *
+ * @param decoder The decoder, whose history this extends.
+ * @param pcm Receives @p n interleaved samples per channel.
+ * @param n Samples per channel: 120 shifted left by @p lm.
+ * @param lm 0 to 3.
+ * @param scratch Working memory.
+ */
+void gaud_celt_decode_lost(CELT_Decoder * decoder, int16_t * pcm, uint32_t n,
+    unsigned lm, CELT_Scratch * scratch);
 
 #ifdef __cplusplus
 }

@@ -107,25 +107,32 @@ FILE_SHA256 = {
         "8107b5e33122cd5e2aceae723d8a4ea2ebb30b3493bb11d7f021cd1d8e653aa0",
 }
 
-# How many packets of each vector end with exactly the range decoder
-# state the vector file states. Pinned per vector rather than only in
-# total, because a decoder that stopped answering for one configuration
-# while another gained the same number of packets would keep a total
-# intact. Every entry is a floor that has been reached, never a target:
-# raising one is the measurement of a decoder that reaches further.
-RANGE_MATCHED = {
-    "testvector01": 2147,
-    "testvector02": 1185,
-    "testvector03": 998,
-    "testvector04": 1265,
-    "testvector05": 2037,
-    "testvector06": 1876,
-    "testvector07": 4186,
-    "testvector08": 4,
-    "testvector09": 4,
-    "testvector10": 1263,
-    "testvector11": 553,
-    "testvector12": 1320,
+# What RFC 6716's own decoder, Appendix A's fixed-point build, writes for
+# each vector at 48 kHz stereo, as a SHA-256 of the raw 16-bit samples.
+#
+# **These are not the `.dec` files and are not interchangeable with them.**
+# The `.dec` files are the output of a 2012 build and `opus_compare` is
+# what accepts a decoder against them, with a tolerance; four of the
+# twelve are what the current reference writes too, and eight are not,
+# differing in the last bits of nearly every sample. A decoder this
+# library's passes `opus_compare` either way. These pins say something
+# stronger and different: this decoder's output is *identical* to the
+# reference's, bit for bit, on all 15,390,480 samples. They were made by
+# building the tarball inside RFC 6716 (Appendix A.1) with FIXED_POINT
+# and running `opus_demo -d 48000 2` over each `.bit` file.
+DECODED_SHA256 = {
+    "testvector01": "9afd77e4ef6865c06bdc105a5761c64702ff6a3c5eb1e0ac23e5f6d409529045",
+    "testvector02": "4ad3b7aeaea242acc96cafebee69edb0914abc2e46c0c884f812ce10bbee4dbc",
+    "testvector03": "e00f4ee27f007d849fb67f4386db93254631d2ff31b580394d854819560f1bc7",
+    "testvector04": "ce7450716f4911284332e76dab66518dcfd5c84e320c0a8a54014e658f5c6908",
+    "testvector05": "b6e9ea7f02969502e4fbeefea822624116a1c0d5401b14363cf41169829ac8c5",
+    "testvector06": "fcf1c85b252390da46a69f3b1e8535cd9d1b40082c41b4599685a721bb84966a",
+    "testvector07": "79d5c6b8a552ee4bc68cf8a18c9fc64d37e006ec24b4fef6faacf0e0b456641c",
+    "testvector08": "aba1e0f8287f9dffd95345031f5241d231ae78c15f3ac956c9290854b42f474a",
+    "testvector09": "8c4c795adbaa04f8583f387c505c61f2e4d08dce9b518e4bec406ff3dd1576ca",
+    "testvector10": "259618769341da7f03c48d349fd14e9291c0d33f993e274aba97ee561b452a99",
+    "testvector11": "57afdb53a68c9571b9d99d3c78d57d3c7411153bb97b86f90b9ad4948a35c0a9",
+    "testvector12": "fe45881e132fa4de8471cdf3807f68b1dba7130036b1bc8c2ca9be797214dd86",
 }
 
 CONFIGS = {

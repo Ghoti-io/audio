@@ -138,6 +138,7 @@ typedef struct {
   uint32_t length[OPUS_MAX_FRAMES];        ///< Bytes of each.
   uint32_t count;                          ///< How many are in use.
   size_t payload_offset;                   ///< Where the first one starts.
+  size_t consumed;                         ///< Bytes the whole packet took, padding too.
 } OPUS_Packet;
 
 /**
@@ -186,6 +187,22 @@ GAUD_Result gaud_opus_open(const GAUD_Codec * codec, GAUD_Stream * stream,
 
 /** @brief ::GAUD_Codec::close. */
 void gaud_opus_close(const GAUD_Codec * codec, GAUD_Doc * doc);
+
+/**
+ * @brief Which of a Vorbis-ordered file's channels belongs in an output slot.
+ *
+ * Defined with Vorbis, whose channel orders mapping family 1 of RFC 7845
+ * borrows for one to eight channels.
+ *
+ * @param channels How many the file has.
+ * @param slot The output slot, in this library's (WAV) order.
+ * @return The file's channel that goes there.
+ */
+unsigned gaud_vorbis_channel_slot(uint32_t channels, unsigned slot);
+
+/** @brief ::GAUD_Codec::decoder_open. */
+GAUD_Result gaud_opus_decoder_open(
+    const GAUD_Codec * codec, GAUD_Track * track, GAUD_Decoder ** out);
 
 #ifdef __cplusplus
 }

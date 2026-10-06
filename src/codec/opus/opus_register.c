@@ -66,33 +66,31 @@ static const GAUD_Codec_Magic ogg_magics[] = {
 /**
  * The codec itself.
  *
- * **`GAUD_CAP_DECODE` is not declared**, and this commit is the half of
- * Opus with no decoder in it: the two headers, the channel count, the
- * tags, and the length - which for Opus is the last page's granule
- * position *minus the pre-skip*, a subtraction no other format here
- * needs because no other format states one. planning/audio.md section
- * 11.18 is the argument for shipping that on its own; its last paragraph
- * is the warning that it must not become a resting place.
- *
  * The sample rate a track reports is always 48,000. That is the format's
  * decision and not this library's: a decoder may output at any of five
  * rates, the granule positions are counted at 48 kHz, and the rate in
  * `OpusHead` is marked informational by the specification that defines
  * it.
+ *
+ * **`GAUD_CAP_DECODE` is declared because section 6's two tests pass**:
+ * every sample of RFC 6716's twelve conformance vectors, and every one
+ * of their 20,075 final range decoder states, are what the reference
+ * produces (`make check-opus-vectors`). It is not declared for a codec
+ * whose output merely sounds right.
  */
 static const GAUD_Codec opus_codec = {
     .abi_version = GAUD_CODEC_ABI_VERSION,
     .size = sizeof(GAUD_Codec),
     .name = "opus",
     .ctx = NULL,
-    .capabilities = GAUD_CAP_METADATA_READ,
+    .capabilities = GAUD_CAP_DECODE | GAUD_CAP_METADATA_READ,
     .encoder_tier = GAUD_ENCODER_NONE,
     .magics = ogg_magics,
     .magic_count = sizeof(ogg_magics) / sizeof(ogg_magics[0]),
     .probe = opus_probe,
     .open = gaud_opus_open,
     .close = gaud_opus_close,
-    .decoder_open = NULL,
+    .decoder_open = gaud_opus_decoder_open,
     .encoder_open = NULL,
 };
 

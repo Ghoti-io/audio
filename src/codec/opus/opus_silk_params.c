@@ -604,6 +604,14 @@ void gaud_silk_decode_parameters(
   }
   memcpy(channel->prev_nlsf_q15, nlsf_q15, (size_t)order * sizeof *nlsf_q15);
 
+  // After a loss the filters are bandwidth-expanded, so that the first
+  // good frame does not ring on a spectrum the listener has just been
+  // told was wrong.
+  if (channel->loss_cnt) {
+    gaud_silk_bwexpander(out->lpc_q12[0], order, SILK_BWE_AFTER_LOSS_Q16);
+    gaud_silk_bwexpander(out->lpc_q12[1], order, SILK_BWE_AFTER_LOSS_Q16);
+  }
+
   if (indices->signal_type == SILK_SIGNAL_VOICED) {
     gaud_silk_decode_pitch(indices->lag_index, indices->contour_index,
         out->pitch, channel->fs_khz, channel->nb_subfr);

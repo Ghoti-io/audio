@@ -141,6 +141,39 @@ typedef enum {
   SILK_CODE_CONDITIONAL = 2,          ///< Delta gain, no LTP scaling.
 } SILK_Coding;
 
+/** The expansion after a loss: 0.97 in Q16. */
+#define SILK_BWE_AFTER_LOSS_Q16 63570
+
+/** Samples of the excitation concealment draws its noise from. */
+#define SILK_PLC_RAND_BUF_SIZE 128
+
+/** @brief What concealment remembers of the last good frame. */
+typedef struct {
+  int32_t pitch_l_q8;                     ///< The lag to repeat, Q8.
+  int16_t ltp_coef_q14[SILK_LTP_ORDER];   ///< The long-term filter to repeat.
+  int16_t prev_lpc_q12[SILK_MAX_LPC_ORDER]; ///< The short-term filter.
+  bool last_frame_lost;                   ///< So the next good one is faded in.
+  int32_t rand_seed;                      ///< The noise generator.
+  int16_t rand_scale_q14;                 ///< How loud the noise still is.
+  int32_t conc_energy;                    ///< Energy of the last concealed frame.
+  int conc_energy_shift;                  ///< And the shift that was applied.
+  int16_t prev_ltp_scale_q14;             ///< The last frame's history scaling.
+  int32_t prev_gain_q16[2];               ///< Its last two subframe gains.
+  int fs_khz;                             ///< The rate this was set up for.
+  int nb_subfr;                           ///< Subframes in that frame.
+  int subfr_length;                       ///< And each one's length.
+} SILK_Plc;
+
+/** @brief Comfort noise: what an inactive stretch sounded like. */
+typedef struct {
+  int32_t exc_buf_q14[SILK_MAX_FRAME_LENGTH]; ///< Recent quiet excitation.
+  int16_t smth_nlsf_q15[SILK_MAX_LPC_ORDER];  ///< A slowly moving spectrum.
+  int32_t synth_state[SILK_MAX_LPC_ORDER];    ///< The noise filter's memory.
+  int32_t smth_gain_q16;                      ///< A slowly moving gain.
+  int32_t rand_seed;                          ///< The noise generator.
+  int fs_khz;                                 ///< The rate this was set up for.
+} SILK_Cng;
+
 /**
  * Everything one SILK frame reads before its excitation.
  *
@@ -201,6 +234,13 @@ typedef struct {
   int16_t out_buf[SILK_MAX_FRAME_LENGTH + 2 * SILK_MAX_SUBFRAME_LENGTH];
   int32_t lpc_state_q14[SILK_MAX_LPC_ORDER]; ///< The synthesis filter's memory.
   int32_t prev_gain_q16;                ///< What the state above is scaled by.
+  SILK_Coding coding;                   ///< How the frame just parsed was coded.
+  int32_t exc_q14[SILK_MAX_FRAME_LENGTH]; ///< The last frame's excitation.
+  int loss_cnt;                         ///< Frames lost in a row, so far.
+  int plc_signal_type;                  ///< The last good frame's type, for concealment.
+  int lag_prev;                         ///< The last frame's final pitch lag.
+  SILK_Plc plc;                         ///< Concealment's memory.
+  SILK_Cng cng;                         ///< Comfort noise's.
 } SILK_Channel;
 
 /**
@@ -219,6 +259,30 @@ typedef struct {
   int16_t ltp_scale_q14;                   ///< How far the history is scaled.
 } SILK_Parameters;
 
+/** The most input samples one resampler call is given per millisecond. */
+#define SILK_RESAMPLER_MAX_KHZ 16
+
+/** Taps in the polyphase interpolator: four rows and their four mirrors. */
+#define SILK_RESAMPLER_FIR_ORDER 8
+
+/**
+ * @brief The state of one channel's resampler to 48 kHz.
+ *
+ * RFC 6716 section 4.2.10 leaves the resampler to the implementation, but
+ * section 6 does not: the conformance vectors were produced with the
+ * reference's, and `opus_compare` measures how far another one strays.
+ * This is the reference's, which upsamples by two with a pair of
+ * all-pass chains and then interpolates the rest with a polyphase FIR.
+ */
+typedef struct {
+  int32_t iir[6];                              ///< The two all-pass chains.
+  int16_t fir[SILK_RESAMPLER_FIR_ORDER];       ///< The last input samples.
+  int16_t delay_buf[SILK_RESAMPLER_MAX_KHZ];   ///< The delayed first millisecond.
+  int fs_in_khz;                               ///< 8, 12 or 16.
+  int input_delay;                             ///< Samples of delay to equalise.
+  int32_t inv_ratio_q16;                       ///< Input steps per output step.
+} SILK_Resampler;
+
 /** Both channels, plus the stereo prediction the mid one is coded under. */
 typedef struct {
   int channels;                 ///< 1 or 2 coded channels.
@@ -234,6 +298,12 @@ typedef struct {
    * number of symbols on the first frame after a mid-only one.
    */
   bool prev_mid_only;
+  int api_channels;             ///< How many channels the caller wants out.
+  int16_t s_mid[2];             ///< The last two mid samples of the last frame.
+  int16_t s_side[2];            ///< And the side channel's.
+  int32_t pred_prev_q13[2];     ///< The previous frame's stereo weights.
+  SILK_Resampler resampler[2];  ///< One per output channel.
+  bool stereo_to_mono;          ///< This packet collapses a stereo stream.
 } SILK_Decoder;
 
 /**
@@ -418,6 +488,178 @@ void gaud_silk_decode_pitch(int16_t lag_index, int8_t contour_index,
  */
 void gaud_silk_decode_core(SILK_Channel * channel,
     const SILK_Parameters * parameters, int16_t * out);
+
+/**
+ * @brief Read and discard a packet's redundancy frames: section 4.2.4.
+ *
+ * Every symbol of them has to be read, because they sit in front of the
+ * regular frames in the same arithmetic-coded stream, and none of them
+ * is wanted by a receiver that lost nothing.
+ *
+ * @param decoder The decoder, after gaud_silk_decode_header().
+ * @param range The range decoder.
+ */
+void gaud_silk_skip_redundancy(SILK_Decoder * decoder, OPUS_Range * range);
+
+/**
+ * @brief Read one regular frame's symbols, for every coded channel.
+ *
+ * The stereo weights and the mid-only flag first, then each channel's
+ * indices and excitation. Afterwards each channel's @c coding says how
+ * its frame was coded, which the parameters decoder needs.
+ *
+ * @param decoder The decoder.
+ * @param range The range decoder.
+ * @param frame Which frame of the packet, from zero.
+ * @return Whether the side channel was left out of this frame.
+ */
+bool gaud_silk_parse_frame(
+    SILK_Decoder * decoder, OPUS_Range * range, int frame);
+
+/**
+ * @brief Reset one resampler for an input rate; the output is 48 kHz.
+ *
+ * @param resampler The state.
+ * @param fs_in_khz 8, 12 or 16.
+ */
+void gaud_silk_resampler_init(SILK_Resampler * resampler, int fs_in_khz);
+
+/**
+ * @brief Resample one frame to 48 kHz.
+ *
+ * @param resampler The state, carried to the next call.
+ * @param out Receives `in_len * 48 / fs_in_khz / 1000 * 1000` samples:
+ *   48 for each input millisecond.
+ * @param in The signal.
+ * @param in_len A whole number of milliseconds, at least one.
+ */
+void gaud_silk_resample(SILK_Resampler * resampler, int16_t * out,
+    const int16_t * in, int in_len);
+
+/**
+ * @brief Turn mid and side back into left and right: section 4.2.9.
+ *
+ * @param decoder Whose weights and two-sample history this carries.
+ * @param mid The mid channel; becomes left. Sample `n` is at `n + 1`,
+ *   and `[0]` and the two after the frame are the history's.
+ * @param side The side channel; becomes right. Same layout.
+ * @param pred_q13 This frame's two weights.
+ * @param fs_khz 8, 12 or 16.
+ * @param length Samples in the frame.
+ */
+void gaud_silk_stereo_ms_to_lr(SILK_Decoder * decoder, int16_t * mid,
+    int16_t * side, const int32_t * pred_q13, int fs_khz, int length);
+
+/**
+ * @brief Configure for one Opus frame's SILK content, keeping state.
+ *
+ * What the reference does when a frame's first SILK frame arrives: the
+ * channel count may have grown (the second channel then starts afresh),
+ * the rate may have changed (then the channel's synthesis state does),
+ * and a stream that has just become stereo at both ends starts the
+ * side channel's prediction from nothing.
+ *
+ * @param decoder The decoder.
+ * @param channels Coded channels: 1 or 2.
+ * @param api_channels Channels to output: 1 or 2.
+ * @param fs_khz 8, 12 or 16.
+ * @param duration_ms 10, 20, 40 or 60.
+ * @return False for a combination the format does not have.
+ */
+bool gaud_silk_configure(SILK_Decoder * decoder, int channels,
+    int api_channels, int fs_khz, int duration_ms);
+
+/**
+ * @brief Decode the next SILK frame of the packet to 48 kHz samples.
+ *
+ * The first call after gaud_silk_configure() also reads the packet's
+ * header and redundancy frames.
+ *
+ * @param decoder The decoder.
+ * @param range The range decoder.
+ * @param out Receives @c api_channels samples interleaved per output
+ *   sample; room for 960 of them is enough.
+ * @param out_samples Receives how many per channel.
+ */
+void gaud_silk_decode_frame(SILK_Decoder * decoder, OPUS_Range * range,
+    int16_t * out, int * out_samples);
+
+/**
+ * @brief Conceal one SILK frame that was not received.
+ *
+ * Extrapolates from the last good frame: its pitch and spectrum carried
+ * on and faded, with noise from its own excitation mixed in. Section
+ * 4.4 is informative, and the reference's version is what this follows.
+ *
+ * @param decoder The decoder, configured as for a real frame.
+ * @param out Receives @c api_channels samples interleaved per output
+ *   sample.
+ * @param out_samples Receives how many per channel.
+ */
+void gaud_silk_decode_lost(
+    SILK_Decoder * decoder, int16_t * out, int * out_samples);
+
+/**
+ * @brief Run the short-term filter forwards, to recover its input.
+ *
+ * RFC 6716's `silk_LPC_analysis_filter`: the inverse of the synthesis
+ * filter, used to turn decoded output back into the whitened history
+ * the long-term predictor and concealment read.
+ *
+ * @param out Receives @p length samples; the first @p order are zero.
+ * @param in The signal, which must have @p order samples before it.
+ * @param lpc_q12 The coefficients.
+ * @param length How many samples to produce.
+ * @param order 10 or 16.
+ */
+void gaud_silk_lpc_analysis_filter(int16_t * out, const int16_t * in,
+    const int16_t * lpc_q12, int length, int order);
+
+/**
+ * @brief Remember what concealment will need from a good frame.
+ *
+ * @param channel The channel.
+ * @param parameters What the frame's indices became.
+ */
+void gaud_silk_plc_update(
+    SILK_Channel * channel, const SILK_Parameters * parameters);
+
+/**
+ * @brief Synthesise a frame that did not arrive.
+ *
+ * @param channel The channel; its loss count is advanced.
+ * @param frame Receives @c frame_length samples.
+ */
+void gaud_silk_plc_conceal(SILK_Channel * channel, int16_t * frame);
+
+/**
+ * @brief Blend a good frame in after concealed ones.
+ *
+ * @param channel The channel.
+ * @param frame The frame, edited in place.
+ * @param length Its length.
+ */
+void gaud_silk_plc_glue(SILK_Channel * channel, int16_t * frame, int length);
+
+/**
+ * @brief Track the comfort noise, and add it to a concealed frame.
+ *
+ * @param channel The channel.
+ * @param parameters The frame's parameters, or NULL for a lost frame.
+ * @param frame The frame, edited in place.
+ * @param length Its length.
+ */
+void gaud_silk_cng(SILK_Channel * channel, const SILK_Parameters * parameters,
+    int16_t * frame, int length);
+
+/**
+ * @brief Chirp an all-pole filter's poles towards the origin.
+ *
+ * @param ar The coefficients, expanded in place.
+ * @param d How many.
+ * @param chirp_q16 The factor, 0 to 1 in Q16.
+ */
+void gaud_silk_bwexpander(int16_t * ar, int d, int32_t chirp_q16);
 
 #ifdef __cplusplus
 }

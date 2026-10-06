@@ -100,6 +100,7 @@ GAUD_Result gaud_opus_parse_packet(const unsigned char * data, size_t size,
   const unsigned char * at = data + 1;
   size_t left = size - 1u;
   uint32_t count = 1;
+  size_t padding = 0;
   /* The length of the frame whose length is never written down: the
    * last one, which takes whatever is left. */
   uint32_t last = (uint32_t)left;
@@ -184,6 +185,7 @@ GAUD_Result gaud_opus_parse_packet(const unsigned char * data, size_t size,
           return GAUD_ERR_CORRUPT;
         }
         left -= amount;
+        padding += amount;
       } while (value == 255u);
     }
     cbr = (control & 0x80u) == 0;
@@ -277,5 +279,7 @@ GAUD_Result gaud_opus_parse_packet(const unsigned char * data, size_t size,
     return GAUD_ERR_CORRUPT;
   }
   out->payload_offset = (size_t)(out->frame[0] - data);
+  // What follows the frames is padding, which belongs to this packet.
+  out->consumed = (size_t)(at - data) + padding;
   return GAUD_OK;
 }

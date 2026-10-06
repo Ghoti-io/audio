@@ -127,9 +127,13 @@ bool gaud_silk_decoder_init(
     // than truncating.
     int blocks = (frame_length + SILK_SHELL_BLOCK - 1) / SILK_SHELL_BLOCK;
     // Only the bitstream-carried history survives a reconfiguration,
-    // and only while the configuration is the same. A rate change
-    // leaves the previous lag meaningless, because a lag is in samples.
-    if (channel->fs_khz != fs_khz || channel->frame_length != frame_length) {
+    // and only while the rate is the same. A rate change leaves the
+    // previous lag meaningless, because a lag is in samples. A change
+    // of frame length alone leaves all of it meaningful, and the
+    // reference keeps it: resetting here as well would drop the
+    // synthesis state whenever a stream moved between 10 and 20 ms.
+    if (channel->fs_khz != fs_khz) {
+      gaud_silk_resampler_init(&decoder->resampler[c], fs_khz);
       channel->prev_signal_type = SILK_SIGNAL_INACTIVE;
       channel->prev_lag_index = 0;
       // The synthesis state is in samples at the old rate and in
@@ -139,6 +143,8 @@ bool gaud_silk_decoder_init(
       channel->prev_gain_index = 0;
       channel->prev_gain_q16 = 1 << 16;
       channel->first_after_reset = true;
+      channel->lag_prev = 100;
+      channel->plc_signal_type = SILK_SIGNAL_INACTIVE;
       memset(channel->prev_nlsf_q15, 0, sizeof channel->prev_nlsf_q15);
       memset(channel->lpc_state_q14, 0, sizeof channel->lpc_state_q14);
       memset(channel->out_buf, 0, sizeof channel->out_buf);

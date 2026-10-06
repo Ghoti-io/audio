@@ -73,20 +73,8 @@
 /** And its increment. */
 #define SILK_RAND_INCREMENT 907633515
 
-/**
- * @brief Run the short-term filter forwards, to recover its input.
- *
- * RFC 6716's `silk_LPC_analysis_filter`. This is the inverse of the
- * synthesis below and is used to turn decoded output back into the
- * whitened history the long-term predictor reads.
- *
- * @param out Receives @p length samples; the first @p order are zero.
- * @param in The signal, which must have @p order samples before it.
- * @param lpc_q12 The coefficients.
- * @param length How many samples to produce.
- * @param order 10 or 16.
- */
-static void analysis_filter(int16_t * out, const int16_t * in,
+// The inverse of the synthesis filter below, documented in opus_silk.h.
+void gaud_silk_lpc_analysis_filter(int16_t * out, const int16_t * in,
     const int16_t * lpc_q12, int length, int order) {
   for (int at = order; at < length; ++at) {
     const int16_t * from = in + at - 1;
@@ -117,6 +105,15 @@ void gaud_silk_decode_core(SILK_Channel * channel,
   int32_t offset_q10 = gaud_opus_silk_quantization_offsets_q10
       [2 * (indices->signal_type >> 1) + indices->quant_offset_type];
   bool interpolated = indices->nlsf_interp_q2 < 4;
+  // After a lost voiced frame, a good unvoiced one would stop the pitch
+  // dead. The reference bridges it: for the first two subframes the
+  // frame is treated as voiced, at the lag concealment ended on, with a
+  // single quarter-strength tap, and the second half is decoded as the
+  // unvoiced frame it is.
+  bool bridge = channel->loss_cnt != 0
+      && channel->plc_signal_type == SILK_SIGNAL_VOICED
+      && indices->signal_type != SILK_SIGNAL_VOICED;
+  int16_t bridge_taps_q14[SILK_LTP_ORDER] = {0, 0, 1 << 12, 0, 0};
 
   // Section 4.2.7.9. The pulse magnitudes become a signed excitation:
   // pulled towards zero by a fixed amount, pushed away from it by the
@@ -139,6 +136,11 @@ void gaud_silk_decode_core(SILK_Channel * channel,
     seed += (uint32_t)channel->pulses[i];
   }
 
+  if (bridge) {
+    memset(history_q15, 0, sizeof history_q15);
+  }
+  memcpy(channel->exc_q14, excitation_q14,
+      (size_t)channel->frame_length * sizeof *channel->exc_q14);
   memcpy(state_q14, channel->lpc_state_q14, sizeof channel->lpc_state_q14);
   int history_at = channel->ltp_mem_length;
   int lag = 0;
@@ -147,6 +149,16 @@ void gaud_silk_decode_core(SILK_Channel * channel,
     // frame has two subframes and uses only the first.
     const int16_t * lpc_q12 = parameters->lpc_q12[k >> 1];
     const int16_t * taps_q14 = parameters->ltp_q14 + k * SILK_LTP_ORDER;
+    int pitch = parameters->pitch[k];
+    bool voiced = indices->signal_type == SILK_SIGNAL_VOICED;
+    if (bridge && k < SILK_MAX_SUBFRAMES / 2) {
+      taps_q14 = bridge_taps_q14;
+      pitch = channel->lag_prev;
+      voiced = true;
+    }
+    if (k == channel->nb_subfr - 1) {
+      channel->lag_prev = pitch;
+    }
     int32_t gain_q16 = parameters->gains_q16[k];
     int32_t gain_q10 = gain_q16 >> 6;
     int32_t inverse_gain_q31 = gaud_silk_inverse32_varq(gain_q16, 47);
@@ -160,8 +172,8 @@ void gaud_silk_decode_core(SILK_Channel * channel,
     }
     channel->prev_gain_q16 = gain_q16;
 
-    if (indices->signal_type == SILK_SIGNAL_VOICED) {
-      lag = parameters->pitch[k];
+    if (voiced) {
+      lag = pitch;
       // The predictor's history has to be rebuilt whenever the
       // short-term filter changes, which is at the start of the frame
       // and again halfway through if the coefficients were
@@ -175,7 +187,7 @@ void gaud_silk_decode_core(SILK_Channel * channel,
           memcpy(channel->out_buf + channel->ltp_mem_length, out,
               (size_t)(2 * subfr_length) * sizeof *out);
         }
-        analysis_filter(whitened + start,
+        gaud_silk_lpc_analysis_filter(whitened + start,
             channel->out_buf + start + k * subfr_length, lpc_q12,
             channel->ltp_mem_length - start, order);
         if (k == 0) {
@@ -199,7 +211,7 @@ void gaud_silk_decode_core(SILK_Channel * channel,
     }
 
     const int32_t * source;
-    if (indices->signal_type == SILK_SIGNAL_VOICED) {
+    if (voiced) {
       const int32_t * at = history_q15 + history_at - lag + SILK_LTP_ORDER / 2;
       for (int i = 0; i < subfr_length; ++i) {
         // Two, because every tap rounds towards negative infinity.

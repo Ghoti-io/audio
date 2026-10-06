@@ -44,13 +44,19 @@ disagree, and the disagreement is an identity rather than a defect:
 And a fourth reading that involves no decoder at all: every fixture is
 made from raw PCM of a length the generator knows.
 
-## What this does not check
+## And the samples
 
-**No sample values**, because there is no decoder. A decoder that
-produced silence would pass everything here, and `opus_compare` - the
-normative tool RFC 6716 defines conformance by, now in the oracle image -
-is not yet called by anything. That is the hole the decode commit
-closes.
+Every mono and stereo fixture is also decoded by `opusdec` and by this
+library, through the whole path - Ogg pages, pre-skip, the end trimmed to
+the last granule position - and the two are put to `opus_compare`, the
+tool RFC 6716 defines conformance by. Two controls are run through the
+same call and must be rejected: silence, and the right signal at half
+amplitude. A comparison that cannot fail is
+not one.
+
+**The six-channel fixture is not compared**, because `opus_compare` takes
+one or two channels. It is checked sample for sample, against RFC 6716's
+own decoder, in the unit tests instead.
 """
 
 import json
@@ -59,6 +65,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -161,6 +168,80 @@ def opusdec_frames(path):
         return None
     return {"frames": int(parts[0]), "rate": int(parts[1]),
             "channels": int(parts[2])}
+
+
+def compare_samples(name, path, channels, frames, scratch):
+    """What opus_compare says of our decode against opusdec's.
+
+    Both run in one container call, because opus_compare reads raw files
+    and the two decodes are the whole of the input. `opusdec` is told not
+    to dither, so that what it writes is its decode and not its decode
+    plus noise, and the rate is forced to 48,000 so that the same count
+    of samples is compared.
+
+    **The reference file is always read as stereo.** opus_compare takes
+    `-s` to say the *test* file is, and for a mono one the reference is
+    still two channels, which it averages - which is how RFC 6716's own
+    mono runs are scored against its stereo `.dec` files. So a mono
+    decode is written out as both channels for the reference side.
+
+    Returns a dict of label -> (passed, text), or None and a reason. The
+    controls are skipped, and say so, for a reference that is silence
+    throughout: silence is the right answer there and a control built
+    from it could not be wrong.
+    """
+    ours_path = os.path.join(scratch, name + ".raw")
+    finished = run([PROBE, path, "--pcm-le"])
+    if finished.returncode != 0:
+        return None, "dump_probe --pcm-le failed"
+    with open(ours_path, "wb") as handle:
+        handle.write(finished.stdout)
+    if len(finished.stdout) != frames * channels * 2:
+        return None, ("we wrote %d bytes for %d frames of %d channels"
+                      % (len(finished.stdout), frames, channels))
+    flag = "-s " if channels == 2 else ""
+    size = frames * channels * 2
+    script = (
+        "set -e\n"
+        "opusdec --quiet --no-dither --rate 48000 %(path)s /tmp/native.raw\n"
+        "python3 - <<'EOF'\n"
+        "import struct\n"
+        "raw = open('/tmp/native.raw', 'rb').read()\n"
+        "ch = %(channels)d\n"
+        "if ch == 1:\n"
+        "    out = b''.join(raw[i:i + 2] * 2 for i in range(0, len(raw), 2))\n"
+        "else:\n"
+        "    out = raw\n"
+        "open('/tmp/ref.raw', 'wb').write(out)\n"
+        "silent = not any(raw)\n"
+        "samples = struct.unpack('<%%dh' %% (len(raw) // 2), raw)\n"
+        "quiet = struct.pack('<%%dh' %% len(samples), *[v // 2 for v in samples])\n"
+        "open('/tmp/quiet.raw', 'wb').write(quiet)\n"
+        "open('/tmp/zero.raw', 'wb').write(b'\\0' * len(raw))\n"
+        "print('SILENT' if silent else 'LOUD')\n"
+        "EOF\n"
+        "set +e\n"
+        "for t in %(ours)s /tmp/zero.raw /tmp/quiet.raw; do\n"
+        "  echo \"== $t\"\n"
+        "  opus_compare %(flag)s/tmp/ref.raw $t 2>&1\n"
+        "  echo \"rc $?\"\n"
+        "done\n" % {"path": path, "channels": channels, "ours": ours_path,
+                    "flag": flag})
+    finished = run(oracle.command("opus_compare", ["sh", "-c", script],
+                                  scratch=[scratch]), text=True)
+    text = clean(finished.stdout) + clean(finished.stderr)
+    if finished.returncode != 0 and "== " not in text:
+        return None, "the reference could not decode it: " + text[-200:]
+    results = {"silent": "SILENT" in text}
+    for label, marker in (("ours", ours_path), ("silence", "/tmp/zero.raw"),
+                          ("quiet", "/tmp/quiet.raw")):
+        block = text.split("== %s" % marker, 1)
+        if len(block) < 2:
+            return None, "no verdict for %s in: %s" % (label, text[-200:])
+        verdict = block[1].split("== ", 1)[0]
+        results[label] = ("Test vector PASSES" in verdict
+                          and "rc 0" in verdict, verdict)
+    return results, None
 
 
 def opusinfo_facts(path):
@@ -276,6 +357,34 @@ def main():
         if first is None:
             first = (name, mine, ffprobe, opusdec, info)
 
+    sample_checks = 0
+    sample_controls = 0
+    with tempfile.TemporaryDirectory(prefix="gaud-opus-") as scratch:
+        os.chmod(scratch, 0o777)
+        for name in files:
+            path = os.path.join(DATA, name)
+            raw = ours(path)
+            channels = int(raw["channels"])
+            if channels > 2:
+                continue
+            results, why = compare_samples(
+                name, path, channels, int(raw["frames"]), scratch)
+            if results is None:
+                bad.append("%s: %s" % (name, why))
+                continue
+            sample_checks += 1
+            if not results["ours"][0]:
+                bad.append("%s: opus_compare rejects our decode: %s"
+                           % (name, results["ours"][1].strip()[-200:]))
+            for control in ("silence", "quiet"):
+                if results["silent"]:
+                    continue
+                sample_controls += 1
+                if results[control][0]:
+                    bad.append("%s: opus_compare accepted %s, so it cannot "
+                               "tell a decode from one that is wrong"
+                               % (name, control))
+
     controls = 0
     unseen = []
     if first is None:
@@ -317,11 +426,11 @@ def main():
           "of them the pre-skip left in - which is the error this format "
           "invites and no other here can make." % controls)
     print()
-    print("**Nothing above compares a sample.** `opus_compare` is in the "
-          "image and is called by nothing, which is the hole the decode "
-          "commit closes: RFC 6716 defines a conforming decoder as one "
-          "whose output that tool accepts, and this library has no "
-          "output for it to accept yet.")
+    print("%d fixtures (every one with one or two channels) decode to "
+          "what libopus's own front end decodes, as `opus_compare` judges "
+          "it, through the whole Ogg path; %d controls - silence, and the "
+          "signal at half amplitude - are rejected by the same call."
+          % (sample_checks, sample_controls))
     return 0
 
 

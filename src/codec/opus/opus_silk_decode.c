@@ -50,11 +50,9 @@
 
 #include "opus_silk.h"
 
-void gaud_silk_parse_packet(SILK_Decoder * decoder, OPUS_Range * range) {
+void gaud_silk_skip_redundancy(SILK_Decoder * decoder, OPUS_Range * range) {
   int frames = decoder->channel[0].frames_per_packet;
   bool stereo = decoder->channels == 2;
-
-  gaud_silk_decode_header(decoder, range);
 
   // Section 4.2.5. A receiver that lost nothing still decodes every
   // symbol of these, because they sit in front of the frames it wants
@@ -81,35 +79,49 @@ void gaud_silk_parse_packet(SILK_Decoder * decoder, OPUS_Range * range) {
       gaud_silk_decode_pulses(channel, range);
     }
   }
+}
 
-  for (int frame = 0; frame < frames; ++frame) {
-    bool mid_only = false;
-    if (stereo) {
-      gaud_silk_decode_stereo_pred(range, decoder->stereo_pred_q13);
-      // A side channel with voice activity is always coded, so the
-      // flag is only sent when it might be absent.
-      mid_only = !decoder->channel[1].vad[frame]
-          && gaud_silk_decode_mid_only(range);
-    }
-    for (int c = 0; c < decoder->channels; ++c) {
-      if (c > 0 && mid_only) {
-        continue;
-      }
-      SILK_Coding coding;
-      if (frame == 0) {
-        coding = SILK_CODE_INDEPENDENT;
-      } else if (c > 0 && decoder->prev_mid_only) {
-        coding = SILK_CODE_INDEPENDENT_NO_SCALE;
-      } else {
-        coding = SILK_CODE_CONDITIONAL;
-      }
-      gaud_silk_decode_indices(
-          &decoder->channel[c], range, frame, false, coding);
-      gaud_silk_decode_pulses(&decoder->channel[c], range);
-    }
-    decoder->prev_mid_only = mid_only;
-    decoder->channel[0].frames_decoded = frame + 1;
-    decoder->channel[1].frames_decoded = frame + 1;
+bool gaud_silk_parse_frame(
+    SILK_Decoder * decoder, OPUS_Range * range, int frame) {
+  bool stereo = decoder->channels == 2;
+  bool mid_only = false;
+  if (stereo) {
+    gaud_silk_decode_stereo_pred(range, decoder->stereo_pred_q13);
+    // A side channel with voice activity is always coded, so the
+    // flag is only sent when it might be absent.
+    mid_only = !decoder->channel[1].vad[frame]
+        && gaud_silk_decode_mid_only(range);
   }
-  decoder->mid_only = decoder->prev_mid_only;
+  for (int c = 0; c < decoder->channels; ++c) {
+    if (c > 0 && mid_only) {
+      continue;
+    }
+    SILK_Coding coding;
+    if (frame == 0) {
+      coding = SILK_CODE_INDEPENDENT;
+    } else if (c > 0 && decoder->prev_mid_only) {
+      coding = SILK_CODE_INDEPENDENT_NO_SCALE;
+    } else {
+      coding = SILK_CODE_CONDITIONAL;
+    }
+    decoder->channel[c].coding = coding;
+    gaud_silk_decode_indices(
+        &decoder->channel[c], range, frame, false, coding);
+    gaud_silk_decode_pulses(&decoder->channel[c], range);
+  }
+  decoder->prev_mid_only = mid_only;
+  decoder->mid_only = mid_only;
+  decoder->channel[0].frames_decoded = frame + 1;
+  decoder->channel[1].frames_decoded = frame + 1;
+  return mid_only;
+}
+
+void gaud_silk_parse_packet(SILK_Decoder * decoder, OPUS_Range * range) {
+  int frames = decoder->channel[0].frames_per_packet;
+
+  gaud_silk_decode_header(decoder, range);
+  gaud_silk_skip_redundancy(decoder, range);
+  for (int frame = 0; frame < frames; ++frame) {
+    (void)gaud_silk_parse_frame(decoder, range, frame);
+  }
 }

@@ -207,6 +207,19 @@ static inline int32_t gaud_celt_frac_mul16(int32_t a, int32_t b) {
 }
 
 /**
+ * @brief Multiply a 32-bit value by a Q15 one, RFC 6716's `MULT16_32_Q15`.
+ *
+ * @param twiddle The Q15 factor; only its low 16 bits are read.
+ * @param value The 32-bit one.
+ * @return Their product, in the second factor's scale.
+ */
+static inline int32_t gaud_celt_mult16_32_q15(int32_t twiddle, int32_t value) {
+  return gaud_celt_add32(
+      (int32_t)((uint32_t)gaud_celt_mult16_16(twiddle, value >> 16) << 1),
+      ((int32_t)(int16_t)twiddle * (int32_t)(uint16_t)(uint32_t)value) >> 15);
+}
+
+/**
  * @brief Multiply two Q31 values, as three 16-bit partial products.
  *
  * RFC 6716's `MULT32_32_Q31`. It drops the lowest partial product

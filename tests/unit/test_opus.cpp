@@ -45,6 +45,7 @@
 #include "../../src/codec/opus/opus_silk_tables.h"
 #include "../../src/codec/opus/opus_silk.h"
 #include "../../src/codec/opus/opus_silk_math.h"
+#include "../../src/codec/opus/opus_decoder.h"
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <ghoti.io/audio/codecs.h>
@@ -492,26 +493,6 @@ TEST(OpusLoad, TheTagsComeOutOfTheCommentHeader) {
   ASSERT_EQ(gaud_meta_count(meta, GAUD_TAG_COMMENT), 1u);
   EXPECT_STREQ(gaud_meta_get(meta, GAUD_TAG_COMMENT, 0),
       "café 日本語");
-}
-
-TEST(OpusLoad, AskingForADecoderIsRefusedAndTheCapabilityBitSaysWhy) {
-  /*
-   * planning/audio.md section 11.18's argument, as an assertion, and
-   * **this test is expected to be deleted**: when the decoder lands,
-   * GAUD_CAP_DECODE is declared and this becomes the test that must be
-   * removed rather than relaxed.
-   */
-  const GAUD_Codec * codec = gaud_registry_find(NULL, "opus");
-  ASSERT_NE(codec, nullptr);
-  EXPECT_TRUE((codec->capabilities & GAUD_CAP_METADATA_READ) != 0);
-  EXPECT_FALSE((codec->capabilities & GAUD_CAP_DECODE) != 0);
-
-  Loaded loaded;
-  ASSERT_EQ(OpenFile(loaded, "opus_celt_stereo_96k.opus"), GAUD_OK);
-  GAUD_Decoder * decoder = nullptr;
-  EXPECT_EQ(gaud_decoder_create(loaded.track(), &decoder),
-      GAUD_ERR_UNSUPPORTED);
-  EXPECT_EQ(decoder, nullptr);
 }
 
 TEST(OpusProbe, OggIsFiveFormatsAndTheProbeDecidesWhich) {
@@ -5424,6 +5405,750 @@ TEST(OpusCeltFrame, TheRangeStateMovesAndDependsOnTheBytes) {
   }
   EXPECT_GT(states.size(), 50u);
 }
+
+
+namespace {
+
+/** Every sample a track holds, read in @p chunk-frame buffers. */
+std::vector<int16_t> DecodeAll(GAUD_Track * track, size_t chunk = 960) {
+  std::vector<int16_t> all;
+  GAUD_Decoder * decoder = nullptr;
+  EXPECT_EQ(gaud_decoder_create(track, &decoder), GAUD_OK);
+  if (!decoder) {
+    return all;
+  }
+  GAUD_Buffer * buffer = nullptr;
+  EXPECT_EQ(gaud_decoder_buffer_create(decoder, nullptr, chunk, &buffer),
+      GAUD_OK);
+  unsigned channels = gaud_track_layout(track).channels;
+  for (;;) {
+    EXPECT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+    size_t frames = gaud_buffer_frames(buffer);
+    if (frames == 0) {
+      break;
+    }
+    const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+    all.insert(all.end(), data, data + frames * channels);
+  }
+  gaud_buffer_destroy(buffer);
+  gaud_decoder_destroy(decoder);
+  return all;
+}
+
+uint64_t DigestOf(const std::vector<int16_t> & samples) {
+  uint64_t digest = 1469598103934665603ULL;
+  for (int16_t v : samples) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (uint64_t)(((int64_t)v >> (8 * i)) & 0xFF);
+      digest *= 1099511628211ULL;
+    }
+  }
+  return digest;
+}
+
+}  // namespace
+
+TEST(OpusDecode, TheCodecDeclaresDecodingBecauseItPassesSectionSix) {
+  const GAUD_Codec * codec = gaud_registry_find(NULL, "opus");
+  ASSERT_NE(codec, nullptr);
+  EXPECT_TRUE((codec->capabilities & GAUD_CAP_METADATA_READ) != 0);
+  EXPECT_TRUE((codec->capabilities & GAUD_CAP_DECODE) != 0);
+  Loaded loaded;
+  ASSERT_EQ(OpenFile(loaded, "opus_celt_stereo_96k.opus"), GAUD_OK);
+  GAUD_Decoder * decoder = nullptr;
+  EXPECT_EQ(gaud_decoder_create(loaded.track(), &decoder), GAUD_OK);
+  EXPECT_NE(decoder, nullptr);
+  gaud_decoder_destroy(decoder);
+}
+
+TEST(OpusDecode, EveryFixtureDecodesToExactlyTheReferencesSamples) {
+  /*
+   * The digests are of what RFC 6716 Appendix A's own decoder produces
+   * from the same packets with the pre-skip dropped and the end trimmed
+   * to the last granule position, channels in WAV order. The harness is
+   * notes/audio/opus-harness/fixture_ref.c, and it parses the Ogg itself
+   * so that what is compared is the decoder and the framing and not two
+   * readings of one container. Fourteen files reach SILK, hybrid and
+   * CELT, both channel counts, 2.5 to 60 ms frames and a five-channel-
+   * and-a-low-frequency multistream.
+   */
+  const struct {
+    const char * name;
+    uint64_t frames;
+    unsigned channels;
+    uint64_t digest;
+  } cases[] = {
+      {"opus_celt_5dot1.opus", 4800, 6, 10768649527793295339ULL},
+      {"opus_celt_lowdelay_2ms5.opus", 9600, 2, 17750459195125432731ULL},
+      {"opus_celt_mono_60ms.opus", 9600, 1, 88819465325557002ULL},
+      {"opus_celt_mono_swb.opus", 9600, 1, 497828282014136728ULL},
+      {"opus_celt_silence.opus", 4800, 2, 15262894102733591427ULL},
+      {"opus_celt_stereo_10ms.opus", 9600, 2, 15024168989242230706ULL},
+      {"opus_celt_stereo_96k.opus", 9600, 2, 11511743838953620795ULL},
+      {"opus_hybrid_mono_fb.opus", 9600, 1, 14444781928337212210ULL},
+      {"opus_hybrid_mono_swb.opus", 9600, 1, 8769112344589667408ULL},
+      {"opus_silk_mono_40ms.opus", 9600, 1, 3098424118183910357ULL},
+      {"opus_silk_mono_mb.opus", 9600, 1, 6213081264931631977ULL},
+      {"opus_silk_mono_nb.opus", 9600, 1, 14720136852303295984ULL},
+      {"opus_silk_mono_wb.opus", 9600, 1, 18012887337420200866ULL},
+      {"opus_silk_stereo_60ms.opus", 9600, 2, 4241935156443072702ULL},
+      {"opus_tagged_stereo.opus", 4800, 2, 9965630012901455777ULL},
+  };
+  for (const auto & one : cases) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, one.name), GAUD_OK) << one.name;
+    EXPECT_EQ(gaud_track_frames(loaded.track()), one.frames) << one.name;
+    EXPECT_EQ(gaud_track_layout(loaded.track()).channels, one.channels)
+        << one.name;
+    std::vector<int16_t> samples = DecodeAll(loaded.track());
+    EXPECT_EQ(samples.size(), one.frames * one.channels) << one.name;
+    EXPECT_EQ(DigestOf(samples), one.digest) << one.name;
+  }
+}
+
+TEST(OpusDecode, TheBufferSizeChangesNothingAboutWhatIsRead) {
+  // One frame at a time, a prime, a packet, and more than the file.
+  for (const char * name :
+      {"opus_silk_mono_wb.opus", "opus_hybrid_mono_fb.opus",
+          "opus_celt_stereo_10ms.opus", "opus_celt_5dot1.opus"}) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, name), GAUD_OK) << name;
+    std::vector<int16_t> reference = DecodeAll(loaded.track(), 960);
+    ASSERT_FALSE(reference.empty()) << name;
+    for (size_t chunk : {1u, 7u, 1000u, 65536u}) {
+      EXPECT_EQ(DecodeAll(loaded.track(), chunk), reference)
+          << name << " in " << chunk;
+    }
+  }
+}
+
+TEST(OpusDecode, SeekingLandsWhereAskedAndReadsWhatAStraightReadReads) {
+  for (const char * name : {"opus_silk_mono_wb.opus", "opus_celt_stereo_96k.opus",
+           "opus_hybrid_mono_swb.opus"}) {
+    Loaded loaded;
+    ASSERT_EQ(OpenFile(loaded, name), GAUD_OK) << name;
+    unsigned channels = gaud_track_layout(loaded.track()).channels;
+    std::vector<int16_t> all = DecodeAll(loaded.track());
+    GAUD_Decoder * decoder = nullptr;
+    ASSERT_EQ(gaud_decoder_create(loaded.track(), &decoder), GAUD_OK);
+    GAUD_Buffer * buffer = nullptr;
+    ASSERT_EQ(gaud_decoder_buffer_create(decoder, nullptr, 500, &buffer),
+        GAUD_OK);
+    // Forwards, backwards, to a packet boundary and across one, to the
+    // start, and past the end.
+    for (uint64_t target : {5000u, 100u, 0u, 960u, 959u, 9000u, 4800u, 9599u,
+             12345u}) {
+      uint64_t landed = 0;
+      ASSERT_EQ(gaud_decoder_seek(decoder, target, &landed), GAUD_OK)
+          << name << " " << target;
+      uint64_t expect = std::min<uint64_t>(target, 9600u);
+      EXPECT_EQ(landed, expect) << name << " " << target;
+      EXPECT_EQ(gaud_decoder_tell(decoder), expect) << name;
+      ASSERT_EQ(gaud_decoder_read(decoder, buffer), GAUD_OK);
+      size_t frames = gaud_buffer_frames(buffer);
+      EXPECT_EQ(frames, std::min<uint64_t>(500u, 9600u - expect)) << name;
+      const int16_t * data = (const int16_t *)gaud_buffer_data_const(buffer);
+      for (size_t i = 0; i < frames * channels; ++i) {
+        ASSERT_EQ(data[i], all[expect * channels + i])
+            << name << " target " << target << " sample " << i;
+      }
+    }
+    gaud_buffer_destroy(buffer);
+    gaud_decoder_destroy(decoder);
+  }
+}
+
+namespace {
+
+/** One Ogg page holding one whole packet, with the right checksum. */
+std::vector<unsigned char> OggPage(uint32_t serial, uint32_t sequence,
+    unsigned flags, uint64_t granule, const std::vector<unsigned char> & packet) {
+  std::vector<unsigned char> page(27, 0);
+  memcpy(page.data(), "OggS", 4);
+  page[5] = (unsigned char)flags;
+  for (int i = 0; i < 8; ++i) page[6 + i] = (unsigned char)(granule >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[14 + i] = (unsigned char)(serial >> (8 * i));
+  for (int i = 0; i < 4; ++i) page[18 + i] = (unsigned char)(sequence >> (8 * i));
+  size_t left = packet.size();
+  std::vector<unsigned char> table;
+  while (left >= 255u) {
+    table.push_back(255);
+    left -= 255u;
+  }
+  table.push_back((unsigned char)left);
+  page[26] = (unsigned char)table.size();
+  page.insert(page.end(), table.begin(), table.end());
+  page.insert(page.end(), packet.begin(), packet.end());
+  uint32_t crc = gaud_ogg_crc32(page.data(), page.size());
+  for (int i = 0; i < 4; ++i) page[22 + i] = (unsigned char)(crc >> (8 * i));
+  return page;
+}
+
+/** Every audio packet of an Ogg Opus file, in order. */
+std::vector<std::vector<unsigned char>> AudioPackets(const char * name) {
+  std::vector<std::vector<unsigned char>> packets;
+  FILE * file = fopen(Fixture(name).c_str(), "rb");
+  if (!file) {
+    return packets;
+  }
+  std::vector<unsigned char> bytes;
+  unsigned char block[4096];
+  size_t got;
+  while ((got = fread(block, 1, sizeof block, file)) > 0) {
+    bytes.insert(bytes.end(), block, block + got);
+  }
+  fclose(file);
+  std::vector<unsigned char> current;
+  int index = 0;
+  for (size_t at = 0; at + 27 <= bytes.size();) {
+    size_t segments = bytes[at + 26];
+    size_t body = at + 27 + segments;
+    for (size_t s = 0; s < segments; ++s) {
+      size_t length = bytes[at + 27 + s];
+      current.insert(current.end(), bytes.begin() + body,
+          bytes.begin() + body + length);
+      body += length;
+      if (length < 255u) {
+        if (index++ >= 2) {
+          packets.push_back(current);
+        }
+        current.clear();
+      }
+    }
+    at = body;
+  }
+  return packets;
+}
+
+/** A code-0 packet rewritten with Appendix B's explicit final length. */
+std::vector<unsigned char> SelfDelimited(const std::vector<unsigned char> & p) {
+  std::vector<unsigned char> out;
+  out.push_back(p[0]);
+  size_t length = p.size() - 1u;
+  if (length < 252u) {
+    out.push_back((unsigned char)length);
+  }
+  else {
+    out.push_back((unsigned char)(252u + (length & 3u)));
+    out.push_back((unsigned char)((length - (252u + (length & 3u))) / 4u));
+  }
+  out.insert(out.end(), p.begin() + 1, p.end());
+  return out;
+}
+
+/** An Ogg Opus file around @p packets, 960 samples to each. */
+std::vector<unsigned char> OggOpus(const std::vector<unsigned char> & head,
+    const std::vector<std::vector<unsigned char>> & packets,
+    uint64_t last_granule) {
+  std::vector<unsigned char> tags;
+  tags.insert(tags.end(), OPUS_TAGS_MAGIC, OPUS_TAGS_MAGIC + 8);
+  for (int i = 0; i < 4; ++i) tags.push_back(0); /* vendor length */
+  for (int i = 0; i < 4; ++i) tags.push_back(0); /* no comments */
+  std::vector<unsigned char> file = OggPage(7, 0, 2, 0, head);
+  auto page = OggPage(7, 1, 0, 0, tags);
+  file.insert(file.end(), page.begin(), page.end());
+  for (size_t i = 0; i < packets.size(); ++i) {
+    bool last = i + 1 == packets.size();
+    page = OggPage(7, (uint32_t)(2 + i), last ? 4u : 0u,
+        last ? last_granule : (uint64_t)(i + 1) * 960u, packets[i]);
+    file.insert(file.end(), page.begin(), page.end());
+  }
+  return file;
+}
+
+}  // namespace
+
+TEST(OpusDecode, ASilentChannelAndTwoStreamsAreMixedWhereTheTableSays) {
+  // Three channels from two uncoupled streams and a channel mapped to
+  // nothing: output 0 is the second stream, output 1 the first, output 2
+  // silence. The streams are real ones taken from two fixtures with the
+  // same frame length, wrapped in Appendix B's framing, and what must
+  // come out is exactly what those two files decode to alone.
+  auto first = AudioPackets("opus_silk_mono_wb.opus");
+  auto second = AudioPackets("opus_hybrid_mono_swb.opus");
+  ASSERT_EQ(first.size(), 11u);
+  ASSERT_EQ(second.size(), 11u);
+  std::vector<std::vector<unsigned char>> joined;
+  for (size_t i = 0; i < first.size(); ++i) {
+    auto packet = SelfDelimited(first[i]);
+    packet.insert(packet.end(), second[i].begin(), second[i].end());
+    joined.push_back(packet);
+  }
+  auto file = OggOpus(Head(1, 3, 312, 48000, 0, 255, {2, 0, 1, 0, 255}),
+      joined, 9912);
+  GAUD_Stream * stream = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory(file.data(), file.size(), &stream),
+      GAUD_OK);
+  GAUD_Diagnostics diagnostics;
+  gaud_diagnostics_init(&diagnostics, nullptr);
+  GAUD_Doc * doc = nullptr;
+  ASSERT_EQ(gaud_doc_load(nullptr, stream, nullptr, &diagnostics, &doc),
+      GAUD_OK);
+  EXPECT_EQ(gaud_track_frames(gaud_doc_track(doc, 0)), 9600u);
+  std::vector<int16_t> mixed = DecodeAll(gaud_doc_track(doc, 0));
+
+  Loaded a;
+  ASSERT_EQ(OpenFile(a, "opus_silk_mono_wb.opus"), GAUD_OK);
+  Loaded b;
+  ASSERT_EQ(OpenFile(b, "opus_hybrid_mono_swb.opus"), GAUD_OK);
+  std::vector<int16_t> from_a = DecodeAll(a.track());
+  std::vector<int16_t> from_b = DecodeAll(b.track());
+  ASSERT_EQ(mixed.size(), 9600u * 3u);
+  ASSERT_EQ(from_a.size(), 9600u);
+  ASSERT_EQ(from_b.size(), 9600u);
+  size_t loud = 0;
+  for (size_t i = 0; i < 9600u; ++i) {
+    ASSERT_EQ(mixed[3 * i + 0], from_b[i]) << i;
+    ASSERT_EQ(mixed[3 * i + 1], from_a[i]) << i;
+    ASSERT_EQ(mixed[3 * i + 2], 0) << i;
+    loud += from_a[i] != 0;
+  }
+  EXPECT_GT(loud, 1000u);
+  gaud_doc_destroy(doc);
+  gaud_stream_destroy(stream);
+  gaud_diagnostics_destroy(&diagnostics);
+}
+
+TEST(OpusDecode, ACoupledStreamAndAMonoOneFeedThreeChannels) {
+  auto stereo = AudioPackets("opus_celt_stereo_96k.opus");
+  auto mono = AudioPackets("opus_silk_mono_wb.opus");
+  ASSERT_EQ(stereo.size(), 11u);
+  ASSERT_EQ(mono.size(), 11u);
+  std::vector<std::vector<unsigned char>> joined;
+  for (size_t i = 0; i < stereo.size(); ++i) {
+    auto packet = SelfDelimited(stereo[i]);
+    packet.insert(packet.end(), mono[i].begin(), mono[i].end());
+    joined.push_back(packet);
+  }
+  auto file = OggOpus(Head(1, 3, 312, 48000, 0, 255, {2, 1, 2, 1, 0}),
+      joined, 9912);
+  GAUD_Stream * stream = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory(file.data(), file.size(), &stream),
+      GAUD_OK);
+  GAUD_Diagnostics diagnostics;
+  gaud_diagnostics_init(&diagnostics, nullptr);
+  GAUD_Doc * doc = nullptr;
+  ASSERT_EQ(gaud_doc_load(nullptr, stream, nullptr, &diagnostics, &doc),
+      GAUD_OK);
+  std::vector<int16_t> mixed = DecodeAll(gaud_doc_track(doc, 0));
+  Loaded a;
+  ASSERT_EQ(OpenFile(a, "opus_celt_stereo_96k.opus"), GAUD_OK);
+  Loaded b;
+  ASSERT_EQ(OpenFile(b, "opus_silk_mono_wb.opus"), GAUD_OK);
+  std::vector<int16_t> from_a = DecodeAll(a.track());
+  std::vector<int16_t> from_b = DecodeAll(b.track());
+  ASSERT_EQ(mixed.size(), 9600u * 3u);
+  // Output 0 is decoded channel 2 (the mono stream), 1 and 2 are the
+  // pair's right and left.
+  for (size_t i = 0; i < 9600u; ++i) {
+    ASSERT_EQ(mixed[3 * i + 0], from_b[i]) << i;
+    ASSERT_EQ(mixed[3 * i + 1], from_a[2 * i + 1]) << i;
+    ASSERT_EQ(mixed[3 * i + 2], from_a[2 * i + 0]) << i;
+  }
+  gaud_doc_destroy(doc);
+  gaud_stream_destroy(stream);
+  gaud_diagnostics_destroy(&diagnostics);
+}
+
+TEST(OpusDecode, AnOutputGainScalesTheSamplesAsLibopusDoes) {
+  // +6.02 dB is about a doubling, and -inf is not representable, so
+  // check the two directions and the saturation: a quarter-scale value
+  // at +12 dB clamps, and zero stays zero.
+  std::vector<int16_t> samples = {0, 1000, -1000, 20000, -20000, 32767, -32768};
+  std::vector<int16_t> doubled = samples;
+  gaud_opus_apply_gain(doubled.data(), doubled.size(), 1541); // 6.02 dB
+  EXPECT_EQ(doubled[0], 0);
+  EXPECT_NEAR(doubled[1], 2000, 3);
+  EXPECT_NEAR(doubled[2], -2000, 3);
+  EXPECT_EQ(doubled[3], 32767);
+  EXPECT_EQ(doubled[4], -32767);
+  EXPECT_EQ(doubled[5], 32767);
+  EXPECT_EQ(doubled[6], -32767);
+  std::vector<int16_t> halved = samples;
+  gaud_opus_apply_gain(halved.data(), halved.size(), -1541);
+  EXPECT_NEAR(halved[1], 500, 2);
+  EXPECT_NEAR(halved[3], 10000, 15);
+  std::vector<int16_t> same = samples;
+  gaud_opus_apply_gain(same.data(), same.size(), 0);
+  EXPECT_EQ(same, samples);
+}
+
+namespace {
+
+/** The linear congruential generator the reference harnesses used. */
+struct HarnessRandom {
+  uint32_t state;
+  uint32_t Next() {
+    state = state * 1664525u + 1013904223u;
+    return state >> 8;
+  }
+};
+
+/** FNV-1a over 64-bit words, the same fold the harnesses print. */
+struct Digest {
+  uint64_t value = 1469598103934665603ULL;
+  void Fold(int64_t v) {
+    for (int i = 0; i < 8; ++i) {
+      value ^= (uint64_t)((v >> (8 * i)) & 0xFF);
+      value *= 1099511628211ULL;
+    }
+  }
+};
+
+}  // namespace
+
+TEST(OpusSilkOutput, TheResamplerMatchesTheReferenceAtEveryRate) {
+  // 9,000 frames of 10 and 20 ms at the three SILK rates, with white
+  // noise, quiet noise, a full-scale square wave and a slow square
+  // wave over noise, each carried across five frames so that the
+  // all-pass state and the delayed first millisecond are both live.
+  // The digest is of RFC 6716 Appendix A's own output, and the harness
+  // that made it (notes/audio/opus-harness/rs.c) compared the two
+  // sample for sample as well and found no difference.
+  const int rates[3] = {8, 12, 16};
+  Digest digest;
+  long cases = 0;
+  long clipped = 0;
+  for (int rate : rates) {
+    for (int ms = 10; ms <= 20; ms += 10) {
+      for (uint32_t trial = 0; trial < 300; ++trial) {
+        int len = ms * rate;
+        SILK_Resampler resampler;
+        gaud_silk_resampler_init(&resampler, rate);
+        HarnessRandom random = {trial * 977u + (uint32_t)(rate * 31 + ms)};
+        for (int frame = 0; frame < 5; ++frame) {
+          std::vector<int16_t> in(320 + 2);
+          std::vector<int16_t> out(960 + 8);
+          int mode = (int)(trial % 4);
+          for (int i = 0; i < len; ++i) {
+            int32_t v;
+            if (mode == 0) {
+              v = (int32_t)(random.Next() % 65536) - 32768;
+            } else if (mode == 1) {
+              v = (int32_t)(random.Next() % 2001) - 1000;
+            } else if (mode == 2) {
+              v = ((i / 7) % 2) ? 32767 : -32768;
+            } else {
+              v = (int32_t)(20000.0
+                       * ((i % (rate * 3)) < rate ? 1 : -1))
+                  + (int32_t)(random.Next() % 100);
+            }
+            in[i] = (int16_t)v;
+          }
+          gaud_silk_resample(&resampler, out.data(), in.data(), len);
+          int n = len * 48 / rate;
+          for (int i = 0; i < n; ++i) {
+            digest.Fold(out[i]);
+            if (out[i] == 32767 || out[i] == -32768) {
+              ++clipped;
+            }
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 9000);
+  EXPECT_EQ(digest.value, 17843768938382602657ULL);
+  // The square waves overshoot, so the saturating paths are reached.
+  EXPECT_GT(clipped, 1000);
+}
+
+TEST(OpusSilkOutput, TheResamplerPassesDirectCurrentAtUnityAndDelaysUnderAMillisecond) {
+  // A constant input must come out constant once the filters settle,
+  // and a step must reach half height inside a millisecond of output,
+  // which is what the delay compensation buys: the filters' own delay
+  // is a few samples at each rate and the per-rate input delay is
+  // chosen to keep the total from growing with the input rate.
+  const int rates[3] = {8, 12, 16};
+  for (int rate : rates) {
+    SILK_Resampler resampler;
+    gaud_silk_resampler_init(&resampler, rate);
+    std::vector<int16_t> in(20 * rate, 0);
+    std::vector<int16_t> out(960);
+    std::vector<int16_t> all;
+    for (int frame = 0; frame < 6; ++frame) {
+      std::fill(in.begin(), in.end(), frame == 0 ? 0 : 10000);
+      gaud_silk_resample(&resampler, out.data(), in.data(), 20 * rate);
+      all.insert(all.end(), out.begin(), out.end());
+    }
+    int half = -1;
+    for (size_t i = 960; i < all.size(); ++i) {
+      if (all[i] >= 5000) {
+        half = (int)(i - 960);
+        break;
+      }
+    }
+    ASSERT_GE(half, 0) << rate;
+    EXPECT_LT(half, 48) << rate;
+    EXPECT_NEAR(all.back(), 10000, 20) << rate;
+  }
+}
+
+TEST(OpusSilkOutput, StereoUnmixingMatchesTheReference) {
+  // 7,200 frames: four in a row per trial, so the predictor weights
+  // glide from a previous frame's that is not zero. Three signal
+  // shapes: full-range noise, which saturates the sum and difference,
+  // and two quiet ones.
+  const int rates[3] = {8, 12, 16};
+  Digest digest;
+  long cases = 0;
+  long saturated = 0;
+  auto decoder = std::make_unique<SILK_Decoder>();
+  for (int rate : rates) {
+    for (int ms = 10; ms <= 20; ms += 10) {
+      for (uint32_t trial = 0; trial < 300; ++trial) {
+        int len = ms * rate;
+        memset(decoder.get(), 0, sizeof *decoder);
+        HarnessRandom random = {trial * 7919u + (uint32_t)(rate * 31 + ms)};
+        for (int frame = 0; frame < 4; ++frame) {
+          std::vector<int16_t> mid(322 + 2);
+          std::vector<int16_t> side(322 + 2);
+          int32_t pred[2];
+          int mode = (int)(trial % 3);
+          pred[0] = (int32_t)(random.Next() % 16000) - 8000;
+          pred[1] = (int32_t)(random.Next() % 16000) - 8000;
+          for (int i = 0; i < len + 2; ++i) {
+            int32_t m = mode == 0 ? (int32_t)(random.Next() % 65536) - 32768
+                                  : (int32_t)(random.Next() % 3001) - 1500;
+            int32_t sd = mode == 0 ? (int32_t)(random.Next() % 65536) - 32768
+                                   : (int32_t)(random.Next() % 801) - 400;
+            mid[i] = (int16_t)m;
+            side[i] = (int16_t)sd;
+          }
+          gaud_silk_stereo_ms_to_lr(
+              decoder.get(), mid.data(), side.data(), pred, rate, len);
+          for (int i = 0; i < len; ++i) {
+            digest.Fold(mid[i + 1]);
+            digest.Fold(side[i + 1]);
+            if (mid[i + 1] == 32767 || mid[i + 1] == -32768
+                || side[i + 1] == 32767 || side[i + 1] == -32768) {
+              ++saturated;
+            }
+          }
+          ++cases;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(cases, 7200);
+  EXPECT_EQ(digest.value, 901026882765732075ULL);
+  EXPECT_GT(saturated, 1000);
+}
+
+TEST(OpusSilkOutput, AZeroSideChannelUnmixesToTheMidChannelBothWays) {
+  // With no side signal and no prediction weights, left and right are
+  // both the mid channel, one sample late.
+  auto decoder = std::make_unique<SILK_Decoder>();
+  memset(decoder.get(), 0, sizeof *decoder);
+  std::vector<int16_t> mid(80 + 2);
+  std::vector<int16_t> side(80 + 2, 0);
+  for (int i = 0; i < 82; ++i) {
+    mid[i] = (int16_t)(i * 100 - 4000);
+  }
+  std::vector<int16_t> original = mid;
+  int32_t pred[2] = {0, 0};
+  gaud_silk_stereo_ms_to_lr(
+      decoder.get(), mid.data(), side.data(), pred, 8, 80);
+  for (int i = 2; i < 80; ++i) {
+    EXPECT_EQ(mid[i + 1], original[i + 1]) << i;
+    EXPECT_EQ(side[i + 1], original[i + 1]) << i;
+  }
+}
+
+namespace {
+
+struct DecoderRun {
+  long packets = 0;
+  long losses = 0;
+  long refused = 0;
+  long modes[4] = {0, 0, 0, 0};
+  long redundancy[3] = {0, 0, 0};
+  long mono = 0;
+  Digest digest;
+};
+
+/**
+ * The packet generator of notes/audio/opus-harness/decdiff.c, which ran
+ * the same packets through RFC 6716's decoder and compared every sample
+ * and every final range state. Random payloads are the point: they reach
+ * every flag a real encoder rarely sets - redundancy frames of any size,
+ * mid-only stereo, mode changes in every direction, frames the framing
+ * refuses - and the losses reach concealment in every mode.
+ */
+DecoderRun RunDecoder(int streams, int per_stream, bool lossy) {
+  DecoderRun run;
+  std::vector<int16_t> pcm(5760 * 2);
+  std::vector<unsigned char> pkt(1500);
+  for (int s = 0; s < streams; ++s) {
+    uint32_t channels = (s % 3 == 2) ? 1u : 2u;
+    OPUS_Decoder * decoder = nullptr;
+    EXPECT_EQ(gaud_opus_decoder_create(nullptr, channels, &decoder), GAUD_OK);
+    HarnessRandom random = {1234567u + (uint32_t)s * 7919u};
+    int prev_dur = 960;
+    int prev_cfg = -1;
+    run.mono += channels == 1u;
+    for (int p = 0; p < per_stream; ++p) {
+      bool lost = lossy && (random.Next() % 7 == 0) && p > 0;
+      uint32_t got = 0;
+      GAUD_Result result;
+      if (lost) {
+        int dur = prev_dur;
+        int r = (int)(random.Next() % 4);
+        if (r == 1) dur = 480;
+        else if (r == 2) dur = 960;
+        else if (r == 3) dur = 1920;
+        result = gaud_opus_decode_packet(
+            decoder, nullptr, 0, pcm.data(), 5760, (uint32_t)dur, &got);
+        ++run.losses;
+      } else {
+        int cfg = (int)(random.Next() % 32);
+        if (random.Next() % 3 == 0 && prev_cfg >= 0) cfg = prev_cfg;
+        prev_cfg = cfg;
+        int stereo = (int)(random.Next() % 2);
+        int code = (int)(random.Next() % 4);
+        int len = 2 + (int)(random.Next() % 200);
+        if (random.Next() % 20 == 0) len = 1 + (int)(random.Next() % 3);
+        pkt[0] = (unsigned char)((cfg << 3) | (stereo << 2) | code);
+        for (int i = 1; i < len; ++i) pkt[i] = (unsigned char)random.Next();
+        if (code == 3 && len >= 2) {
+          int frames = 1 + (int)(random.Next() % 3);
+          pkt[1] = (unsigned char)(frames | ((random.Next() % 2) ? 0x80 : 0));
+          if (pkt[1] & 0x80) {
+            for (int f = 0; f < frames - 1 && 2 + f < len; ++f)
+              pkt[2 + f] = (unsigned char)(1 + random.Next() % 40);
+          }
+        }
+        if (code == 2 && len >= 2) pkt[1] = (unsigned char)(1 + random.Next() % 60);
+        if (code == 1 && (len & 1) == 0) --len;
+        result = gaud_opus_decode_packet(
+            decoder, pkt.data(), (size_t)len, pcm.data(), 5760, 0, &got);
+      }
+      ++run.packets;
+      if (result != GAUD_OK) {
+        ++run.refused;
+        continue;
+      }
+      if (!lost) {
+        ++run.modes[decoder->mode];
+        ++run.redundancy[decoder->redundancy];
+      }
+      for (uint32_t i = 0; i < got * channels; ++i) run.digest.Fold(pcm[i]);
+      if (!lost) {
+        prev_dur = got > 0 ? (int)got : prev_dur;
+        if (prev_dur > 960) prev_dur = 960;
+      }
+    }
+    gaud_opus_decoder_destroy(nullptr, decoder);
+  }
+  return run;
+}
+
+}  // namespace
+
+TEST(OpusDecoder, RandomPacketsDecodeToExactlyTheReferencesSamples) {
+  // 7,500 packets through 150 streams, a third of them mono. The
+  // digest and every count were printed by the harness that compared
+  // each decoded sample and each final range state with RFC 6716's
+  // decoder, and it reported no difference in any of them.
+  DecoderRun run = RunDecoder(150, 50, false);
+  EXPECT_EQ(run.packets, 7500);
+  EXPECT_EQ(run.refused, 913);
+  EXPECT_EQ(run.modes[1], 2412);
+  EXPECT_EQ(run.modes[2], 796);
+  EXPECT_EQ(run.modes[3], 3379);
+  EXPECT_EQ(run.redundancy[1], 388);
+  EXPECT_EQ(run.redundancy[2], 443);
+  EXPECT_EQ(run.mono, 50);
+  EXPECT_EQ(run.digest.value, 982450114296123256ULL);
+}
+
+TEST(OpusDecoder, ConcealedPacketsDecodeToExactlyTheReferencesSamples) {
+  // The same, with one packet in seven lost, at a length the last
+  // packet suggests or one of three fixed ones. Concealment of every
+  // mode, and the transitions that conceal packets that were never
+  // lost, go through here.
+  DecoderRun run = RunDecoder(150, 50, true);
+  EXPECT_EQ(run.packets, 7500);
+  EXPECT_EQ(run.losses, 1013);
+  EXPECT_EQ(run.refused, 780);
+  EXPECT_EQ(run.modes[1], 2140);
+  EXPECT_EQ(run.modes[2], 725);
+  EXPECT_EQ(run.modes[3], 2842);
+  EXPECT_EQ(run.redundancy[1], 365);
+  EXPECT_EQ(run.redundancy[2], 368);
+  EXPECT_EQ(run.digest.value, 7171383989736018314ULL);
+}
+
+TEST(OpusDecoder, ARefusedPacketStillTellsTheDecoderHowLongItsFramesWere) {
+  // The reference reads the table of contents before it validates the
+  // packet, so a loss concealed after a refused packet is as long as
+  // that packet's frames said, not as long as the last good one's.
+  OPUS_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_opus_decoder_create(nullptr, 2, &decoder), GAUD_OK);
+  std::vector<int16_t> pcm(5760 * 2);
+  uint32_t got = 0;
+  // A 20 ms CELT packet that decodes.
+  std::vector<unsigned char> good(60, 0x55);
+  good[0] = (31u << 3);
+  ASSERT_EQ(gaud_opus_decode_packet(decoder, good.data(), good.size(),
+                pcm.data(), 5760, 0, &got),
+      GAUD_OK);
+  EXPECT_EQ(got, 960u);
+  // Three 2.5 ms frames in a code-3 packet whose count byte is zero:
+  // refused, but it was a 2.5 ms packet.
+  unsigned char bad[2] = {(unsigned char)((28u << 3) | 3u), 0};
+  EXPECT_NE(gaud_opus_decode_packet(
+                decoder, bad, sizeof bad, pcm.data(), 5760, 0, &got),
+      GAUD_OK);
+  EXPECT_EQ(decoder->frame_size, 120u);
+  // Asked to conceal 20 ms, it conceals no more than the last table of
+  // contents said.
+  ASSERT_EQ(gaud_opus_decode_packet(decoder, nullptr, 0, pcm.data(), 5760,
+                960, &got),
+      GAUD_OK);
+  EXPECT_EQ(got, 120u);
+  gaud_opus_decoder_destroy(nullptr, decoder);
+}
+
+TEST(OpusDecoder, ALostPacketBeforeAnyPacketIsSilence) {
+  OPUS_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_opus_decoder_create(nullptr, 2, &decoder), GAUD_OK);
+  std::vector<int16_t> pcm(960 * 2, 77);
+  uint32_t got = 0;
+  ASSERT_EQ(gaud_opus_decode_packet(
+                decoder, nullptr, 0, pcm.data(), 960, 480, &got),
+      GAUD_OK);
+  // The table-of-contents default, 2.5 ms, caps what can be concealed.
+  EXPECT_EQ(got, 120u);
+  for (uint32_t i = 0; i < got * 2; ++i) {
+    EXPECT_EQ(pcm[i], 0) << i;
+  }
+  gaud_opus_decoder_destroy(nullptr, decoder);
+}
+
+TEST(OpusDecoder, OnlyOneAndTwoChannelsCanBeMade) {
+  OPUS_Decoder * decoder = nullptr;
+  EXPECT_EQ(gaud_opus_decoder_create(nullptr, 0, &decoder), GAUD_ERR_INVALID);
+  EXPECT_EQ(gaud_opus_decoder_create(nullptr, 3, &decoder), GAUD_ERR_INVALID);
+  EXPECT_EQ(decoder, nullptr);
+  gaud_opus_decoder_destroy(nullptr, nullptr);
+}
+
+TEST(OpusDecoder, APacketLongerThanTheBufferIsRefusedNotTruncated) {
+  OPUS_Decoder * decoder = nullptr;
+  ASSERT_EQ(gaud_opus_decoder_create(nullptr, 1, &decoder), GAUD_OK);
+  std::vector<int16_t> pcm(960);
+  std::vector<unsigned char> packet(40, 0x33);
+  packet[0] = (31u << 3);
+  uint32_t got = 99;
+  EXPECT_EQ(gaud_opus_decode_packet(decoder, packet.data(), packet.size(),
+                pcm.data(), 480, 0, &got),
+      GAUD_ERR_INVALID);
+  EXPECT_EQ(got, 0u);
+  gaud_opus_decoder_destroy(nullptr, decoder);
+}
+
 
 
 int main(int argc, char ** argv) {

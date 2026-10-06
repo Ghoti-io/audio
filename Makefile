@@ -745,17 +745,17 @@ $(VORBIS_PROBE): $(ORACLE)/vorbis_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
-OPUS_PROBE := $(APP_DIR)/oracle/opus_probe$(EXE_EXTENSION)
+OPUS_DECODE_PROBE := $(APP_DIR)/oracle/opus_decode_probe$(EXE_EXTENSION)
 
-$(OPUS_PROBE): $(ORACLE)/opus_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+$(OPUS_DECODE_PROBE): $(ORACLE)/opus_decode_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET) $(LIBVER_GEN)
-	@printf "\n### Compiling Oracle Probe: opus_probe ###\n"
+	@printf "\n### Compiling Oracle Probe: opus_decode_probe ###\n"
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
 oracle-probe: ## Build the probes the differentials drive
 oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE) $(VORBIS_PROBE) \
-		$(OPUS_PROBE)
+		$(OPUS_DECODE_PROBE)
 
 oracle-build: ## Build the pinned reference image: ffmpeg, sox, libsndfile, python3, mutagen, flac and opus
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
@@ -814,15 +814,16 @@ opus-vectors: ## Fetch RFC 6716's conformance vectors (39 MB, deliberate)
 # second. The hash is checked before anything is unpacked.
 	@python3 $(ORACLE)/opus_vectors.py --fetch
 
-check-opus-vectors: ## Fail if we read RFC 6716's conformance vectors wrongly
-# The strictest gate here, once there is a decoder: RFC 6716 section 6
-# requires the same FINAL RANGE DECODER STATE as the reference for every
-# packet, which is an exact integer equality over every symbol a frame
-# contained rather than a tolerance on samples. Until the decoder exists
-# it asserts the framing and the durations, and refuses to stay quiet if
-# GAUD_CAP_DECODE appears while no range state is being compared.
-check-opus-vectors: $(OPUS_PROBE)
-	@GAUD_OPUS_PROBE=$(OPUS_PROBE) python3 $(ORACLE)/check_opus_vectors.py
+check-opus-vectors: ## Fail if the Opus decoder disagrees with RFC 6716's reference on its conformance vectors
+# The strictest gate here: RFC 6716 section 6 requires both that
+# `opus_compare` accepts the output and that the final range decoder
+# state is the reference's for every packet, which is an exact equality
+# over every symbol a frame contained rather than a tolerance on
+# samples. This one also requires the output to be bit-identical to the
+# reference decoder's, which section 6 does not ask for.
+check-opus-vectors: $(OPUS_DECODE_PROBE)
+	@GAUD_OPUS_DECODE_PROBE=$(OPUS_DECODE_PROBE) \
+		python3 $(ORACLE)/check_opus_vectors.py
 
 check-vorbis: ## Fail if a reference disagrees about what a Vorbis stream is
 check-vorbis: $(DUMP_PROBE)
