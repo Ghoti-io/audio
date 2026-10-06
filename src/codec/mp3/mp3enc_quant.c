@@ -47,9 +47,6 @@
 /** The largest magnitude the table and the escape bits can carry. */
 #define QUANT_MAX 8206
 
-/** How many outer-loop passes before giving up. */
-#define OUTER_LIMIT 40u
-
 /* ------------------------------------------------------------ one value */
 
 int32_t gaud_mp3e_quantize_one(int32_t value, int e4) {
@@ -268,18 +265,124 @@ static void set_caps(Work * w) {
   }
 }
 
-/** How much worse @p a is than @p b: more bands over, or more over by. */
-typedef struct {
-  unsigned over;
-  uint64_t excess; ///< Sum of octaves over, Q8.
-} Score;
-
-static bool better(const Score * a, const Score * b) {
-  if (a->over != b->over) {
-    return a->over < b->over;
+/** Bands louder than allowed when every run is quantised at @p gain. */
+static unsigned masked_over(const Work * w, unsigned gain, MP3E_Granule * g) {
+  quantize_all(w, gain, g);
+  unsigned over = 0;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    if (run_noise(w, r, gain, g) > w->in->allowed[r]) {
+      ++over;
+    }
   }
-  return a->excess < b->excess;
+  return over;
 }
+
+/** The largest gain at which no band is over its threshold, or 0. */
+static unsigned coarsest_masked(const Work * w, MP3E_Granule * g) {
+  unsigned low = 0;
+  unsigned high = 255;
+  while (low < high) {
+    unsigned mid = (low + high + 1u) >> 1;
+    if (masked_over(w, mid, g) == 0u) {
+      low = mid;
+    }
+    else {
+      high = mid - 1u;
+    }
+  }
+  return low;
+}
+
+/**
+ * Each band's noise against its threshold, in octaves of energy (Q8): how
+ * far over it is, or - negative - how far under. Bands whose signal is not
+ * above their threshold at all need no bits and are left out, marked
+ * INT32_MIN, because their margin is not something coding can change.
+ *
+ * @return how many bands are over the thresholds as given.
+ */
+static unsigned measure_excess(const Work * w, unsigned gain,
+    const MP3E_Granule * g, int32_t * excess) {
+  unsigned over = 0;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    uint64_t noise = run_noise(w, r, gain, g);
+    uint64_t allowed = w->in->allowed[r];
+    if (noise > allowed) {
+      ++over;
+    }
+    if (w->energy[r] <= allowed) {
+      excess[r] = INT32_MIN;
+      continue;
+    }
+    excess[r] = gaud_mp3e_log2_q8(noise ? noise : 1u)
+        - gaud_mp3e_log2_q8(allowed ? allowed : 1u);
+  }
+  return over;
+}
+
+/**
+ * Move each band's scalefactor toward making every band's margin the same.
+ *
+ * A band more than half an octave over the weighted median is amplified, a
+ * band more than half an octave under it - and amplified before - is let
+ * go. The deadband and the one-step limit are what keep this from
+ * oscillating: the global gain is chosen afresh after every move, which
+ * shifts every margin together.
+ *
+ * @return whether anything changed.
+ */
+static bool equalise(Work * w, const int32_t * excess) {
+  int32_t value[MP3E_MAX_BANDS];
+  unsigned weight[MP3E_MAX_BANDS];
+  unsigned count = 0;
+  unsigned total = 0;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    if (excess[r] == INT32_MIN) {
+      continue;
+    }
+    unsigned width = w->layout->band[r].width;
+    /* Insertion sort by value; there are at most 39. */
+    unsigned at = count++;
+    while (at > 0 && value[at - 1u] > excess[r]) {
+      value[at] = value[at - 1u];
+      weight[at] = weight[at - 1u];
+      --at;
+    }
+    value[at] = excess[r];
+    weight[at] = width;
+    total += width;
+  }
+  if (count == 0) {
+    return false;
+  }
+  unsigned running = 0;
+  int32_t median = value[count - 1u];
+  for (unsigned i = 0; i < count; ++i) {
+    running += weight[i];
+    if (running * 2u >= total) {
+      median = value[i];
+      break;
+    }
+  }
+  bool changed = false;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    if (excess[r] == INT32_MIN) {
+      continue;
+    }
+    if (excess[r] > median + 128 && w->sf[r] < w->sf_cap[r]) {
+      ++w->sf[r];
+      changed = true;
+    }
+    else if (excess[r] < median - 128 && w->sf[r] > 0) {
+      --w->sf[r];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** The most the shaping loop may run before it settles for what it has. */
+#define SHAPE_PASSES 8u
 
 unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
     const MP3E_Layout * layout, unsigned row, MP3_Version version,
@@ -298,69 +401,77 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
   set_caps(&w);
 
   MP3E_Granule * trial = out;
-  MP3E_Granule best;
-  Score best_score = {UINT32_MAX, UINT64_MAX};
-  bool have_best = false;
   uint32_t budget = input->target_bits;
-  unsigned stale = 0;
+  MP3E_Granule best;
+  bool have_best = false;
+  unsigned best_over = 0;
+  int32_t best_worst = INT32_MAX;
+  uint32_t best_bits = UINT32_MAX;
 
-  for (unsigned pass = 0; pass < OUTER_LIMIT; ++pass) {
-    bool fits = false;
-    unsigned gain = fit_gain(&w, budget, trial, &fits);
-
-    Score score = {0, 0};
+  /* The loop has two aims. With bits to use, it takes the finest step the
+   * budget affords and evens out the margins, so the surplus is spread as an
+   * equal noise-to-mask ratio instead of as noise that is the same size in
+   * every band. Without, it takes the coarsest step that masks every band
+   * and evens out the margins at that, which is the cheapest way to mask
+   * them. Either way each pass moves the scalefactors toward equal margins
+   * and chooses the step again. */
+  bool masks = masked_over(&w, 0u, trial) == 0u;
+  for (unsigned pass = 0; pass < SHAPE_PASSES; ++pass) {
+    unsigned gain;
+    bool fits = true;
+    uint32_t bits;
+    if (input->spend || !masks) {
+      gain = fit_gain(&w, budget, trial, &fits);
+      bits = trial->side.part2_3_length;
+    }
+    else {
+      gain = coarsest_masked(&w, trial);
+      quantize_all(&w, gain, trial);
+      bits = finish(&w, gain, trial);
+      fits = bits <= budget;
+    }
+    int32_t excess[MP3E_MAX_BANDS];
+    unsigned over = measure_excess(&w, gain, trial, excess);
     int32_t worst = INT32_MIN;
-    int32_t excess_q8[MP3E_MAX_BANDS];
     for (unsigned r = 0; r < w.runs; ++r) {
-      uint64_t noise = run_noise(&w, r, gain, trial);
-      uint64_t allowed = input->allowed[r];
-      excess_q8[r] = INT32_MIN;
-      if (noise > allowed) {
-        ++score.over;
-        int32_t over = gaud_mp3e_log2_q8(noise) - gaud_mp3e_log2_q8(allowed ? allowed : 1u);
-        excess_q8[r] = over;
-        score.excess += (uint64_t)(over > 0 ? over : 0);
-        if (over > worst) {
-          worst = over;
-        }
+      if (excess[r] > worst) {
+        worst = excess[r];
       }
     }
-    /* A granule that did not fit its budget at the coarsest step is worse
-     * than any that did, however quiet. */
+    if (worst == INT32_MIN) {
+      worst = 0;
+    }
     if (!fits) {
-      score.over += MP3E_MAX_BANDS;
-    }
-    if (!have_best || better(&score, &best_score)) {
-      best = *trial;
-      best_score = score;
-      have_best = true;
-      stale = 0;
-    }
-    else if (++stale >= 4u) {
-      break;
-    }
-    if (score.over == 0 || !fits) {
-      break;
-    }
-
-    /* Amplify the worst bands: those within half an octave of the worst. */
-    bool changed = false;
-    for (unsigned r = 0; r < w.runs; ++r) {
-      if (excess_q8[r] != INT32_MIN && excess_q8[r] + 128 >= worst
-          && w.sf[r] < w.sf_cap[r]) {
-        ++w.sf[r];
-        changed = true;
+      if (!have_best) {
+        best = *trial;
+        best_over = over;
+        have_best = true;
       }
+      break;
     }
-    if (!changed) {
+    bool better_state = !have_best
+        || ((input->spend || !masks) ? worst < best_worst
+                                      : bits < best_bits);
+    if (better_state) {
+      best = *trial;
+      best_over = over;
+      best_worst = worst;
+      best_bits = bits;
+      have_best = true;
+    }
+    if (!equalise(&w, excess)) {
       break;
     }
   }
   *out = best;
-  return best_score.over >= MP3E_MAX_BANDS ? best_score.over - MP3E_MAX_BANDS
-                                           : best_score.over;
+  return best_over;
 }
 
+/**
+ * What a spectrum would cost to code with noise held to the thresholds: the
+ * perceptual entropy, sum of width * log2(1 + sqrt(energy / allowed)) over
+ * the bands that need any, in bits.
+ */
 uint32_t gaud_mp3e_estimate_bits(const MP3E_Layout * layout,
     const int32_t * spectrum, const uint64_t * allowed) {
   uint64_t total_q8 = 0;

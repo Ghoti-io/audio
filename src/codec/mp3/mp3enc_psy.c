@@ -244,10 +244,10 @@ static uint32_t unpredictability(int32_t re, int32_t im, uint32_t mag,
  * @param out_pe Perceptual entropy in bits.
  */
 static void thresholds(unsigned count, const uint16_t * lo, const uint16_t * hi,
-    const uint64_t * ath, const uint32_t (*spread)[MP3E_MAX_LONG_PARTS],
+    const uint64_t * ath, const uint16_t * minimum_snr, const uint32_t (*spread)[MP3E_MAX_LONG_PARTS],
     const uint32_t * norm, const uint64_t * power, const uint32_t * c15,
     int snr_offset_q8, const uint64_t * previous, uint64_t * out_thr,
-    uint32_t * out_pe, size_t spread_stride) {
+    uint64_t * out_mask, uint32_t * out_pe, size_t spread_stride) {
   uint64_t e[MP3E_MAX_LONG_PARTS];
   uint64_t cw[MP3E_MAX_LONG_PARTS];
   uint64_t max_e = 0;
@@ -299,7 +299,11 @@ static void thresholds(unsigned count, const uint16_t * lo, const uint16_t * hi,
       tb15 = 32768;
     }
     int64_t snr_q8 = SNR_NOISE_Q8
-        + (((int64_t)(SNR_TONE_Q8 - SNR_NOISE_Q8) * tb15) >> 15) + snr_offset_q8;
+        + (((int64_t)(SNR_TONE_Q8 - SNR_NOISE_Q8) * tb15) >> 15);
+    if (snr_q8 < minimum_snr[j]) {
+      snr_q8 = minimum_snr[j];
+    }
+    snr_q8 += snr_offset_q8;
     uint32_t bc = gaud_mp3e_exp2_q8((int32_t)(-(snr_q8 * 85) / 256));
     uint64_t en = ecb / norm[j];
     uint64_t nb = ((en * bc) >> 16) << shift;
@@ -309,6 +313,7 @@ static void thresholds(unsigned count, const uint16_t * lo, const uint16_t * hi,
       uint64_t cap = previous[j] > UINT64_MAX / 4u ? UINT64_MAX / 2u : previous[j] * 2u;
       thr = nb < cap ? nb : cap;
     }
+    out_mask[j] = thr;
     if (thr < floor_power) {
       thr = floor_power;
     }
@@ -323,16 +328,39 @@ static void thresholds(unsigned count, const uint16_t * lo, const uint16_t * hi,
   *out_pe = (uint32_t)(pe_q8 >> 8);
 }
 
-/** The noise a band of lines may carry: the partition thresholds summed over
- *  them, per line, in the quantiser's units. */
-static uint64_t band_allowed(const uint64_t * thr, const uint16_t * bins,
-    const uint8_t * line_part, unsigned from, unsigned to, uint32_t divisor) {
-  uint64_t sum = 0;
+/**
+ * The noise a band of lines may carry, in the quantiser's units.
+ *
+ * Two floors, combined as the working encoders combine them. What the
+ * *signal* masks is summed over the band's lines, as the standard's
+ * description reads: masking is a property of the energy the band holds,
+ * and the lines of a noise band share it. What the *ear* would hear in
+ * silence is the lowest threshold of hearing anywhere in the band, times its
+ * lines: a scalefactor band has one step, its noise is flat across it, and
+ * flat noise is inaudible only if it is under the quietest line's absolute
+ * threshold. The threshold of hearing falls sixty decibels between the first
+ * bin and the fifth, so summing it - which the first version did - let one
+ * line's allowance pay for a band whose fundamental was then not coded.
+ * The band may carry the larger of the two.
+ */
+static uint64_t band_allowed(const uint64_t * mask, const uint64_t * ath,
+    const uint16_t * bins, const uint8_t * line_part, unsigned from,
+    unsigned to, uint32_t divisor) {
+  uint64_t masked = 0;
+  uint64_t least = UINT64_MAX;
   for (unsigned k = from; k < to; ++k) {
     unsigned p = line_part[k];
-    sum += thr[p] / bins[p] / divisor;
+    masked += mask[p] / bins[p] / divisor;
+    uint64_t quiet = ath[p] / divisor;
+    if (quiet < least) {
+      least = quiet;
+    }
   }
-  return sum;
+  if (least == UINT64_MAX) {
+    return 0;
+  }
+  uint64_t floor_power = least * (to - from);
+  return masked > floor_power ? masked : floor_power;
 }
 
 void gaud_mp3e_psy_analyze(const MP3E_Psy_Rate * rate,
@@ -368,22 +396,27 @@ void gaud_mp3e_psy_analyze(const MP3E_Psy_Rate * rate,
   memcpy(channel->long_mag[0], mag, sizeof(mag));
 
   uint64_t long_thr[MP3E_MAX_LONG_PARTS];
+  uint64_t long_mask[MP3E_MAX_LONG_PARTS];
   thresholds(rate->long_count, gaud_mp3enc_long_lo[rate->psy_row],
       gaud_mp3enc_long_hi[rate->psy_row], gaud_mp3enc_long_ath[rate->psy_row],
+      gaud_mp3enc_long_minsnr[rate->psy_row],
       (const uint32_t (*)[MP3E_MAX_LONG_PARTS])rate->long_spread, rate->long_norm,
-      power, c15, snr_offset_q8, channel->long_previous, long_thr,
+      power, c15, snr_offset_q8, channel->long_previous, long_thr, long_mask,
       &out->pe_long, sizeof(rate->long_spread[0]));
   memcpy(channel->long_previous, long_thr, sizeof(long_thr));
 
   const uint16_t * bounds = gaud_mp3_sfb_long[rate->band_row];
   for (unsigned b = 0; b < gaud_mp3_sfb_long_bands[rate->band_row]; ++b) {
-    out->allowed_long[b] = band_allowed(long_thr, rate->long_bins,
+    out->allowed_long[b] = band_allowed(long_mask,
+        gaud_mp3enc_long_ath[rate->psy_row], rate->long_bins,
         rate->long_line_part, bounds[b], bounds[b + 1u], LONG_DIVISOR);
   }
 
   for (unsigned k = 0; k < MP3E_LINES; ++k) {
     unsigned p = rate->long_line_part[k];
-    out->allowed_line[k] = long_thr[p] / rate->long_bins[p] / LONG_DIVISOR;
+    uint64_t line = long_mask[p] / rate->long_bins[p] / LONG_DIVISOR;
+    uint64_t quiet = gaud_mp3enc_long_ath[rate->psy_row][p] / LONG_DIVISOR;
+    out->allowed_line[k] = line > quiet ? line : quiet;
   }
 
   /* --- three short spectra, at the centres of the three short windows --- */
@@ -407,16 +440,19 @@ void gaud_mp3e_psy_analyze(const MP3E_Psy_Rate * rate,
     memcpy(channel->short_mag[0], smag, sizeof(smag));
 
     uint64_t short_thr[MP3E_MAX_SHORT_PARTS];
+    uint64_t short_mask[MP3E_MAX_SHORT_PARTS];
     uint32_t pe = 0;
     thresholds(rate->short_count, gaud_mp3enc_short_lo[rate->psy_row],
         gaud_mp3enc_short_hi[rate->psy_row], gaud_mp3enc_short_ath[rate->psy_row],
+        gaud_mp3enc_short_minsnr[rate->psy_row],
         (const uint32_t (*)[MP3E_MAX_LONG_PARTS])rate->short_spread, rate->short_norm,
-        spower, sc15, snr_offset_q8, NULL, short_thr, &pe,
+        spower, sc15, snr_offset_q8, NULL, short_thr, short_mask, &pe,
         sizeof(rate->short_spread[0]));
     out->pe_short += pe;
     const uint16_t * sb = gaud_mp3_sfb_short[rate->band_row];
     for (unsigned b = 0; b < gaud_mp3_sfb_short_bands[rate->band_row]; ++b) {
-      out->allowed_short[w][b] = band_allowed(short_thr, rate->short_bins,
+      out->allowed_short[w][b] = band_allowed(short_mask,
+          gaud_mp3enc_short_ath[rate->psy_row], rate->short_bins,
           rate->short_line_part, sb[b], sb[b + 1u], SHORT_DIVISOR);
     }
   }

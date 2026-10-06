@@ -213,9 +213,11 @@ typedef struct {
   const int32_t * spectrum;   ///< 576 lines in spectrum order, Q28.
   uint8_t block_type;         ///< 0 long, 1 start, 2 short, 3 stop.
   uint64_t allowed[MP3E_MAX_BANDS]; ///< Noise each band may carry.
-  uint32_t target_bits;       ///< What to aim for; the loop never exceeds it.
-  uint32_t hard_bits;         ///< What it must not exceed.
-  bool fit_to_noise;          ///< VBR: stop at the coarsest that is masked.
+  uint32_t target_bits;       ///< The most it may use; it uses less if masked.
+  /** Use the whole target on the finest step it affords, rather than only
+   *  what masking needs: for when the reservoir is full and a saved bit
+   *  would be stuffed away. */
+  bool spend;
 } MP3E_Quant_Input;
 
 /**

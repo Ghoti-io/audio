@@ -486,15 +486,31 @@ TEST(Mp3EncodePsy, ATonesMaskingIsEighteenDecibelsDownAndNoiseSixIsNot) {
     return (int16_t)std::lround(4000.0 * v);
   };
   r = RunPsy(noise, 90, rate, spectrum);
-  /* Several bands, away from the edges: a noise masker has a signal-to-noise
-   * ratio of six decibels, less what the normalisation by the spreading
-   * function's width takes. */
-  for (unsigned b = 12; b < 18; ++b) {
+  /* A noise masker has a signal-to-noise ratio of six decibels, less what
+   * normalising by the spreading function's width takes - or the least the
+   * model holds a band at that frequency to, if that is more: 24 dB up to
+   * 600 Hz, six an octave less to 3 kHz, three an octave less above. */
+  auto least = [](double f) {
+    if (f <= 600.0) {
+      return 24.0;
+    }
+    if (f <= 3000.0) {
+      return 24.0 - 6.0 * std::log2(f / 600.0);
+    }
+    return std::max(0.0, 10.0 - 3.0 * std::log2(f / 3000.0));
+  };
+  double off_sum = 0;
+  for (unsigned b = 6; b < 19; ++b) {
     double e = BandEnergy(spectrum, bounds[b], bounds[b + 1]);
     double d = 10.0 * std::log10(e / (double)r.allowed_long[b]);
-    EXPECT_GT(d, 3.0) << "band " << b;
-    EXPECT_LT(d, 9.0) << "band " << b;
+    double centre = 0.5 * (bounds[b] + bounds[b + 1]) * 44100.0 / 1152.0;
+    double expected = std::max(6.0, least(centre));
+    /* One band can sit several decibels off - a band straddles partitions
+     * whose floors differ - but the shape is the table's. */
+    EXPECT_NEAR(d, expected - 0.5, 5.0) << "band " << b << " at " << centre << " Hz";
+    off_sum += d - (expected - 0.5);
   }
+  EXPECT_NEAR(off_sum / 13.0, 0.0, 1.5) << "the level is the table's, on average";
 }
 
 TEST(Mp3EncodePsy, AStricterOffsetLowersEveryThreshold) {

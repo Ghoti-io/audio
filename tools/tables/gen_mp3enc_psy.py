@@ -79,6 +79,22 @@ def ath_db(f):
     return min(max(v, -20.0), 90.0)
 
 
+def minimum_snr_db(f):
+    """The least signal-to-noise ratio a band is held to, whatever its
+    tonality says: high at the bottom of the spectrum, where the ear is
+    keen and an encoder's noise is most audible, and falling away above.
+    Piecewise, in decibels: 24 up to 600 Hz, six decibels an octave less up
+    to 3 kHz (10 dB), three an octave less above it, never under zero. The
+    shape is the one the established encoders' noise takes on stationary
+    noise at the middle bit rates, measured, and the standard's own model
+    carries a table of the same character."""
+    if f <= 600.0:
+        return 24.0
+    if f <= 3000.0:
+        return 24.0 - 6.0 * math.log2(f / 600.0)
+    return max(0.0, 10.0 - 3.0 * math.log2(f / 3000.0))
+
+
 def partitions(rate, n):
     """Partition boundaries over bins 0..n/2 inclusive: [(lo, hi)), bins
     lo..hi-1."""
@@ -102,9 +118,11 @@ def table_for(rate, n, full_scale_power):
     hi = [p[1] for p in parts]
     centre_bark = []
     ath = []
+    minimum = []
     for a, b in parts:
         f = (a + b - 1) / 2.0 * rate / n
         centre_bark.append(int(round(bark(f) * 256)))
+        minimum.append(int(round(minimum_snr_db(f) * 256)))
         # The quietest bin of the partition, in power units.
         best = None
         for k in range(a, b):
@@ -112,7 +130,7 @@ def table_for(rate, n, full_scale_power):
             power = full_scale_power * 10.0 ** ((db - 96.0) / 10.0)
             best = power if best is None else min(best, power)
         ath.append(max(1, int(best)))
-    return lo, hi, centre_bark, ath
+    return lo, hi, centre_bark, ath, minimum
 
 
 def spread_table():
@@ -171,7 +189,8 @@ def build():
             counts.append(len(r[idx][0]))
         arr(out, "const uint8_t gaud_mp3enc_%s_parts[9]" % name, counts, 9)
         for field, pos, ctype in (("lo", 0, "uint16_t"), ("hi", 1, "uint16_t"),
-                                  ("bark", 2, "uint16_t"), ("ath", 3, "uint64_t")):
+                                  ("bark", 2, "uint16_t"), ("ath", 3, "uint64_t"),
+                                  ("minsnr", 4, "uint16_t")):
             out.append("const %s gaud_mp3enc_%s_%s[9][%d] = {" % (ctype, name, field, maxp))
             for r in rows:
                 vals = list(r[idx][pos]) + [0] * (maxp - len(r[idx][pos]))
@@ -219,11 +238,12 @@ extern const uint8_t gaud_mp3enc_long_parts[9];
 extern const uint8_t gaud_mp3enc_short_parts[9];
 """ % (MAX_LONG_PARTS, MAX_SHORT_PARTS, SPREAD_STEP, SPREAD_LOW, SPREAD_COUNT, SPREAD_COUNT)]
     for name, maxp in (("long", MAX_LONG_PARTS), ("short", MAX_SHORT_PARTS)):
-        hdr.append("/** The %s partitions' first bin, one past their last, Bark centre (Q8)\n * and quiet threshold per bin (power units). */" % name)
+        hdr.append("/** The %s partitions' first bin, one past their last, Bark centre (Q8)\n * quiet threshold per bin (power units) and the least\n * signal-to-noise ratio (dB, Q8). */" % name)
         hdr.append("extern const uint16_t gaud_mp3enc_%s_lo[9][%d];" % (name, maxp))
         hdr.append("extern const uint16_t gaud_mp3enc_%s_hi[9][%d];" % (name, maxp))
         hdr.append("extern const uint16_t gaud_mp3enc_%s_bark[9][%d];" % (name, maxp))
-        hdr.append("extern const uint64_t gaud_mp3enc_%s_ath[9][%d];\n" % (name, maxp))
+        hdr.append("extern const uint64_t gaud_mp3enc_%s_ath[9][%d];" % (name, maxp))
+        hdr.append("extern const uint16_t gaud_mp3enc_%s_minsnr[9][%d];\n" % (name, maxp))
     hdr.append("""#ifdef __cplusplus
 }
 #endif

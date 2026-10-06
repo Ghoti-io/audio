@@ -57,18 +57,22 @@ extern const uint8_t gaud_mp3enc_long_parts[9];
 extern const uint8_t gaud_mp3enc_short_parts[9];
 
 /** The long partitions' first bin, one past their last, Bark centre (Q8)
- * and quiet threshold per bin (power units). */
+ * quiet threshold per bin (power units) and the least
+ * signal-to-noise ratio (dB, Q8). */
 extern const uint16_t gaud_mp3enc_long_lo[9][72];
 extern const uint16_t gaud_mp3enc_long_hi[9][72];
 extern const uint16_t gaud_mp3enc_long_bark[9][72];
 extern const uint64_t gaud_mp3enc_long_ath[9][72];
+extern const uint16_t gaud_mp3enc_long_minsnr[9][72];
 
 /** The short partitions' first bin, one past their last, Bark centre (Q8)
- * and quiet threshold per bin (power units). */
+ * quiet threshold per bin (power units) and the least
+ * signal-to-noise ratio (dB, Q8). */
 extern const uint16_t gaud_mp3enc_short_lo[9][48];
 extern const uint16_t gaud_mp3enc_short_hi[9][48];
 extern const uint16_t gaud_mp3enc_short_bark[9][48];
 extern const uint64_t gaud_mp3enc_short_ath[9][48];
+extern const uint16_t gaud_mp3enc_short_minsnr[9][48];
 
 #ifdef __cplusplus
 }

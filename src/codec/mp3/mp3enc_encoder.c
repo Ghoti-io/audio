@@ -349,31 +349,20 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
     }
   }
 
-  /* What each granule-channel deserves: its perceptual entropy, scaled to
-   * what the frame has. The frame has its own bytes, and - when it wants
-   * more than that - part of what the reservoir has saved. */
+  /* What each granule-channel needs is found by asking the quantiser, not
+   * by estimating: the first pass codes every one as coarsely as masking
+   * allows, up to the most a granule can hold, and what it used is what it
+   * needed. If the frame can afford all of them, that is the frame. If it
+   * cannot, the bits there are - the frame's own and most of the
+   * reservoir's - are shared in proportion to need and everything is
+   * coded again within its share. If there are more than the frame can
+   * hold in the reservoir at all, the surplus would be stuffed away, so it
+   * is spent instead on finer steps. */
   unsigned units = granules * channels;
-  uint32_t want[4];
-  uint64_t wanted = 0;
-  for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
-    const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
-    for (unsigned ch = 0; ch < channels; ++ch, ++u) {
-      uint32_t pe = gaud_mp3e_estimate_bits(layout, spectrum[gr][ch], allowed[gr][ch]);
-      want[u] = pe < 200u ? 200u : pe;
-      wanted += want[u];
-    }
-  }
   uint64_t base = 8u * (uint64_t)area;
-  uint64_t reservoir_bits = 8u * reservoir;
-  uint64_t budget = base;
-  if (wanted > base) {
-    uint64_t extra = wanted - base;
-    uint64_t usable = reservoir_bits * 6u / 10u;
-    budget = base + (extra < usable ? extra : usable);
-  }
-  uint32_t hard_bits = (uint32_t)(8u * (area + reservoir));
-
-  uint32_t spent = 0;
+  uint64_t available = base + 8u * reservoir * 9u / 10u;
+  uint32_t need[4] = {0, 0, 0, 0};
+  uint64_t needed = 0;
   for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
     for (unsigned ch = 0; ch < channels; ++ch, ++u) {
       MP3E_Quant_Input input;
@@ -381,18 +370,49 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
       input.spectrum = spectrum[gr][ch];
       input.block_type = (uint8_t)type[gr];
       memcpy(input.allowed, allowed[gr][ch], sizeof(input.allowed));
-      uint64_t share = budget * want[u] / wanted;
-      if (share > MP3E_MAX_PART23) {
-        share = MP3E_MAX_PART23;
-      }
-      input.target_bits = (uint32_t)share;
-      input.hard_bits = hard_bits - (spent < hard_bits ? spent : hard_bits);
+      input.target_bits = MP3E_MAX_PART23;
       gaud_mp3e_quantize_granule(&input, &enc->layout[layout_index[gr]], enc->row,
           enc->version, &enc->coded[gr][ch]);
-      spent += enc->coded[gr][ch].side.part2_3_length;
+      need[u] = enc->coded[gr][ch].side.part2_3_length;
+      needed += need[u];
     }
   }
-  (void)units;
+  uint64_t grant = 0;
+  bool recode = false;
+  if (needed > available) {
+    grant = available;
+    recode = true;
+  }
+  else {
+    uint64_t used_bytes = (needed + 7u) / 8u;
+    uint64_t left = area + reservoir - used_bytes;
+    /* Keep enough in the reservoir for a granule that needs more than its
+     * share - five eighths of what it can hold - and spend the rest. */
+    uint64_t keep = enc->reservoir_max * 5u / 8u;
+    if (left > keep) {
+      grant = needed + 8u * (left - keep);
+      recode = true;
+    }
+  }
+  if (recode) {
+    for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
+      for (unsigned ch = 0; ch < channels; ++ch, ++u) {
+        MP3E_Quant_Input input;
+        memset(&input, 0, sizeof(input));
+        input.spectrum = spectrum[gr][ch];
+        input.block_type = (uint8_t)type[gr];
+        memcpy(input.allowed, allowed[gr][ch], sizeof(input.allowed));
+        uint64_t share = needed ? grant * need[u] / needed : grant / units;
+        if (share > MP3E_MAX_PART23) {
+          share = MP3E_MAX_PART23;
+        }
+        input.target_bits = (uint32_t)share;
+        input.spend = true;
+        gaud_mp3e_quantize_granule(&input, &enc->layout[layout_index[gr]], enc->row,
+            enc->version, &enc->coded[gr][ch]);
+      }
+    }
+  }
 
   /* Scalefactor reuse between the two granules of an MPEG-1 frame. */
   uint8_t scfsi[2] = {0, 0};
