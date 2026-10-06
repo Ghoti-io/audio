@@ -360,3 +360,26 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
   return best_score.over >= MP3E_MAX_BANDS ? best_score.over - MP3E_MAX_BANDS
                                            : best_score.over;
 }
+
+uint32_t gaud_mp3e_estimate_bits(const MP3E_Layout * layout,
+    const int32_t * spectrum, const uint64_t * allowed) {
+  uint64_t total_q8 = 0;
+  for (unsigned r = 0; r < layout->count; ++r) {
+    const MP3E_Band * band = &layout->band[r];
+    uint64_t energy = 0;
+    for (unsigned i = band->start; i < (unsigned)band->start + band->width; ++i) {
+      int64_t scaled = (int64_t)spectrum[layout->order[i]] / (1 << MP3E_ENERGY_SHIFT);
+      energy += (uint64_t)(scaled * scaled);
+    }
+    uint64_t limit = allowed[r] ? allowed[r] : 1u;
+    if (energy <= limit) {
+      continue;
+    }
+    /* width * log2(1 + sqrt(energy / limit)), the perceptual entropy. */
+    int32_t diff = gaud_mp3e_log2_q8(energy) - gaud_mp3e_log2_q8(limit);
+    uint32_t root = gaud_mp3e_exp2_q8(diff / 2);
+    int32_t bits_q8 = gaud_mp3e_log2_q8(65536u + (uint64_t)root) - 16 * 256;
+    total_q8 += (uint64_t)band->width * (uint64_t)bits_q8;
+  }
+  return (uint32_t)(total_q8 >> 8);
+}

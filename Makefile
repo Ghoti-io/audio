@@ -804,6 +804,7 @@ check-mp3enc-tables: ## Fail if the MP3 encoder's generated tables are not what 
 # committed ones and not from the standard; the decoder's own are what
 # check-mpeg's references vouch for.
 	@python3 tools/tables/gen_mp3enc_tables.py --check
+	@python3 tools/tables/gen_mp3enc_psy.py --check
 
 check-opus-tables: ## Fail if the generated Opus tables are not what the RFC yields
 # Needs the network, so it is asked for by name and is not in TEST_GATES.

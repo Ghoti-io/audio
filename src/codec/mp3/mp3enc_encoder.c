@@ -68,6 +68,19 @@ typedef struct {
   uint64_t slot_end;   ///< And one past its last.
 } Queued;
 
+/** How many analysed granules are held: two to make a frame, one more
+ *  waiting for its successor's verdict on whether it starts a transient,
+ *  and one arriving. */
+#define RING 4u
+
+/** One granule's transforms and verdict. */
+typedef struct {
+  int32_t spectrum[4][2][MP3E_LINES]; ///< By block type, channel.
+  MP3E_Psy_Result psy[2];
+  bool attack;
+  int type; ///< Block type, or -1 until its successor has been seen.
+} Analysed;
+
 typedef struct {
   const GAUD_Allocator * allocator;
   GAUD_Stream * stream;
@@ -86,10 +99,18 @@ typedef struct {
 
   MP3E_Layout layout[2]; ///< Long, short.
   MP3E_Filter filter[2];
+  MP3E_Psy_Rate psy_rate;
+  MP3E_Psy_Channel psy[2];
   int16_t pcm[2][MP3E_LINES];
   unsigned fill;
-  int32_t spectrum[2][2][MP3E_LINES];
-  unsigned pending;
+  Analysed * ring;        ///< Granules analysed and not yet coded.
+  int32_t mid_side[2][2][MP3E_LINES]; ///< A frame's spectra as mid and side.
+  uint64_t analysed;      ///< Granules analysed so far.
+  uint64_t decided;       ///< Of those, how many have a block type.
+  uint64_t coded_granules;
+  int previous_type;      ///< Block type of the granule before the next.
+  uint64_t window_energy[2][2][14]; ///< Last two short windows' band energies.
+  int snr_offset_q8;
   MP3E_Granule coded[2][2];
 
   uint64_t cursor;
@@ -211,21 +232,35 @@ static void place_data(MP3_Encoder * enc, const unsigned char * data, size_t siz
 
 /* -------------------------------------------------------------- the frame */
 
-/**
- * Noise each band may carry, for now: a fixed signal-to-noise ratio below
- * the band's own energy. The psychoacoustic model replaces it; what stays
- * is the shape of the answer, one number per band in bitstream order.
- */
-static void provisional_allowed(const MP3E_Layout * layout,
-    const int32_t * spectrum, uint64_t * allowed) {
-  for (unsigned r = 0; r < layout->count; ++r) {
-    const MP3E_Band * band = &layout->band[r];
-    uint64_t e = 0;
-    for (unsigned i = band->start; i < (unsigned)band->start + band->width; ++i) {
-      int64_t scaled = (int64_t)spectrum[layout->order[i]] / (1 << MP3E_ENERGY_SHIFT);
-      e += (uint64_t)(scaled * scaled);
+static Analysed * slot_of(MP3_Encoder * enc, uint64_t granule) {
+  return &enc->ring[granule % RING];
+}
+
+/** The model's thresholds for one channel, in the quantiser's run order. */
+static void allowed_for(const Analysed * slot, unsigned ch, unsigned type,
+    unsigned sfb_count, uint64_t * out) {
+  if (type == 2u) {
+    for (unsigned b = 0; b < sfb_count; ++b) {
+      for (unsigned w = 0; w < 3u; ++w) {
+        out[3u * b + w] = slot->psy[ch].allowed_short[w][b];
+      }
     }
-    allowed[r] = e / 128u + 64u;
+  }
+  else {
+    for (unsigned b = 0; b < sfb_count; ++b) {
+      out[b] = slot->psy[ch].allowed_long[b];
+    }
+  }
+}
+
+/** Middle and side of two spectra, in place of left and right. */
+static void to_middle_side(const int32_t * left, const int32_t * right,
+    int32_t * middle, int32_t * side) {
+  for (unsigned i = 0; i < MP3E_LINES; ++i) {
+    int64_t sum = (int64_t)left[i] + right[i];
+    int64_t difference = (int64_t)left[i] - right[i];
+    middle[i] = (int32_t)((sum * gaud_mp3_inv_sqrt2 + (1 << (MP3_Q - 1))) >> MP3_Q);
+    side[i] = (int32_t)((difference * gaud_mp3_inv_sqrt2 + (1 << (MP3_Q - 1))) >> MP3_Q);
   }
 }
 
@@ -234,7 +269,7 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
       .version = enc->version,
       .bitrate_index = enc->bitrate_index,
       .rate_index = enc->rate_index,
-      .mode = enc->channels == 1u ? MP3_MODE_SINGLE_CHANNEL : MP3_MODE_STEREO,
+      .mode = enc->channels == 1u ? MP3_MODE_SINGLE_CHANNEL : MP3_MODE_JOINT_STEREO,
       .channels = enc->channels,
       .bitrate = enc->bitrate,
       .sample_rate = enc->sample_rate,
@@ -251,7 +286,6 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
     return GAUD_ERR_INTERNAL;
   }
   uint32_t area = total - head;
-
   if (enc->queue_count >= QUEUE_FRAMES) {
     return GAUD_ERR_INTERNAL;
   }
@@ -260,36 +294,110 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
     return GAUD_ERR_INTERNAL;
   }
 
-  /* Budget: the frame's own bytes, and half of what has been saved. */
-  uint32_t frame_bits = 8u * area + 4u * (uint32_t)reservoir;
-  uint32_t hard_bits = 8u * (area + (uint32_t)reservoir);
-  unsigned units = enc->granules * enc->channels;
+  unsigned channels = enc->channels;
+  unsigned granules = enc->granules;
+  uint64_t first = enc->coded_granules;
+  /* The spectra and thresholds this frame is coded from, per granule and
+   * channel, in left/right or - for a frame that chooses it - mid/side. */
+  int32_t (*mid_side)[2][MP3E_LINES] = enc->mid_side;
+  uint64_t allowed[2][2][MP3E_MAX_BANDS];
+  const int32_t * spectrum[2][2];
+  unsigned type[2];
+
+  unsigned layout_index[2];
+  for (unsigned gr = 0; gr < granules; ++gr) {
+    Analysed * slot = slot_of(enc, first + gr);
+    type[gr] = (unsigned)slot->type;
+    layout_index[gr] = type[gr] == 2u ? 1u : 0u;
+    for (unsigned ch = 0; ch < channels; ++ch) {
+      spectrum[gr][ch] = slot->spectrum[type[gr]][ch];
+      allowed_for(slot, ch, type[gr], enc->layout[layout_index[gr]].sfb_count, allowed[gr][ch]);
+    }
+  }
+
+  bool middle_side = false;
+  if (channels == 2u) {
+    uint64_t lr = 0;
+    uint64_t ms = 0;
+    uint64_t ms_allowed[2][MP3E_MAX_BANDS];
+    for (unsigned gr = 0; gr < granules; ++gr) {
+      const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
+      to_middle_side(spectrum[gr][0], spectrum[gr][1], mid_side[gr][0], mid_side[gr][1]);
+      for (unsigned r = 0; r < layout->count; ++r) {
+        uint64_t m = allowed[gr][0][r] < allowed[gr][1][r] ? allowed[gr][0][r] : allowed[gr][1][r];
+        ms_allowed[0][r] = m;
+        ms_allowed[1][r] = m;
+      }
+      lr += gaud_mp3e_estimate_bits(layout, spectrum[gr][0], allowed[gr][0]);
+      lr += gaud_mp3e_estimate_bits(layout, spectrum[gr][1], allowed[gr][1]);
+      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][0], ms_allowed[0]);
+      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][1], ms_allowed[1]);
+    }
+    middle_side = ms < lr;
+    if (middle_side) {
+      for (unsigned gr = 0; gr < granules; ++gr) {
+        const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
+        for (unsigned r = 0; r < layout->count; ++r) {
+          uint64_t m = allowed[gr][0][r] < allowed[gr][1][r] ? allowed[gr][0][r] : allowed[gr][1][r];
+          allowed[gr][0][r] = m;
+          allowed[gr][1][r] = m;
+        }
+        spectrum[gr][0] = mid_side[gr][0];
+        spectrum[gr][1] = mid_side[gr][1];
+      }
+      header.mode_extension = 2u;
+    }
+  }
+
+  /* What each granule-channel deserves: its perceptual entropy, scaled to
+   * what the frame has. The frame has its own bytes, and - when it wants
+   * more than that - part of what the reservoir has saved. */
+  unsigned units = granules * channels;
+  uint32_t want[4];
+  uint64_t wanted = 0;
+  for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
+    const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
+    for (unsigned ch = 0; ch < channels; ++ch, ++u) {
+      uint32_t pe = gaud_mp3e_estimate_bits(layout, spectrum[gr][ch], allowed[gr][ch]);
+      want[u] = pe < 200u ? 200u : pe;
+      wanted += want[u];
+    }
+  }
+  uint64_t base = 8u * (uint64_t)area;
+  uint64_t reservoir_bits = 8u * reservoir;
+  uint64_t budget = base;
+  if (wanted > base) {
+    uint64_t extra = wanted - base;
+    uint64_t usable = reservoir_bits * 6u / 10u;
+    budget = base + (extra < usable ? extra : usable);
+  }
+  uint32_t hard_bits = (uint32_t)(8u * (area + reservoir));
 
   uint32_t spent = 0;
-  unsigned done = 0;
-  for (unsigned gr = 0; gr < enc->granules; ++gr) {
-    for (unsigned ch = 0; ch < enc->channels; ++ch, ++done) {
+  for (unsigned gr = 0, u = 0; gr < granules; ++gr) {
+    for (unsigned ch = 0; ch < channels; ++ch, ++u) {
       MP3E_Quant_Input input;
       memset(&input, 0, sizeof(input));
-      input.spectrum = enc->spectrum[gr][ch];
-      input.block_type = 0;
-      provisional_allowed(&enc->layout[0], input.spectrum, input.allowed);
-      uint32_t share = (frame_bits - (spent < frame_bits ? spent : frame_bits)) / (units - done);
+      input.spectrum = spectrum[gr][ch];
+      input.block_type = (uint8_t)type[gr];
+      memcpy(input.allowed, allowed[gr][ch], sizeof(input.allowed));
+      uint64_t share = budget * want[u] / wanted;
       if (share > MP3E_MAX_PART23) {
         share = MP3E_MAX_PART23;
       }
-      input.target_bits = share;
-      input.hard_bits = hard_bits - spent;
-      gaud_mp3e_quantize_granule(
-          &input, &enc->layout[0], enc->row, enc->version, &enc->coded[gr][ch]);
+      input.target_bits = (uint32_t)share;
+      input.hard_bits = hard_bits - (spent < hard_bits ? spent : hard_bits);
+      gaud_mp3e_quantize_granule(&input, &enc->layout[layout_index[gr]], enc->row,
+          enc->version, &enc->coded[gr][ch]);
       spent += enc->coded[gr][ch].side.part2_3_length;
     }
   }
+  (void)units;
 
   /* Scalefactor reuse between the two granules of an MPEG-1 frame. */
   uint8_t scfsi[2] = {0, 0};
   if (enc->version == MP3_MPEG1) {
-    for (unsigned ch = 0; ch < enc->channels; ++ch) {
+    for (unsigned ch = 0; ch < channels; ++ch) {
       MP3E_Granule * g0 = &enc->coded[0][ch];
       MP3E_Granule * g1 = &enc->coded[1][ch];
       if (g0->side.block_type == 2u || g1->side.block_type == 2u) {
@@ -319,8 +427,8 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
   memset(data, 0, sizeof(data));
   MP3E_Bits bits;
   gaud_mp3e_bits_init(&bits, data, sizeof(data));
-  for (unsigned gr = 0; gr < enc->granules; ++gr) {
-    for (unsigned ch = 0; ch < enc->channels; ++ch) {
+  for (unsigned gr = 0; gr < granules; ++gr) {
+    for (unsigned ch = 0; ch < channels; ++ch) {
       MP3E_Granule * g = &enc->coded[gr][ch];
       size_t before = bits.bits;
       gaud_mp3e_scalefactor_write(&bits, g, enc->version);
@@ -356,19 +464,118 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
     enc->cursor += data_bytes - sizeof(data);
   }
   ++enc->audio_frames;
+  enc->coded_granules += granules;
   return emit_ready(enc, false);
 }
 
-static GAUD_Result process_granule(MP3_Encoder * enc) {
-  for (unsigned ch = 0; ch < enc->channels; ++ch) {
-    gaud_mp3e_filter_analyze(&enc->filter[ch], enc->pcm[ch], 1u);
-    gaud_mp3e_filter_transform(&enc->filter[ch], 0, enc->spectrum[enc->pending][ch]);
+/**
+ * Decide the block type of granule @p which, now that it is known whether
+ * the granule after it starts a transient.
+ *
+ * The legal sequences are the format's: a long block may be followed by a
+ * start block, which must be followed by a short one; short blocks run
+ * until a stop block, which is followed by a long block or - because the
+ * standard allows it - another start block. Everything below is those
+ * three rules and nothing else.
+ */
+static void decide_type(MP3_Encoder * enc, uint64_t which, bool next_attack) {
+  Analysed * slot = slot_of(enc, which);
+  int previous = enc->previous_type;
+  int type;
+  if (previous == 1) {
+    type = 2;
   }
-  if (++enc->pending == enc->granules) {
-    enc->pending = 0;
-    return encode_frame(enc);
+  else if (slot->attack) {
+    type = 2;
+  }
+  else if (next_attack) {
+    type = previous == 2 ? 2 : 1;
+  }
+  else {
+    type = previous == 2 ? 3 : 0;
+  }
+  slot->type = type;
+  enc->previous_type = type;
+  ++enc->decided;
+}
+
+/** Code every frame whose granules all have a block type. */
+static GAUD_Result drain(MP3_Encoder * enc) {
+  while (enc->decided >= enc->coded_granules + enc->granules) {
+    GAUD_Result result = encode_frame(enc);
+    if (result != GAUD_OK) {
+      return result;
+    }
   }
   return GAUD_OK;
+}
+
+/**
+ * Whether a short window of channel @p ch starts a transient.
+ *
+ * A transient is a window much louder, in some band that matters, than the
+ * two before it. "Matters" is the model's own: a band counts only if its
+ * energy is well above the noise the long transform would be allowed to
+ * leave there, because noise below the signal is masked and noise above it
+ * is exactly the pre-echo a short block exists to avoid. "Much louder" is
+ * measured against the larger of the two preceding windows plus a floor of
+ * a quarter of that same noise, so that a window following silence is
+ * judged against what the noise would be and not against nothing; and the
+ * larger of two, not the last, so that a voiced sound's pulse train - loud
+ * every second window - is not mistaken for a series of onsets.
+ */
+static bool detect_attack(MP3_Encoder * enc, Analysed * slot, unsigned ch) {
+  const MP3E_Layout * layout = &enc->layout[1];
+  bool attack = false;
+  const uint16_t * bounds = gaud_mp3_sfb_short[enc->row];
+  for (unsigned w = 0; w < 3u; ++w) {
+    uint64_t energy[14];
+    for (unsigned b = 0; b < layout->sfb_count; ++b) {
+      const MP3E_Band * band = &layout->band[3u * b + w];
+      uint64_t e = 0;
+      for (unsigned i = band->start; i < (unsigned)band->start + band->width; ++i) {
+        int64_t scaled = (int64_t)slot->spectrum[2][ch][layout->order[i]]
+            / (1 << MP3E_ENERGY_SHIFT);
+        e += (uint64_t)(scaled * scaled);
+      }
+      energy[b] = e;
+      uint64_t noise = 0;
+      for (unsigned k = 3u * bounds[b]; k < 3u * bounds[b + 1u]; ++k) {
+        noise += slot->psy[ch].allowed_line[k];
+      }
+      uint64_t before = enc->window_energy[ch][0][b] > enc->window_energy[ch][1][b]
+          ? enc->window_energy[ch][0][b]
+          : enc->window_energy[ch][1][b];
+      if (e > 4u * noise && e / 10u > before + noise / 4u) {
+        attack = true;
+      }
+    }
+    memcpy(enc->window_energy[ch][1], enc->window_energy[ch][0], sizeof(energy));
+    memcpy(enc->window_energy[ch][0], energy, sizeof(energy));
+  }
+  return attack;
+}
+
+static GAUD_Result process_granule(MP3_Encoder * enc) {
+  uint64_t g = enc->analysed++;
+  Analysed * slot = slot_of(enc, g);
+  slot->attack = false;
+  slot->type = -1;
+  for (unsigned ch = 0; ch < enc->channels; ++ch) {
+    gaud_mp3e_filter_analyze(&enc->filter[ch], enc->pcm[ch], 1u);
+    for (unsigned t = 0; t < 4u; ++t) {
+      gaud_mp3e_filter_transform(&enc->filter[ch], t, slot->spectrum[t][ch]);
+    }
+    gaud_mp3e_psy_analyze(&enc->psy_rate, &enc->psy[ch], enc->pcm[ch],
+        enc->snr_offset_q8, &slot->psy[ch]);
+    if (detect_attack(enc, slot, ch)) {
+      slot->attack = true;
+    }
+  }
+  if (g >= 1u) {
+    decide_type(enc, g - 1u, slot->attack);
+  }
+  return drain(enc);
 }
 
 /* -------------------------------------------------------------- vtable */
@@ -408,23 +615,36 @@ static GAUD_Result encoder_finish(GAUD_Encoder * encoder) {
   if (enc->sticky != GAUD_OK) {
     return enc->sticky;
   }
-  /* Enough zeros to flush the filters, and then to end on a whole frame. */
+  /* Enough zeros to flush the filters, and then to end on a whole frame,
+   * and one granule more: each granule's block type waits on its
+   * successor, so the last one coded needs a successor to ask. */
   uint64_t need = enc->samples_in + TOTAL_DELAY;
-  uint64_t have = (enc->audio_frames * enc->granules + enc->pending) * MP3E_LINES
-      + enc->fill;
-  while (have < need || enc->pending != 0 || enc->fill != 0) {
+  uint64_t frame_samples = (uint64_t)enc->granules * MP3E_LINES;
+  uint64_t target_granules = (need + frame_samples - 1u) / frame_samples * enc->granules;
+  uint64_t have = enc->analysed;
+  if (enc->fill != 0) {
     while (enc->fill < MP3E_LINES) {
       for (unsigned ch = 0; ch < enc->channels; ++ch) {
         enc->pcm[ch][enc->fill] = 0;
       }
       ++enc->fill;
-      ++have;
     }
     enc->fill = 0;
     GAUD_Result result = process_granule(enc);
     if (result != GAUD_OK) {
       return result;
     }
+    have = enc->analysed;
+  }
+  while (have < target_granules + 1u) {
+    for (unsigned ch = 0; ch < enc->channels; ++ch) {
+      memset(enc->pcm[ch], 0, sizeof(enc->pcm[ch]));
+    }
+    GAUD_Result result = process_granule(enc);
+    if (result != GAUD_OK) {
+      return result;
+    }
+    have = enc->analysed;
   }
   GAUD_Result result = emit_ready(enc, true);
   if (result != GAUD_OK) {
@@ -453,6 +673,7 @@ static void encoder_close(GAUD_Encoder * encoder) {
     return;
   }
   gcu_allocator_free(enc->allocator, enc->queue);
+  gcu_allocator_free(enc->allocator, enc->ring);
   gcu_allocator_free(enc->allocator, enc);
 }
 
@@ -499,10 +720,14 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   }
   memset(enc, 0, sizeof(*enc));
   enc->queue = gcu_allocator_malloc(allocator, sizeof(Queued) * QUEUE_FRAMES);
-  if (!enc->queue) {
+  enc->ring = gcu_allocator_malloc(allocator, sizeof(Analysed) * RING);
+  if (!enc->queue || !enc->ring) {
+    gcu_allocator_free(allocator, enc->queue);
+    gcu_allocator_free(allocator, enc->ring);
     gcu_allocator_free(allocator, enc);
     return GAUD_ERR_OOM;
   }
+  memset(enc->ring, 0, sizeof(Analysed) * RING);
   enc->allocator = allocator;
   enc->stream = stream;
   enc->meta = params->meta;
@@ -524,7 +749,9 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   gaud_mp3e_layout(&enc->layout[1], enc->row, true);
   for (unsigned ch = 0; ch < 2u; ++ch) {
     gaud_mp3e_filter_reset(&enc->filter[ch]);
+    gaud_mp3e_psy_channel_reset(&enc->psy[ch]);
   }
+  gaud_mp3e_psy_rate_init(&enc->psy_rate, 3u * (unsigned)version + rate_index, enc->row);
   enc->sticky = GAUD_OK;
 
   GAUD_Result failure = GAUD_OK;
@@ -554,6 +781,7 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   }
   if (failure != GAUD_OK) {
     gcu_allocator_free(allocator, enc->queue);
+    gcu_allocator_free(allocator, enc->ring);
     gcu_allocator_free(allocator, enc);
   }
   return failure;

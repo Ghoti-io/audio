@@ -53,6 +53,7 @@
 #include <ghoti.io/audio/macros.h>
 #include "mp3_internal.h"
 #include "mp3_tables.h"
+#include "mp3enc_psy_tables.h"
 #include "mp3enc_tables.h"
 
 #ifdef __cplusplus
@@ -228,6 +229,15 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
     const MP3E_Layout * layout, unsigned row, MP3_Version version,
     MP3E_Granule * out);
 
+/**
+ * What a spectrum would cost to code with noise held to @p allowed: the
+ * perceptual entropy, sum of width * log2(1 + sqrt(energy / allowed)) over
+ * the bands that need any, in bits. Used to compare ways of coding the
+ * same granule and to decide how many bits it deserves.
+ */
+uint32_t gaud_mp3e_estimate_bits(const MP3E_Layout * layout,
+    const int32_t * spectrum, const uint64_t * allowed);
+
 /* -------------------------------------------------------- filterbank */
 
 typedef struct {
@@ -253,6 +263,68 @@ void gaud_mp3e_filter_analyze(
  */
 void gaud_mp3e_filter_transform(
     const MP3E_Filter * filter, unsigned block_type, int32_t out[MP3E_LINES]);
+
+
+/* ------------------------------------------------ the psychoacoustic model */
+
+/** Per-sampling-frequency tables the model derives once at open. */
+typedef struct {
+  unsigned psy_row;    ///< Version * 3 + rate index: the generated tables' row.
+  unsigned band_row;   ///< The scalefactor band tables' row.
+  unsigned long_count; ///< Partitions of the 1024-point spectrum.
+  unsigned short_count;
+  /** Spreading of masking from partition i to j, Q16; and each j's norm. */
+  uint32_t long_spread[MP3E_MAX_LONG_PARTS][MP3E_MAX_LONG_PARTS];
+  uint32_t long_norm[MP3E_MAX_LONG_PARTS];
+  uint32_t short_spread[MP3E_MAX_SHORT_PARTS][MP3E_MAX_SHORT_PARTS];
+  uint32_t short_norm[MP3E_MAX_SHORT_PARTS];
+  /** Which partition each MDCT line's frequency falls in. */
+  uint8_t long_line_part[MP3E_LINES];
+  uint8_t short_line_part[192];
+  /** Bins in each partition. */
+  uint16_t long_bins[MP3E_MAX_LONG_PARTS];
+  uint16_t short_bins[MP3E_MAX_SHORT_PARTS];
+} MP3E_Psy_Rate;
+
+/** What the model concludes about one channel of one granule. */
+typedef struct {
+  /** Noise each scalefactor band may carry, in the quantiser's units. */
+  uint64_t allowed_long[23];
+  uint64_t allowed_short[3][14];
+  /** Perceptual entropy, in bits, of coding it long or as three short. */
+  uint32_t pe_long;
+  uint32_t pe_short;
+  /** The noise each line of the long transform may carry, which is what a
+   *  transient detector compares the short windows' energies against. */
+  uint64_t allowed_line[MP3E_LINES];
+} MP3E_Psy_Result;
+
+/** Everything the model remembers of one channel between granules. */
+typedef struct {
+  int16_t history[3u * MP3E_LINES]; ///< The last three granules' samples.
+  int32_t long_re[2][513];          ///< The last two long spectra.
+  int32_t long_im[2][513];
+  uint32_t long_mag[2][513];
+  int32_t short_re[2][129];         ///< The last two short spectra.
+  int32_t short_im[2][129];
+  uint32_t short_mag[2][129];
+  uint64_t long_previous[MP3E_MAX_LONG_PARTS]; ///< The last thresholds.
+} MP3E_Psy_Channel;
+
+void gaud_mp3e_psy_rate_init(
+    MP3E_Psy_Rate * rate, unsigned psy_row, unsigned band_row);
+
+void gaud_mp3e_psy_channel_reset(MP3E_Psy_Channel * channel);
+
+/**
+ * Take in a granule's 576 samples and say what its neighbourhood permits.
+ *
+ * @param snr_offset_q8 Decibels (Q8) added to the signal-to-noise ratio
+ *   the model demands under each band: positive is stricter and costs bits.
+ */
+void gaud_mp3e_psy_analyze(const MP3E_Psy_Rate * rate,
+    MP3E_Psy_Channel * channel, const int16_t * samples, int snr_offset_q8,
+    MP3E_Psy_Result * out);
 
 /* ----------------------------------------------------------- the frame */
 

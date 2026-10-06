@@ -48,6 +48,7 @@
 #include <ghoti.io/audio/audio.h>
 #include <ghoti.io/audio/codec_sdk.h>
 #include <gtest/gtest.h>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -423,6 +424,275 @@ TEST(Mp3EncodeRoundTrip, TheBufferSizeDoesNotChangeTheBytes) {
 TEST(Mp3EncodeRoundTrip, EncodingTwiceGivesTheSameBytes) {
   Pcm pcm = Tone(2, 20000, 44100);
   EXPECT_EQ(Encode(pcm, 2, 44100, 192000), Encode(pcm, 2, 44100, 192000));
+}
+
+/* ---------------------------------------------- the psychoacoustic model */
+
+/** Run the model on @p granules of @p make(sample index), return the last result. */
+template <typename F>
+MP3E_Psy_Result RunPsy(F make, unsigned granules, const MP3E_Psy_Rate & rate,
+    int32_t * spectrum, int snr_offset = 0) {
+  MP3E_Psy_Channel channel;
+  gaud_mp3e_psy_channel_reset(&channel);
+  MP3E_Filter filter;
+  gaud_mp3e_filter_reset(&filter);
+  MP3E_Psy_Result result;
+  for (unsigned g = 0; g < granules; ++g) {
+    int16_t pcm[576];
+    for (unsigned i = 0; i < 576; ++i) {
+      pcm[i] = make(g * 576u + i);
+    }
+    gaud_mp3e_psy_analyze(&rate, &channel, pcm, snr_offset, &result);
+    gaud_mp3e_filter_analyze(&filter, pcm, 1);
+  }
+  gaud_mp3e_filter_transform(&filter, 0, spectrum);
+  return result;
+}
+
+double BandEnergy(const int32_t * spectrum, unsigned from, unsigned to) {
+  double e = 0;
+  for (unsigned k = from; k < to; ++k) {
+    double v = (double)(spectrum[k] >> MP3E_ENERGY_SHIFT);
+    e += v * v;
+  }
+  return e;
+}
+
+TEST(Mp3EncodePsy, ATonesMaskingIsEighteenDecibelsDownAndNoiseSixIsNot) {
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  int32_t spectrum[576];
+  uint32_t state = 7;
+  auto tone = [&](unsigned n) {
+    state = state * 1664525u + 1013904223u;
+    double noise = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+    return (int16_t)std::lround(10000.0 * std::sin(2 * M_PI * 1000.0 * n / 44100.0) + 60.0 * noise);
+  };
+  /* Long enough for the pre-echo rule - a threshold may not more than
+   * double from one granule to the next - to have let it settle. */
+  MP3E_Psy_Result r = RunPsy(tone, 90, rate, spectrum);
+  const uint16_t * bounds = gaud_mp3_sfb_long[0];
+  /* The band holding 1 kHz is the sixth: lines 24 to 30. */
+  double signal = BandEnergy(spectrum, bounds[6], bounds[7]);
+  double allowed = (double)r.allowed_long[6];
+  double db = 10.0 * std::log10(signal / allowed);
+  EXPECT_GT(db, 15.0) << "a tone is masked less than that";
+  EXPECT_LT(db, 24.0) << "and more than that is not the model";
+
+  state = 99;
+  auto noise = [&](unsigned) {
+    state = state * 1664525u + 1013904223u;
+    double v = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+    return (int16_t)std::lround(4000.0 * v);
+  };
+  r = RunPsy(noise, 90, rate, spectrum);
+  /* Several bands, away from the edges: a noise masker has a signal-to-noise
+   * ratio of six decibels, less what the normalisation by the spreading
+   * function's width takes. */
+  for (unsigned b = 12; b < 18; ++b) {
+    double e = BandEnergy(spectrum, bounds[b], bounds[b + 1]);
+    double d = 10.0 * std::log10(e / (double)r.allowed_long[b]);
+    EXPECT_GT(d, 3.0) << "band " << b;
+    EXPECT_LT(d, 9.0) << "band " << b;
+  }
+}
+
+TEST(Mp3EncodePsy, AStricterOffsetLowersEveryThreshold) {
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  int32_t spectrum[576];
+  uint32_t state = 5;
+  auto noise = [&](unsigned) {
+    state = state * 1664525u + 1013904223u;
+    return (int16_t)(((int32_t)(state >> 8) - 8388608) / 2200);
+  };
+  MP3E_Psy_Result loose = RunPsy(noise, 60, rate, spectrum, 0);
+  state = 5;
+  MP3E_Psy_Result strict = RunPsy(noise, 60, rate, spectrum, 6 * 256);
+  for (unsigned b = 10; b < 18; ++b) {
+    double ratio = (double)strict.allowed_long[b] / (double)loose.allowed_long[b];
+    EXPECT_NEAR(10.0 * std::log10(ratio), -6.0, 1.0) << "band " << b;
+  }
+}
+
+TEST(Mp3EncodePsy, SilenceIsLeftToTheThresholdOfHearing) {
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  int32_t spectrum[576];
+  MP3E_Psy_Result r = RunPsy([](unsigned) { return (int16_t)0; }, 20, rate, spectrum);
+  for (unsigned b = 0; b < 22; ++b) {
+    EXPECT_GT(r.allowed_long[b], 0u) << "band " << b;
+  }
+  EXPECT_EQ(r.pe_long, 0u) << "nothing to code";
+}
+
+/* ------------------------------------------------------- block switching */
+
+/** The block type of every granule-channel of a stereo MPEG-1 file, and
+ *  whether each frame used middle/side. */
+struct SideInfo {
+  std::vector<std::array<int, 4>> types; ///< Per frame: gr0 ch0, ch1, gr1 ch0, ch1.
+  std::vector<bool> middle_side;
+  uint32_t max_back = 0;
+};
+
+SideInfo ReadSideInfo(const std::vector<unsigned char> & mp3) {
+  SideInfo info;
+  MP3_Header first;
+  EXPECT_TRUE(gaud_mp3_header_parse(mp3.data(), &first));
+  size_t at = first.frame_size;
+  while (at + 4 <= mp3.size()) {
+    MP3_Header h;
+    if (!gaud_mp3_header_parse(mp3.data() + at, &h)) {
+      break;
+    }
+    MP3_Bits bits;
+    gaud_mp3_bits_init(&bits, mp3.data() + at + 4, gaud_mp3_side_info_size(&h));
+    uint32_t back = gaud_mp3_bits_read(&bits, 9);
+    info.max_back = std::max(info.max_back, back);
+    gaud_mp3_bits_read(&bits, 3);
+    gaud_mp3_bits_read(&bits, 8);
+    std::array<int, 4> t = {0, 0, 0, 0};
+    for (unsigned gr = 0; gr < 2; ++gr) {
+      for (unsigned ch = 0; ch < 2; ++ch) {
+        gaud_mp3_bits_read(&bits, 12 + 9 + 8 + 4);
+        unsigned ws = gaud_mp3_bits_read(&bits, 1);
+        unsigned type = 0;
+        if (ws) {
+          type = gaud_mp3_bits_read(&bits, 2);
+          gaud_mp3_bits_read(&bits, 1 + 10 + 9);
+        }
+        else {
+          gaud_mp3_bits_read(&bits, 15 + 4 + 3);
+        }
+        gaud_mp3_bits_read(&bits, 3);
+        t[gr * 2 + ch] = (int)type;
+      }
+    }
+    info.types.push_back(t);
+    info.middle_side.push_back((h.mode_extension & 2u) != 0);
+    at += h.frame_size;
+  }
+  return info;
+}
+
+/** Quiet noise with loud bursts of noise at irregular spacing. */
+Pcm Bursts(unsigned channels, size_t frames) {
+  Pcm pcm(frames * channels);
+  uint32_t state = 4242;
+  auto next = [&]() {
+    state = state * 1664525u + 1013904223u;
+    return ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+  };
+  size_t spacing = 7000;
+  for (size_t i = 0; i < frames; ++i) {
+    size_t phase = i % spacing;
+    double envelope = phase < 2200 ? std::exp(-(double)phase / 500.0) : 0.0;
+    for (unsigned c = 0; c < channels; ++c) {
+      double v = 3.0 * next() + 9000.0 * envelope * next();
+      pcm[i * channels + c] = (int16_t)std::lround(v);
+    }
+  }
+  return pcm;
+}
+
+TEST(Mp3EncodeBlocks, TransientsMakeShortBlocksAndTheSequenceIsLegal) {
+  Pcm pcm = Bursts(2, 44100 * 3);
+  SideInfo info = ReadSideInfo(Encode(pcm, 2, 44100, 128000));
+  int counts[4] = {0, 0, 0, 0};
+  int previous[2] = {-1, -1}; /* before the first granule there is nothing */
+  for (const auto & t : info.types) {
+    for (unsigned gr = 0; gr < 2; ++gr) {
+      EXPECT_EQ(t[gr * 2], t[gr * 2 + 1]) << "both channels share a block type";
+      for (unsigned ch = 0; ch < 2; ++ch) {
+        int type = t[gr * 2 + ch];
+        ++counts[type];
+        /* The format's transitions: start is followed by short, short by
+         * short or stop, and nothing else may follow them. */
+        if (previous[ch] == 1) {
+          EXPECT_EQ(type, 2);
+        }
+        if (previous[ch] == 2) {
+          EXPECT_TRUE(type == 2 || type == 3) << "type " << type;
+        }
+        if (type == 2) {
+          EXPECT_TRUE(previous[ch] == -1 || previous[ch] == 1 || previous[ch] == 2);
+        }
+        if (type == 3) {
+          EXPECT_EQ(previous[ch], 2);
+        }
+        previous[ch] = type;
+      }
+    }
+  }
+  EXPECT_GT(counts[1], 0) << "a start block";
+  EXPECT_GT(counts[2], 0) << "a short block";
+  EXPECT_GT(counts[3], 0) << "a stop block";
+  EXPECT_GT(counts[0], counts[2]) << "most of a sparse signal is long";
+}
+
+TEST(Mp3EncodeBlocks, ShortBlocksKeepTheNoiseBeforeAnOnsetDown) {
+  /* A burst of loud noise in near-silence. Coded with one long window the
+   * noise spreads over 1152 samples and is far above the silence well
+   * before the burst; with short blocks it stays within a short window of
+   * it. The window measured is 700 to 420 samples ahead: further than a
+   * short block's noise can reach and well inside a long one's. */
+  size_t frames = 44100;
+  Pcm pcm(frames, 0);
+  uint32_t state = 1;
+  size_t onset = 20000;
+  for (size_t i = 0; i < frames; ++i) {
+    state = state * 1664525u + 1013904223u;
+    double n = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+    double burst = (i >= onset && i < onset + 300) ? 12000.0 : 0.0;
+    pcm[i] = (int16_t)std::lround(2.0 * n + burst * n);
+  }
+  Decoded d = Decode(Encode(pcm, 1, 44100, 128000));
+  ASSERT_EQ(d.frames, frames);
+  double before = 0;
+  double original = 0;
+  for (size_t i = onset - 700; i < onset - 420; ++i) {
+    double e = (double)d.pcm[i] - pcm[i];
+    before += e * e;
+    original += (double)pcm[i] * pcm[i];
+  }
+  /* The silence's own energy is the reference: the noise added there may
+   * be a few times it, not ten thousand. With long blocks alone it is 1.5
+   * million against a hundred and thirty. */
+  EXPECT_LT(before, 30.0 * original) << "pre-echo energy " << before << " against " << original;
+}
+
+TEST(Mp3EncodeStereo, ACorrelatedPairIsCodedAsMiddleAndSide) {
+  Pcm mono = Tone(1, 44100 * 2, 44100);
+  Pcm pcm(mono.size() * 2);
+  for (size_t i = 0; i < mono.size(); ++i) {
+    pcm[2 * i] = mono[i];
+    pcm[2 * i + 1] = mono[i];
+  }
+  std::vector<unsigned char> mp3 = Encode(pcm, 2, 44100, 128000);
+  SideInfo info = ReadSideInfo(mp3);
+  size_t ms = 0;
+  for (bool b : info.middle_side) {
+    ms += b;
+  }
+  EXPECT_GT(ms, info.middle_side.size() * 9 / 10);
+  Decoded d = Decode(mp3);
+  double worst = 0;
+  for (size_t i = 0; i + 1 < d.pcm.size(); i += 2) {
+    worst = std::max(worst, std::fabs((double)d.pcm[i] - d.pcm[i + 1]));
+  }
+  EXPECT_LT(worst, 8.0) << "the side channel carries almost nothing";
+  EXPECT_GT(SnrDb(pcm, d.pcm), 15.0);
+}
+
+TEST(Mp3EncodeStereo, IndependentChannelsAreNotForcedIntoMiddleSide) {
+  Pcm pcm = Tone(2, 44100 * 2, 44100);
+  SideInfo info = ReadSideInfo(Encode(pcm, 2, 44100, 128000));
+  size_t ms = 0;
+  for (bool b : info.middle_side) {
+    ms += b;
+  }
+  EXPECT_LT(ms, info.middle_side.size() / 10);
 }
 
 /* ------------------------------------------------------- the file itself */
