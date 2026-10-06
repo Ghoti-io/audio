@@ -34,44 +34,53 @@
 extern "C" {
 #endif
 
-/** Most partitions of the long (1024-point) and short (256-point) spectra. */
+/** Most partitions of the long (1024-point) spectrum. */
 #define MP3E_MAX_LONG_PARTS 72
+/** Most partitions of the short (256-point) spectrum. */
 #define MP3E_MAX_SHORT_PARTS 48
-/** The spreading table: entries per Bark, Bark below the masker it covers,
- *  and its length. Index 0 is SPREAD_LOW Bark below. */
+/** The spreading table's entries per Bark. */
 #define MP3E_SPREAD_STEP 8
+/** How many Bark below the masker the spreading table reaches; index 0. */
 #define MP3E_SPREAD_LOW 8
+/** And its length. */
 #define MP3E_SPREAD_COUNT 193
 
-/** cos and sin of 2 pi k / 1024, Q30. */
+/** cos of 2 pi k / 1024, Q30. */
 extern const int32_t gaud_mp3enc_fft_cos[512];
+/** sin of 2 pi k / 1024, Q30. */
 extern const int32_t gaud_mp3enc_fft_sin[512];
-/** Hann windows, Q15. */
+/** The 1024-point Hann window, Q15. */
 extern const int16_t gaud_mp3enc_hann_long[1024];
+/** The 256-point Hann window, Q15. */
 extern const int16_t gaud_mp3enc_hann_short[256];
 /** Schroeder's spreading function as linear power, times 65536. */
 extern const uint32_t gaud_mp3enc_spread[193];
 
-/** Partitions per row (version * 3 + rate index), long and short. */
+/** Long partitions per row (version * 3 + rate index). */
 extern const uint8_t gaud_mp3enc_long_parts[9];
+/** Short partitions per row. */
 extern const uint8_t gaud_mp3enc_short_parts[9];
 
-/** The long partitions' first bin, one past their last, Bark centre (Q8)
- * quiet threshold per bin (power units) and the least
- * signal-to-noise ratio (dB, Q8). */
+/** The first bin of each partition. (long) */
 extern const uint16_t gaud_mp3enc_long_lo[9][72];
+/** One past the last bin of each partition. (long) */
 extern const uint16_t gaud_mp3enc_long_hi[9][72];
+/** The Bark scale at each partition's centre, Q8. (long) */
 extern const uint16_t gaud_mp3enc_long_bark[9][72];
+/** The threshold of hearing in each partition, per bin, in power units. (long) */
 extern const uint64_t gaud_mp3enc_long_ath[9][72];
+/** The least signal-to-noise ratio each partition is held to, dB Q8. (long) */
 extern const uint16_t gaud_mp3enc_long_minsnr[9][72];
 
-/** The short partitions' first bin, one past their last, Bark centre (Q8)
- * quiet threshold per bin (power units) and the least
- * signal-to-noise ratio (dB, Q8). */
+/** The first bin of each partition. (short) */
 extern const uint16_t gaud_mp3enc_short_lo[9][48];
+/** One past the last bin of each partition. (short) */
 extern const uint16_t gaud_mp3enc_short_hi[9][48];
+/** The Bark scale at each partition's centre, Q8. (short) */
 extern const uint16_t gaud_mp3enc_short_bark[9][48];
+/** The threshold of hearing in each partition, per bin, in power units. (short) */
 extern const uint64_t gaud_mp3enc_short_ath[9][48];
+/** The least signal-to-noise ratio each partition is held to, dB Q8. (short) */
 extern const uint16_t gaud_mp3enc_short_minsnr[9][48];
 
 #ifdef __cplusplus

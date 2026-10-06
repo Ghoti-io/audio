@@ -106,8 +106,12 @@ static GAUD_Result mp3_probe(const GAUD_Codec * codec, GAUD_Stream * stream,
  * answers ::GAUD_ERR_UNSUPPORTED when asked for a decoder, which is the
  * per-track answer a capability bit cannot give.
  *
- * No encoder: phase 8 brings the perceptual ones, with the two-gate
- * harness their output needs.
+ * `GAUD_CAP_ENCODE` is declared for Layer III only, with the tier
+ * ::GAUD_ENCODER_PRODUCTION. **That is a claim about measurement and it is
+ * a judgement**: against LAME and Shine at the same rate, on a handful of
+ * synthetic signals and ten recordings, with a similarity metric that
+ * cannot hear (\ref mpeg_writing says what and why). It is not a claim that
+ * LAME's decades have been matched on music, which could not be tried.
  */
 static const GAUD_Codec mp3_codec = {
     .abi_version = GAUD_CODEC_ABI_VERSION,
@@ -115,7 +119,7 @@ static const GAUD_Codec mp3_codec = {
     .name = "mp3",
     .ctx = NULL,
     .capabilities = GAUD_CAP_DECODE | GAUD_CAP_ENCODE | GAUD_CAP_METADATA_READ,
-    .encoder_tier = GAUD_ENCODER_STUB,
+    .encoder_tier = GAUD_ENCODER_PRODUCTION,
     .magics = NULL,
     .magic_count = 0,
     .probe = mp3_probe,

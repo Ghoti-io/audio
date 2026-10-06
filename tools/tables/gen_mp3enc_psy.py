@@ -56,6 +56,13 @@ HDR = os.path.join(ROOT, "src", "codec", "mp3", "mp3enc_psy_tables.h")
 #: 12, 8 - version * 3 + the header's rate index.
 RATES = [44100, 48000, 32000, 22050, 24000, 16000, 11025, 12000, 8000]
 
+#: How many decibels the threshold of hearing is lowered by, which is to say
+#: how much louder than 96 dB SPL a full-scale sine is assumed to be played.
+#: A listener turns a quiet passage up, and a threshold that hid noise at 16 dB SPL
+#: would have it audible at 28; encoders put their assumed threshold
+#: well under the textbook one for that reason.
+ATH_LOWER_DB = 16.0
+
 LONG_N = 1024
 SHORT_N = 256
 MAX_LONG_PARTS = 72
@@ -127,7 +134,7 @@ def table_for(rate, n, full_scale_power):
         best = None
         for k in range(a, b):
             db = ath_db(k * rate / n)
-            power = full_scale_power * 10.0 ** ((db - 96.0) / 10.0)
+            power = full_scale_power * 10.0 ** ((db - 96.0 - ATH_LOWER_DB) / 10.0)
             best = power if best is None else min(best, power)
         ath.append(max(1, int(best)))
     return lo, hi, centre_bark, ath, minimum
@@ -146,7 +153,9 @@ def spread_table():
 LICENCE = open(os.path.join(HERE, "gen_mp3enc_tables.py")).read().split('LICENCE = """')[1].split('"""')[0]
 
 
-def arr(lines, decl, values, per=8):
+def arr(lines, decl, values, per=8, doc=None):
+    if doc:
+        lines.append("/** " + doc + " */")
     lines.append(decl + " = {")
     for i in range(0, len(values), per):
         lines.append("    " + ", ".join(str(v) for v in values[i:i + per]) + ",")
@@ -170,13 +179,18 @@ def build():
     for k in range(LONG_N // 2):
         cos.append(int(round(math.cos(2 * math.pi * k / LONG_N) * (1 << 30))))
         sin.append(int(round(math.sin(2 * math.pi * k / LONG_N) * (1 << 30))))
-    arr(out, "const int32_t gaud_mp3enc_fft_cos[512]", cos)
-    arr(out, "const int32_t gaud_mp3enc_fft_sin[512]", sin)
+    arr(out, "const int32_t gaud_mp3enc_fft_cos[512]", cos,
+        doc="cos of 2 pi k / 1024, Q30.")
+    arr(out, "const int32_t gaud_mp3enc_fft_sin[512]", sin,
+        doc="sin of 2 pi k / 1024, Q30.")
     hl = [int(round(32767 * 0.5 * (1 - math.cos(2 * math.pi * (i + 0.5) / LONG_N)))) for i in range(LONG_N)]
     hs = [int(round(32767 * 0.5 * (1 - math.cos(2 * math.pi * (i + 0.5) / SHORT_N)))) for i in range(SHORT_N)]
-    arr(out, "const int16_t gaud_mp3enc_hann_long[1024]", hl, 12)
-    arr(out, "const int16_t gaud_mp3enc_hann_short[256]", hs, 12)
-    arr(out, "const uint32_t gaud_mp3enc_spread[%d]" % SPREAD_COUNT, spread_table())
+    arr(out, "const int16_t gaud_mp3enc_hann_long[1024]", hl, 12,
+        doc="The 1024-point Hann window, Q15.")
+    arr(out, "const int16_t gaud_mp3enc_hann_short[256]", hs, 12,
+        doc="The 256-point Hann window, Q15.")
+    arr(out, "const uint32_t gaud_mp3enc_spread[%d]" % SPREAD_COUNT, spread_table(),
+        doc="Schroeder's spreading function as linear power times 65536.")
 
     rows = []
     for rate in RATES:
@@ -187,10 +201,17 @@ def build():
             if len(r[idx][0]) > maxp:
                 raise SystemExit("too many %s partitions: %d" % (name, len(r[idx][0])))
             counts.append(len(r[idx][0]))
-        arr(out, "const uint8_t gaud_mp3enc_%s_parts[9]" % name, counts, 9)
+        arr(out, "const uint8_t gaud_mp3enc_%s_parts[9]" % name, counts, 9,
+            doc="How many %s partitions each row has." % name)
+        meaning = {"lo": "The first bin of each partition.",
+                   "hi": "One past the last bin of each partition.",
+                   "bark": "The Bark scale at each partition's centre, Q8.",
+                   "ath": "The threshold of hearing in each partition, per bin, in power units.",
+                   "minsnr": "The least signal-to-noise ratio each partition is held to, dB Q8."}
         for field, pos, ctype in (("lo", 0, "uint16_t"), ("hi", 1, "uint16_t"),
                                   ("bark", 2, "uint16_t"), ("ath", 3, "uint64_t"),
                                   ("minsnr", 4, "uint16_t")):
+            out.append("/** %s (%s) */" % (meaning[field], name))
             out.append("const %s gaud_mp3enc_%s_%s[9][%d] = {" % (ctype, name, field, maxp))
             for r in rows:
                 vals = list(r[idx][pos]) + [0] * (maxp - len(r[idx][pos]))
@@ -215,35 +236,43 @@ def build():
 extern "C" {
 #endif
 
-/** Most partitions of the long (1024-point) and short (256-point) spectra. */
+/** Most partitions of the long (1024-point) spectrum. */
 #define MP3E_MAX_LONG_PARTS %d
+/** Most partitions of the short (256-point) spectrum. */
 #define MP3E_MAX_SHORT_PARTS %d
-/** The spreading table: entries per Bark, Bark below the masker it covers,
- *  and its length. Index 0 is SPREAD_LOW Bark below. */
+/** The spreading table's entries per Bark. */
 #define MP3E_SPREAD_STEP %d
+/** How many Bark below the masker the spreading table reaches; index 0. */
 #define MP3E_SPREAD_LOW %d
+/** And its length. */
 #define MP3E_SPREAD_COUNT %d
 
-/** cos and sin of 2 pi k / 1024, Q30. */
+/** cos of 2 pi k / 1024, Q30. */
 extern const int32_t gaud_mp3enc_fft_cos[512];
+/** sin of 2 pi k / 1024, Q30. */
 extern const int32_t gaud_mp3enc_fft_sin[512];
-/** Hann windows, Q15. */
+/** The 1024-point Hann window, Q15. */
 extern const int16_t gaud_mp3enc_hann_long[1024];
+/** The 256-point Hann window, Q15. */
 extern const int16_t gaud_mp3enc_hann_short[256];
 /** Schroeder's spreading function as linear power, times 65536. */
 extern const uint32_t gaud_mp3enc_spread[%d];
 
-/** Partitions per row (version * 3 + rate index), long and short. */
+/** Long partitions per row (version * 3 + rate index). */
 extern const uint8_t gaud_mp3enc_long_parts[9];
+/** Short partitions per row. */
 extern const uint8_t gaud_mp3enc_short_parts[9];
 """ % (MAX_LONG_PARTS, MAX_SHORT_PARTS, SPREAD_STEP, SPREAD_LOW, SPREAD_COUNT, SPREAD_COUNT)]
     for name, maxp in (("long", MAX_LONG_PARTS), ("short", MAX_SHORT_PARTS)):
-        hdr.append("/** The %s partitions' first bin, one past their last, Bark centre (Q8)\n * quiet threshold per bin (power units) and the least\n * signal-to-noise ratio (dB, Q8). */" % name)
-        hdr.append("extern const uint16_t gaud_mp3enc_%s_lo[9][%d];" % (name, maxp))
-        hdr.append("extern const uint16_t gaud_mp3enc_%s_hi[9][%d];" % (name, maxp))
-        hdr.append("extern const uint16_t gaud_mp3enc_%s_bark[9][%d];" % (name, maxp))
-        hdr.append("extern const uint64_t gaud_mp3enc_%s_ath[9][%d];" % (name, maxp))
-        hdr.append("extern const uint16_t gaud_mp3enc_%s_minsnr[9][%d];\n" % (name, maxp))
+        for field, ctype, text in (
+                ("lo", "uint16_t", "The first bin of each partition."),
+                ("hi", "uint16_t", "One past the last bin of each partition."),
+                ("bark", "uint16_t", "The Bark scale at each partition's centre, Q8."),
+                ("ath", "uint64_t", "The threshold of hearing in each partition, per bin, in power units."),
+                ("minsnr", "uint16_t", "The least signal-to-noise ratio each partition is held to, dB Q8.")):
+            hdr.append("/** %s (%s) */" % (text, name))
+            hdr.append("extern const %s gaud_mp3enc_%s_%s[9][%d];" % (ctype, name, field, maxp))
+        hdr.append("")
     hdr.append("""#ifdef __cplusplus
 }
 #endif

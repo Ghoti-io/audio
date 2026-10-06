@@ -527,7 +527,7 @@ MP3E_Psy_Result RunPsy(F make, unsigned granules, const MP3E_Psy_Rate & rate,
     for (unsigned i = 0; i < 576; ++i) {
       pcm[i] = make(g * 576u + i);
     }
-    gaud_mp3e_psy_analyze(&rate, &channel, pcm, snr_offset, &result);
+    gaud_mp3e_psy_analyze(&rate, &channel, pcm, snr_offset, 0, &result);
     gaud_mp3e_filter_analyze(&filter, pcm, 1);
   }
   gaud_mp3e_filter_transform(&filter, 0, spectrum);
@@ -616,6 +616,39 @@ TEST(Mp3EncodePsy, AStricterOffsetLowersEveryThreshold) {
   }
 }
 
+TEST(Mp3EncodePsy, AThresholdMayNotMoreThanDoubleBetweenGranules) {
+  MP3E_Psy_Rate rate;
+  gaud_mp3e_psy_rate_init(&rate, 0, 0);
+  MP3E_Psy_Channel channel;
+  gaud_mp3e_psy_channel_reset(&channel);
+  /* Steady noise, then noise four times the amplitude: sixteen times the
+   * energy, which an uncapped threshold would follow up at once. */
+  MP3E_Psy_Result last{};
+  double worst = 0;
+  for (unsigned g = 0; g < 40; ++g) {
+    int16_t pcm[576];
+    for (unsigned i = 0; i < 576; ++i) {
+      uint32_t x = (g * 576u + i) * 2654435761u + 12345u;
+      x ^= x >> 15;
+      x *= 2246822519u;
+      x ^= x >> 13;
+      int v = (int)(x % 1601u) - 800;
+      pcm[i] = (int16_t)(g >= 20 ? v * 4 : v);
+    }
+    MP3E_Psy_Result now;
+    gaud_mp3e_psy_analyze(&rate, &channel, pcm, 0, 0, &now);
+    if (g > 5) {
+      for (unsigned b = 8; b < 18; ++b) {
+        worst = std::max(worst,
+            (double)now.allowed_long[b] / (double)last.allowed_long[b]);
+      }
+    }
+    last = now;
+  }
+  EXPECT_GT(worst, 1.2) << "the step must have been seen for this to mean anything";
+  EXPECT_LT(worst, 2.6);
+}
+
 TEST(Mp3EncodePsy, SilenceIsLeftToTheThresholdOfHearing) {
   MP3E_Psy_Rate rate;
   gaud_mp3e_psy_rate_init(&rate, 0, 0);
@@ -634,6 +667,7 @@ TEST(Mp3EncodePsy, SilenceIsLeftToTheThresholdOfHearing) {
 struct SideInfo {
   std::vector<std::array<int, 4>> types; ///< Per frame: gr0 ch0, ch1, gr1 ch0, ch1.
   std::vector<bool> middle_side;
+  std::vector<uint32_t> back; ///< Each frame's back-pointer.
   uint32_t max_back = 0;
 };
 
@@ -651,6 +685,7 @@ SideInfo ReadSideInfo(const std::vector<unsigned char> & mp3) {
     gaud_mp3_bits_init(&bits, mp3.data() + at + 4, gaud_mp3_side_info_size(&h));
     uint32_t back = gaud_mp3_bits_read(&bits, 9);
     info.max_back = std::max(info.max_back, back);
+    info.back.push_back(back);
     gaud_mp3_bits_read(&bits, 3);
     gaud_mp3_bits_read(&bits, 8);
     std::array<int, 4> t = {0, 0, 0, 0};
@@ -763,6 +798,51 @@ TEST(Mp3EncodeBlocks, ShortBlocksKeepTheNoiseBeforeAnOnsetDown) {
   EXPECT_LT(before, 30.0 * original) << "pre-echo energy " << before << " against " << original;
 }
 
+/** Steady noise of one level, then of another, at sample @p at. */
+Pcm Steps(unsigned channels, size_t frames, size_t at, double before, double after) {
+  Pcm pcm(frames * channels);
+  uint32_t state = 31337;
+  for (size_t i = 0; i < frames; ++i) {
+    for (unsigned c = 0; c < channels; ++c) {
+      state = state * 1664525u + 1013904223u;
+      double n = ((int32_t)(state >> 8) - 8388608) / 8388608.0;
+      pcm[i * channels + c] = (int16_t)std::lround((i < at ? before : after) * n);
+    }
+  }
+  return pcm;
+}
+
+/** Granules of short or transitional type within three frames of @p frame. */
+int ShortsNear(const SideInfo & info, size_t frame) {
+  int found = 0;
+  for (size_t f = frame > 3 ? frame - 3 : 0; f < info.types.size() && f <= frame + 3; ++f) {
+    for (int t : info.types[f]) {
+      found += t != 0;
+    }
+  }
+  return found;
+}
+
+TEST(Mp3EncodeBlocks, ARiseOfTwelveDecibelsAmongSteadyNoiseIsAnOnset) {
+  /* Four times the amplitude is sixteen times the energy: past the rule's
+   * factor of ten, and nowhere near leaving the earlier window's noise over
+   * the signal, so it is the rise test that has to see it. */
+  size_t at = 44100;
+  SideInfo info = ReadSideInfo(Encode(Steps(2, 44100 * 2, at, 2000.0, 8000.0), 2, 44100, 128000));
+  EXPECT_GT(ShortsNear(info, at / 1152), 0);
+  SideInfo flat = ReadSideInfo(Encode(Steps(2, 44100 * 2, at, 8000.0, 8000.0), 2, 44100, 128000));
+  EXPECT_EQ(ShortsNear(flat, at / 1152), 0) << "steady noise alone does not";
+}
+
+TEST(Mp3EncodeBlocks, AnAbruptStopIsAnEventToo) {
+  /* Loud noise that ends at once. Nothing rises: the energy only falls. The
+   * quiet that follows is where a long window's noise would stand over the
+   * signal, so the decay test has to see it. */
+  size_t at = 44100;
+  SideInfo info = ReadSideInfo(Encode(Steps(2, 44100 * 2, at, 8000.0, 0.0), 2, 44100, 128000));
+  EXPECT_GT(ShortsNear(info, at / 1152), 0);
+}
+
 TEST(Mp3EncodeStereo, ACorrelatedPairIsCodedAsMiddleAndSide) {
   Pcm mono = Tone(1, 44100 * 2, 44100);
   Pcm pcm(mono.size() * 2);
@@ -831,6 +911,31 @@ TEST(Mp3EncodeFile, FramesAreWhereTheirLengthsSayAndTheReservoirIsReachable) {
   EXPECT_EQ(at, mp3.size());
   EXPECT_EQ(frames, tag.frames);
   EXPECT_GT(reservoir_seen, 0u) << "a signal that varies should use the reservoir";
+}
+
+TEST(Mp3EncodeFile, AHardFrameDrawsOnWhatEasyOnesSaved) {
+  /* A plain tone for a second, then loud noise. The reservoir fills while it
+   * is easy and a frame that wants more than its own bytes empties it, so
+   * between two frames the back-pointer must fall by a good part of what it
+   * held - and a stream whose frames never drew on it would never do that. */
+  Pcm pcm = Steps(2, 44100 * 3, 44100, 0.0, 12000.0);
+  for (size_t i = 0; i < 44100; ++i) {
+    pcm[2 * i] = pcm[2 * i + 1]
+        = (int16_t)std::lround(3000.0 * std::sin(2 * M_PI * 700.0 * i / 44100.0));
+  }
+  SideInfo info = ReadSideInfo(Encode(pcm, 2, 44100, 128000));
+  uint32_t previous = 0;
+  uint32_t drop = 0;
+  uint32_t high = 0;
+  for (size_t f = 0; f < info.back.size(); ++f) {
+    high = std::max(high, info.back[f]);
+    if (previous > info.back[f]) {
+      drop = std::max(drop, previous - info.back[f]);
+    }
+    previous = info.back[f];
+  }
+  EXPECT_GT(high, 300u) << "the quiet second fills it";
+  EXPECT_GT(drop, 150u) << "and the loud one drains it";
 }
 
 TEST(Mp3EncodeFile, TheTagStatesTheDelayAndPaddingThatMakeTheLengthExact) {
@@ -987,6 +1092,17 @@ TEST(Mp3EncodeRate, AverageRateLandsNearItsTarget) {
   EXPECT_LT(lo, hi) << "an average-rate file is not a constant one";
 }
 
+TEST(Mp3EncodeRate, ConstantRateAt44100PadsToTheExactAverage) {
+  /* 128 kbit/s at 44.1 kHz is 417.96 bytes a frame, so one in about twenty
+   * frames carries a padding byte; without the carry the file is 0.2 % short,
+   * which over this many frames is a whole frame or more. */
+  Pcm pcm = Tone(1, 44100 * 30, 44100);
+  std::vector<unsigned char> mp3 = Encode(pcm, 1, 44100, 128000);
+  Frames f = Walk(mp3);
+  double ideal = 128000.0 / 8.0 * (double)f.kbps.size() * 1152.0 / 44100.0;
+  EXPECT_NEAR((double)mp3.size(), ideal, 420.0);
+}
+
 TEST(Mp3EncodeRate, TheLowerSamplingFrequenciesDoAllThreeToo) {
   for (uint32_t rate : {22050u, 11025u}) {
     Pcm pcm = Dynamics(1, rate * 3, rate);
@@ -1065,6 +1181,58 @@ TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
       EXPECT_EQ(stated, gaud_mp3e_crc16(a, (size_t)(lame + 34 - a), 0));
     }
   }
+}
+
+TEST(Mp3EncodeFile, TagsAreWrittenAsID3v2AndReadBack) {
+  GAUD_Meta * meta = nullptr;
+  ASSERT_EQ(gaud_meta_create(nullptr, &meta), GAUD_OK);
+  ASSERT_EQ(gaud_meta_add(meta, GAUD_TAG_TITLE, "A Title with \xC3\xA9 in it"), GAUD_OK);
+  ASSERT_EQ(gaud_meta_add(meta, GAUD_TAG_ARTIST, "Somebody"), GAUD_OK);
+  Pcm pcm = Tone(2, 20000, 44100);
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.meta = meta;
+  std::vector<unsigned char> mp3 = EncodeWith(pcm, params);
+  EXPECT_EQ(std::memcmp(mp3.data(), "ID3", 3), 0) << "tags go in front, as ID3v2";
+
+  GAUD_Stream * stream = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory(mp3.data(), mp3.size(), &stream), GAUD_OK);
+  GAUD_Doc * doc = nullptr;
+  ASSERT_EQ(gaud_doc_load(nullptr, stream, nullptr, nullptr, &doc), GAUD_OK);
+  const GAUD_Meta * read = gaud_doc_meta(doc);
+  ASSERT_NE(read, nullptr);
+  ASSERT_EQ(gaud_meta_count(read, GAUD_TAG_TITLE), 1u);
+  EXPECT_STREQ(gaud_meta_get(read, GAUD_TAG_TITLE, 0), "A Title with \xC3\xA9 in it");
+  EXPECT_STREQ(gaud_meta_get(read, GAUD_TAG_ARTIST, 0), "Somebody");
+  gaud_doc_destroy(doc);
+  gaud_stream_destroy(stream);
+  /* And the audio is still where it was: the same length once decoded. */
+  EXPECT_EQ(Decode(mp3).frames, pcm.size() / 2);
+
+  /* Dropping the tags leaves a file that starts at the first frame. */
+  params.meta_policy = GAUD_META_DROP_ALL;
+  std::vector<unsigned char> bare = EncodeWith(pcm, params);
+  EXPECT_NE(std::memcmp(bare.data(), "ID3", 3), 0);
+  EXPECT_LT(bare.size(), mp3.size());
+  gaud_meta_destroy(meta);
+}
+
+TEST(Mp3EncodeRegistration, TheEncoderStatesWhatKindOfEncoderItIs) {
+  const GAUD_Codec * codec = gaud_registry_find(nullptr, "mp3");
+  ASSERT_NE(codec, nullptr);
+  EXPECT_TRUE(codec->capabilities & GAUD_CAP_ENCODE);
+  EXPECT_EQ(codec->encoder_tier, GAUD_ENCODER_PRODUCTION);
+}
+
+TEST(Mp3EncodeRefusals, OnlySixteenBitSamplesAreAccepted) {
+  GAUD_Encode_Params params = BaseParams(2, 44100);
+  params.format = GAUD_SAMPLE_S24;
+  GAUD_Stream * out = nullptr;
+  ASSERT_EQ(gaud_stream_create_memory_writer(nullptr, &out), GAUD_OK);
+  GAUD_Encoder * encoder = nullptr;
+  GAUD_Result result = gaud_encoder_create("mp3", nullptr, out, &params, &encoder);
+  EXPECT_NE(result, GAUD_OK);
+  gaud_encoder_destroy(encoder);
+  gaud_stream_destroy(out);
 }
 
 /* ------------------------------------------------------------ refusals */

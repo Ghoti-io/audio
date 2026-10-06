@@ -80,6 +80,7 @@ uint32_t gaud_mp3e_exp2_q8(int32_t exponent) {
   return base >> -whole;
 }
 
+/** Start writing at the front of @p data, which the caller has zeroed. */
 void gaud_mp3e_bits_init(
     MP3E_Bits * bits, unsigned char * data, size_t capacity) {
   bits->data = data;

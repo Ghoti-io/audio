@@ -220,6 +220,33 @@ static uint32_t quads_cost(
 }
 
 /**
+ * The cheapest usable table over runs [from, to), and its cost, into
+ * @p out_table and @p out_cost.
+ *
+ * A macro only because it is used five times over the same locals - `cost`,
+ * `bad`, `tried` and `tried_count` of choose_tables() - and a function would
+ * have to be handed all four each time.
+ */
+#define REGION_BEST(from, to, out_table, out_cost) \
+  do { \
+    uint32_t best_ = COST_INF; \
+    unsigned best_t_ = 0; \
+    for (unsigned i_ = 0; i_ < tried_count; ++i_) { \
+      unsigned t_ = tried[i_]; \
+      if (bad[t_][to] != bad[t_][from]) { \
+        continue; \
+      } \
+      uint32_t c_ = cost[t_][to] - cost[t_][from]; \
+      if (c_ < best_) { \
+        best_ = c_; \
+        best_t_ = t_; \
+      } \
+    } \
+    out_table = best_t_; \
+    out_cost = best_; \
+  } while (0)
+
+/**
  * Find the cheapest regions and tables for a granule whose pair and
  * quadruple extents are already known.
  *
@@ -301,25 +328,6 @@ static void choose_tables(MP3E_Granule * granule, const MP3E_Layout * layout,
     }
   }
 
-  /* Cheapest table over runs [from, to). */
-  #define REGION_BEST(from, to, out_table, out_cost) \
-    do { \
-      uint32_t best_ = COST_INF; \
-      unsigned best_t_ = 0; \
-      for (unsigned i_ = 0; i_ < tried_count; ++i_) { \
-        unsigned t_ = tried[i_]; \
-        if (bad[t_][to] != bad[t_][from]) { \
-          continue; \
-        } \
-        uint32_t c_ = cost[t_][to] - cost[t_][from]; \
-        if (c_ < best_) { \
-          best_ = c_; \
-          best_t_ = t_; \
-        } \
-      } \
-      out_table = best_t_; \
-      out_cost = best_; \
-    } while (0)
 
   if (side->window_switching) {
     /* The two regions' end is stated by the standard: after the first

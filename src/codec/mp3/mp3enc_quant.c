@@ -117,18 +117,19 @@ int64_t gaud_mp3e_dequantize_one(int32_t quantized, int e4) {
 
 /* ------------------------------------------------------------ the state */
 
+/** The quantiser's working state for one granule of one channel. */
 typedef struct {
-  const MP3E_Quant_Input * in;
-  const MP3E_Layout * layout;
-  unsigned row;
-  MP3_Version version;
-  unsigned runs;
+  const MP3E_Quant_Input * in;  ///< What it was asked to do.
+  const MP3E_Layout * layout;   ///< The band layout of the block type.
+  unsigned row;                 ///< The scalefactor band tables' row.
+  MP3_Version version;          ///< Which scalefactor scheme applies.
+  unsigned runs;                ///< Bands in the layout.
   int32_t xs[MP3E_LINES];       ///< The spectrum in bitstream order.
   int sf[MP3E_MAX_BANDS];       ///< Scalefactor per run.
   int sf_cap[MP3E_MAX_BANDS];   ///< The most each may be.
-  uint64_t energy[MP3E_MAX_BANDS];
-  bool preflag;
-  bool scale;
+  uint64_t energy[MP3E_MAX_BANDS]; ///< Each run's energy, in the model's units.
+  bool preflag;                 ///< Add the preemphasis table to the steps.
+  bool scale;                   ///< Scalefactors count double.
   unsigned gain_floor; ///< The finest step that does not clamp the loudest line.
   unsigned run_floor[MP3E_MAX_BANDS]; ///< The same, for each band with no amplification.
   MP3E_Granule scratch; ///< A second granule to try a step in.
@@ -553,6 +554,9 @@ unsigned gaud_mp3e_quantize_granule(const MP3E_Quant_Input * input,
     if (!equalise(&w, excess)) {
       break;
     }
+  }
+  if (!have_best) {
+    best = *trial;
   }
   *out = best;
   return best_over;

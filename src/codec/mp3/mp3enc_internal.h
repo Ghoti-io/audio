@@ -73,6 +73,7 @@ extern "C" {
 
 /** The back-pointer's range: nine bits for MPEG-1, eight below it. */
 #define MP3E_RESERVOIR_MAX_V1 511u
+/** And eight for MPEG-2 and 2.5: 255. */
 #define MP3E_RESERVOIR_MAX_V2 255u
 
 /** Bands in a granule's layout, long (22) or three windows of short (39). */
@@ -96,6 +97,7 @@ uint32_t gaud_mp3e_exp2_q8(int32_t exponent);
 
 /* ------------------------------------------------------------ bit writer */
 
+/** A writer of bits, most significant first, into a caller's buffer. */
 typedef struct {
   unsigned char * data; ///< Borrowed; zeroed by the caller.
   size_t capacity;      ///< Bytes in @p data.
@@ -103,7 +105,9 @@ typedef struct {
   bool overflow;        ///< A write went past the capacity.
 } MP3E_Bits;
 
-void gaud_mp3e_bits_init(MP3E_Bits * bits, unsigned char * data, size_t capacity);
+/** Start writing at the front of @p data, which the caller has zeroed. */
+void gaud_mp3e_bits_init(
+    MP3E_Bits * bits, unsigned char * data, size_t capacity);
 
 /** Append the low @p count bits of @p value, most significant first. */
 void gaud_mp3e_bits_put(MP3E_Bits * bits, uint32_t value, unsigned count);
@@ -128,11 +132,11 @@ typedef struct {
  * reordering step, run the other way.
  */
 typedef struct {
-  MP3E_Band band[MP3E_MAX_BANDS];
+  MP3E_Band band[MP3E_MAX_BANDS]; ///< The runs, in bitstream order.
   unsigned count;           ///< Entries in @p band.
   unsigned sfb_count;       ///< Scalefactor bands per window.
   bool is_short;            ///< Three windows.
-  uint16_t order[MP3E_LINES];
+  uint16_t order[MP3E_LINES]; ///< Bitstream position to spectrum position.
 } MP3E_Layout;
 
 /** Build the layout for @p row of ::gaud_mp3_sfb_long, long or short. */
@@ -250,12 +254,15 @@ uint32_t gaud_mp3e_estimate_bits(const MP3E_Layout * layout,
 
 /* -------------------------------------------------------- filterbank */
 
+/** One channel's analysis filterbank: its input history and the last two
+ *  granules of subband samples. */
 typedef struct {
   int32_t x[512];          ///< The last 512 input samples, newest at 0.
   int32_t slot[2][18][32]; ///< This and the previous granule's subbands, Q28.
   unsigned current;        ///< Which of @p slot is the newer one.
 } MP3E_Filter;
 
+/** Clear a filter's history: the start of a stream. */
 void gaud_mp3e_filter_reset(MP3E_Filter * filter);
 
 /**
@@ -282,28 +289,28 @@ typedef struct {
   unsigned psy_row;    ///< Version * 3 + rate index: the generated tables' row.
   unsigned band_row;   ///< The scalefactor band tables' row.
   unsigned long_count; ///< Partitions of the 1024-point spectrum.
-  unsigned short_count;
+  unsigned short_count; ///< Partitions of the 256-point spectrum.
   /** Spreading of masking from partition i to j, Q16; and each j's norm. */
   uint32_t long_spread[MP3E_MAX_LONG_PARTS][MP3E_MAX_LONG_PARTS];
-  uint32_t long_norm[MP3E_MAX_LONG_PARTS];
-  uint32_t short_spread[MP3E_MAX_SHORT_PARTS][MP3E_MAX_SHORT_PARTS];
-  uint32_t short_norm[MP3E_MAX_SHORT_PARTS];
+  uint32_t long_norm[MP3E_MAX_LONG_PARTS]; ///< Each partition's sum of weights, Q16.
+  uint32_t short_spread[MP3E_MAX_SHORT_PARTS][MP3E_MAX_SHORT_PARTS]; ///< As above, short.
+  uint32_t short_norm[MP3E_MAX_SHORT_PARTS]; ///< And their norms.
   /** Which partition each MDCT line's frequency falls in. */
   uint8_t long_line_part[MP3E_LINES];
-  uint8_t short_line_part[192];
+  uint8_t short_line_part[192]; ///< The same for a short block's lines.
   /** Bins in each partition. */
   uint16_t long_bins[MP3E_MAX_LONG_PARTS];
-  uint16_t short_bins[MP3E_MAX_SHORT_PARTS];
+  uint16_t short_bins[MP3E_MAX_SHORT_PARTS]; ///< And the short ones.
 } MP3E_Psy_Rate;
 
 /** What the model concludes about one channel of one granule. */
 typedef struct {
   /** Noise each scalefactor band may carry, in the quantiser's units. */
   uint64_t allowed_long[23];
-  uint64_t allowed_short[3][14];
+  uint64_t allowed_short[3][14]; ///< The same per short window and band.
   /** Perceptual entropy, in bits, of coding it long or as three short. */
   uint32_t pe_long;
-  uint32_t pe_short;
+  uint32_t pe_short; ///< And as three short windows.
   /** The noise each line of the long transform may carry, which is what a
    *  transient detector compares the short windows' energies against. */
   uint64_t allowed_line[MP3E_LINES];
@@ -313,43 +320,51 @@ typedef struct {
 typedef struct {
   int16_t history[3u * MP3E_LINES]; ///< The last three granules' samples.
   int32_t long_re[2][513];          ///< The last two long spectra.
-  int32_t long_im[2][513];
-  uint32_t long_mag[2][513];
+  int32_t long_im[2][513];          ///< Their imaginary parts.
+  uint32_t long_mag[2][513];        ///< And magnitudes.
   int32_t short_re[2][129];         ///< The last two short spectra.
-  int32_t short_im[2][129];
-  uint32_t short_mag[2][129];
+  int32_t short_im[2][129];         ///< Their imaginary parts.
+  uint32_t short_mag[2][129];       ///< And magnitudes.
   uint64_t long_previous[MP3E_MAX_LONG_PARTS]; ///< The last thresholds.
 } MP3E_Psy_Channel;
 
+/** Derive one sampling frequency's spreading matrices and line maps. */
 void gaud_mp3e_psy_rate_init(
     MP3E_Psy_Rate * rate, unsigned psy_row, unsigned band_row);
 
+/** Forget a channel's past: the start of a stream. */
 void gaud_mp3e_psy_channel_reset(MP3E_Psy_Channel * channel);
 
 /**
  * Take in a granule's 576 samples and say what its neighbourhood permits.
  *
+ * @param rate The sampling frequency's tables.
+ * @param channel This channel's history; updated.
+ * @param samples The granule's 576 samples.
  * @param snr_offset_q8 Decibels (Q8) added to the signal-to-noise ratio
  *   the model demands under each band: positive is stricter and costs bits.
+ * @param ath_offset_q8 Decibels (Q8) the threshold of hearing is lowered by
+ *   beyond the table's own: positive makes quiet passages count for more.
+ * @param out Receives the conclusions.
  */
 void gaud_mp3e_psy_analyze(const MP3E_Psy_Rate * rate,
     MP3E_Psy_Channel * channel, const int16_t * samples, int snr_offset_q8,
-    MP3E_Psy_Result * out);
+    int ath_offset_q8, MP3E_Psy_Result * out);
 
 /* ----------------------------------------------------------- the frame */
 
 /** A frame's header fields, as the encoder chooses them. */
 typedef struct {
-  MP3_Version version;
-  unsigned bitrate_index;
-  unsigned rate_index;
-  bool padding;
-  MP3_Mode mode;
-  unsigned mode_extension;
-  bool crc;
-  unsigned channels;
+  MP3_Version version;       ///< MPEG-1, 2 or 2.5.
+  unsigned bitrate_index;    ///< The header's four-bit field.
+  unsigned rate_index;       ///< And its sampling frequency's.
+  bool padding;              ///< The frame is one byte longer.
+  MP3_Mode mode;             ///< Channel mode.
+  unsigned mode_extension;   ///< What joint stereo shares: 2 is mid/side.
+  bool crc;                  ///< A checksum follows the header.
+  unsigned channels;         ///< One or two.
   uint32_t bitrate;     ///< bits per second
-  uint32_t sample_rate;
+  uint32_t sample_rate; ///< Frames per second.
 } MP3E_Frame_Header;
 
 /** The bitrate index for @p kbps in @p version's table, or -1. */
@@ -383,9 +398,9 @@ void gaud_mp3e_side_write(unsigned char * out, const MP3E_Frame_Header * h,
 
 /** What the Info or Xing frame states. */
 typedef struct {
-  MP3_Version version;
-  unsigned rate_index;
-  unsigned channels;
+  MP3_Version version;     ///< MPEG-1, 2 or 2.5.
+  unsigned rate_index;     ///< The sampling frequency's header index.
+  unsigned channels;       ///< One or two.
   unsigned bitrate_index;  ///< The frame's own header.
   uint32_t frame_bytes;    ///< Its length; at least 192 for the tag to fit.
   bool vbr;                ///< Xing rather than Info.
@@ -395,11 +410,11 @@ typedef struct {
   uint32_t quality;        ///< Xing's, 0 best to 100 worst (VBR only).
   uint32_t delay;          ///< Samples of delay, as LAME states it.
   uint32_t padding;        ///< And of padding.
-  uint16_t music_crc;
-  uint32_t music_length;
+  uint16_t music_crc;      ///< Checksum of the audio frames.
+  uint32_t music_length;   ///< Bytes of audio, counting the tag frame.
   unsigned vbr_method;     ///< 1 constant, 2 average, 3 to 9 variable.
   unsigned bitrate_byte;   ///< The extension's bit rate field.
-  unsigned lowpass_100hz;
+  unsigned lowpass_100hz;  ///< The lowpass the encoder applied, in 100 Hz.
 } MP3E_Tag;
 
 /** Write the tag frame into @p frame, which has room for its length. */
@@ -409,9 +424,9 @@ void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame);
 
 /** The bit rate policy and its running state. */
 typedef struct {
-  GAUD_Rate_Control mode;
-  MP3_Version version;
-  uint32_t sample_rate;
+  GAUD_Rate_Control mode;    ///< Constant, average or variable.
+  MP3_Version version;       ///< MPEG-1, 2 or 2.5.
+  uint32_t sample_rate;      ///< Frames per second.
   unsigned min_index;        ///< Lowest bit rate index a frame may use.
   unsigned max_index;        ///< Highest.
   unsigned fixed_index;      ///< The constant rate's.
@@ -421,6 +436,7 @@ typedef struct {
   uint64_t actual_bytes;     ///< Bytes of audio frames written so far.
 } MP3E_Rate;
 
+/** Set up a policy; the fields above say what each argument is. */
 void gaud_mp3e_rate_init(MP3E_Rate * rate, GAUD_Rate_Control mode,
     MP3_Version version, uint32_t sample_rate, unsigned min_index,
     unsigned max_index, unsigned fixed_index, uint32_t target_bps);

@@ -60,8 +60,10 @@
  */
 #define TOTAL_DELAY 1057u
 
+/** A frame that is built and not yet written, because data may still be
+ *  placed in it. */
 typedef struct {
-  unsigned char bytes[MP3_MAX_FRAME_SIZE];
+  unsigned char bytes[MP3_MAX_FRAME_SIZE]; ///< The frame as it will be written.
   uint32_t total;      ///< Bytes in the frame.
   uint32_t head;       ///< Bytes before its main-data area.
   uint64_t slot_start; ///< Cursor coordinate of that area's first byte.
@@ -76,61 +78,63 @@ typedef struct {
 /** One granule's transforms and verdict. */
 typedef struct {
   int32_t spectrum[4][2][MP3E_LINES]; ///< By block type, channel.
-  MP3E_Psy_Result psy[2];
-  bool attack;
+  MP3E_Psy_Result psy[2];             ///< The model's answer, per channel.
+  bool attack;                        ///< Some channel starts a transient here.
   int type; ///< Block type, or -1 until its successor has been seen.
 } Analysed;
 
+/** Everything one encoder holds between writes. */
 typedef struct {
-  const GAUD_Allocator * allocator;
-  GAUD_Stream * stream;
-  const GAUD_Meta * meta;
-  GAUD_Meta_Policy policy;
+  const GAUD_Allocator * allocator; ///< Where every allocation came from.
+  GAUD_Stream * stream;             ///< The sink; borrowed.
+  const GAUD_Meta * meta;           ///< The tags to write, or NULL.
+  GAUD_Meta_Policy policy;          ///< What of them to write.
 
-  MP3_Version version;
-  unsigned rate_index;
-  unsigned channels;
-  unsigned row;
+  MP3_Version version;     ///< MPEG-1, 2 or 2.5.
+  unsigned rate_index;     ///< The header's sampling frequency index.
+  unsigned channels;       ///< One or two.
+  unsigned row;            ///< The scalefactor band tables' row.
   unsigned granules; ///< Per frame: 2 for MPEG-1, otherwise 1.
-  uint32_t sample_rate;
-  unsigned reservoir_max;
-  MP3E_Rate rate;
+  uint32_t sample_rate;    ///< Frames per second.
+  unsigned reservoir_max;  ///< The most the back-pointer can state.
+  MP3E_Rate rate;         ///< The bit rate policy and its running state.
   unsigned tag_index;     ///< The tag frame's bit rate index.
   uint32_t tag_bytes;     ///< And its length.
   bool vbr_tag;           ///< Variable rate: a Xing tag with a table.
   uint32_t quality;       ///< 1 to 100, for the tag.
   uint32_t * sizes;       ///< Every audio frame's length, for the table.
-  size_t sizes_count;
-  size_t sizes_capacity;
+  size_t sizes_count;     ///< How many are in @p sizes.
+  size_t sizes_capacity;  ///< How many it has room for.
 
   MP3E_Layout layout[2]; ///< Long, short.
-  MP3E_Filter filter[2];
-  MP3E_Psy_Rate psy_rate;
-  MP3E_Psy_Channel psy[2];
-  int16_t pcm[2][MP3E_LINES];
-  unsigned fill;
+  MP3E_Filter filter[2];  ///< The analysis filterbank, per channel.
+  MP3E_Psy_Rate psy_rate; ///< The model's tables for this frequency.
+  MP3E_Psy_Channel psy[2]; ///< The model's memory, per channel.
+  int16_t pcm[2][MP3E_LINES]; ///< The granule being filled, per channel.
+  unsigned fill;          ///< How many of its samples are in.
   Analysed * ring;        ///< Granules analysed and not yet coded.
   int32_t mid_side[2][2][MP3E_LINES]; ///< A frame's spectra as mid and side.
   uint64_t analysed;      ///< Granules analysed so far.
   uint64_t decided;       ///< Of those, how many have a block type.
-  uint64_t coded_granules;
+  uint64_t coded_granules; ///< And how many have been written.
   int previous_type;      ///< Block type of the granule before the next.
   uint64_t window_energy[2][2][14]; ///< Last two short windows' band energies.
-  int snr_offset_q8;
-  MP3E_Granule coded[2][2];
+  int snr_offset_q8;      ///< Decibels (Q8) the model is made stricter by.
+  int ath_offset_q8;      ///< And its threshold of hearing is lowered by.
+  MP3E_Granule coded[2][2]; ///< The frame being assembled: [granule][channel].
 
-  uint64_t cursor;
-  uint64_t slot_end;
-  Queued * queue;
-  unsigned queue_head;
-  unsigned queue_count;
+  uint64_t cursor;        ///< Where the next granule's data begins.
+  uint64_t slot_end;      ///< The end of the last queued frame's data area.
+  Queued * queue;         ///< Frames waiting for their data to be final.
+  unsigned queue_head;    ///< The oldest.
+  unsigned queue_count;   ///< How many there are.
 
-  uint64_t samples_in;
-  uint64_t audio_frames;
-  uint64_t bytes_out;
-  uint64_t tag_position;
-  uint16_t music_crc;
-  GAUD_Result sticky;
+  uint64_t samples_in;    ///< Sample frames given to write.
+  uint64_t audio_frames;  ///< Audio frames built so far.
+  uint64_t bytes_out;     ///< Bytes written so far, not counting the tag.
+  uint64_t tag_position;  ///< Where the tag frame is, to rewrite it.
+  uint16_t music_crc;     ///< Checksum of the audio frames written so far.
+  GAUD_Result sticky;     ///< The first failure, kept.
 } MP3_Encoder;
 
 /* ---------------------------------------------------------- the tag frame */
@@ -523,10 +527,11 @@ static void decide_type(MP3_Encoder * enc, uint64_t which, bool next_attack) {
   Analysed * slot = slot_of(enc, which);
   int previous = enc->previous_type;
   int type;
-  if (previous == 1) {
-    type = 2;
-  }
-  else if (slot->attack) {
+  /* A start block is chosen only because the next granule has an attack, and
+   * that is this granule's own flag by the time it is decided - so the rule
+   * that a start block is followed by a short one needs no line of its own,
+   * and the test that the sequence is legal is what keeps it so. */
+  if (slot->attack) {
     type = 2;
   }
   else if (next_attack) {
@@ -629,7 +634,7 @@ static GAUD_Result process_granule(MP3_Encoder * enc) {
       gaud_mp3e_filter_transform(&enc->filter[ch], t, slot->spectrum[t][ch]);
     }
     gaud_mp3e_psy_analyze(&enc->psy_rate, &enc->psy[ch], enc->pcm[ch],
-        enc->snr_offset_q8, &slot->psy[ch]);
+        enc->snr_offset_q8, enc->ath_offset_q8, &slot->psy[ch]);
     if (detect_attack(enc, slot, ch)) {
       slot->attack = true;
     }
@@ -753,7 +758,11 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
     GAUD_Stream * stream, const GAUD_Encode_Params * params,
     GAUD_Encoder ** out_encoder) {
   (void)codec;
-  if (params->coding != GAUD_CODING_MPEG_LAYER3
+  /* The codec's name says what is wanted, so a caller who left the coding
+   * at its zero value - PCM - has asked for MP3 as clearly as one who named
+   * it. The samples they give are signed 16-bit either way. */
+  if ((params->coding != GAUD_CODING_MPEG_LAYER3
+          && params->coding != GAUD_CODING_PCM)
       || params->format != GAUD_SAMPLE_S16) {
     return GAUD_ERR_UNSUPPORTED;
   }
@@ -854,6 +863,13 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
    * quantisation noise the encoder leaves under what the ear masks. */
   enc->snr_offset_q8 = mode == GAUD_RATE_VBR
       ? ((int)quality - 50) * 4 * 256 / 10 - 4 * 256
+      : 0;
+  /* The threshold of hearing follows quality twice as fast: a recorded
+   * voice's quiet passages are what a variable-rate file gives up first and
+   * what an encoder that cares about them keeps, and their level is nowhere
+   * near any masking threshold, only the threshold of hearing. */
+  enc->ath_offset_q8 = mode == GAUD_RATE_VBR
+      ? ((int)quality - 50) * 8 * 256 / 10
       : 0;
   enc->vbr_tag = mode != GAUD_RATE_CBR;
   enc->reservoir_max = version == MP3_MPEG1 ? MP3E_RESERVOIR_MAX_V1 : MP3E_RESERVOIR_MAX_V2;

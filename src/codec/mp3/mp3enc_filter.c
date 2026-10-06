@@ -47,8 +47,9 @@
 
 #include "mp3enc_internal.h"
 
-/** Round(2^28 / 9) and Round(2^28 / 3): the forward transforms' scales. */
+/** Round(2^28 / 9), the 36-point transform's scale. */
 #define SCALE_LONG 29826162
+/** Round(2^28 / 3), the 12-point transform's. */
 #define SCALE_SHORT 89478485
 
 static int32_t mul(int32_t a, int32_t b) {
@@ -72,6 +73,7 @@ static int32_t scale(int64_t sum, int32_t factor) {
   return (int32_t)((line * factor + (1 << 27)) >> MP3_Q);
 }
 
+/** Clear a filter's history: the start of a stream. */
 void gaud_mp3e_filter_reset(MP3E_Filter * filter) {
   memset(filter, 0, sizeof(*filter));
 }
