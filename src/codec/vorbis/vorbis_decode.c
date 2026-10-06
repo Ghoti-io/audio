@@ -349,6 +349,12 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
 
   /* The floors, and whether each channel carries anything. */
   bool used[256];
+  // Whether the channel stated a floor at all. A channel can be *used*
+  // without one, when coupling pairs it with a channel that has one, and
+  // then it takes part in the residue and in the coupling but its
+  // spectrum is zero, because there is no envelope to scale it by. Its
+  // curve was never written.
+  bool has_floor[256];
   if (state->channels > 256u) {
     return GAUD_ERR_UNSUPPORTED;
   }
@@ -362,6 +368,7 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
       return result;
     }
     used[ch] = one;
+    has_floor[ch] = one;
   }
 
   /*
@@ -526,7 +533,7 @@ static GAUD_Result decode_packet(VORBIS_Decoder * state,
         = state->residue + (size_t)ch * (state->long_block / 2u);
     const unsigned char * curve
         = state->curves + (size_t)ch * (state->long_block / 2u);
-    if (!used[ch]) {
+    if (!has_floor[ch]) {
       memset(state->block, 0, (size_t)n * sizeof(*state->block));
     }
     else {
