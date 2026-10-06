@@ -418,11 +418,14 @@ typedef struct {
 } MP3E_Tag;
 
 /**
- * The nine bytes the LAME extension keeps for the encoder's name. The first
+ * Write the nine bytes the LAME extension keeps for the encoder's name:
+ * `LAME(G<major>)`, space-padded, where major is the library's. The first
  * four must be `LAME` for ffmpeg to apply the delay and padding the tag
- * states; the rest says this encoder and its major generation.
+ * states; the rest says this library and its generation.
+ *
+ * @param out Receives nine bytes.
  */
-#define MP3E_TAG_ENCODER "LAME(G1) "
+void gaud_mp3e_tag_encoder_name(unsigned char * out);
 
 /** Write the tag frame into @p frame, which has room for its length. */
 void gaud_mp3e_tag_build(const MP3E_Tag * tag, unsigned char * frame);

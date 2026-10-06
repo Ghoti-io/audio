@@ -8,23 +8,27 @@
 # Ghoti.io Audio is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""Score the MP3 encoder's files with two decoders that are not ours.
+"""Score the MP3 encoder's files with three decoders that are not ours.
 
     make check-mp3-encode
 
 planning/audio.md 11.3 puts it in two gates and only one of them is fuzzy.
-This is the exact one: **if ffmpeg's decoder and libsndfile's - two
-separate implementations of MPEG audio, libavcodec's and minimp3 - decode
-what the encoder wrote, to what our own decoder says, then the file is a
-conformant stream.** No tolerance on quality, none on the encoder's choices;
-only on the decoders' own last bit.
+This is the exact one: **if ffmpeg's decoder, libsndfile's and mpg123's
+decode what the encoder wrote, to what our own decoder says, then the file is
+a conformant stream.** No tolerance on quality, none on the encoder's
+choices; only on the decoders' own last bit. That is *two* implementations
+and not three: libsndfile 1.2.2 decodes MP3 through libmpg123, so it and
+mpg123 are one decoder asked twice, and ffmpeg's native one is the other.
 
 Every case below is encoded, and then:
 
-  - **Our decode, ffmpeg's and libsndfile's agree**, sample for sample to
-    two least significant bits, on the whole file. The decoders return
-    the file's contents, not the recording - none of them honours this
-    encoder's tag - so lengths are compared before anything else.
+  - **Our decode, ffmpeg's, libsndfile's and mpg123's agree**, sample for
+    sample to two least significant bits, on the whole recording. Each of
+    them returns the *recording* and not the file's contents, because each
+    honours the delay and padding the tag states - ffmpeg only because the
+    encoder's name begins `LAME` (see mp3enc_tag.c), mpg123 and libsndfile
+    whatever it says - so the lengths are compared before anything else and
+    must equal the frames that were given.
   - **The tag tells the truth**: its frame count is the frames in the file,
     its byte count is the file's, and delay plus the recording plus
     padding is the decoded length.
@@ -348,8 +352,25 @@ def correlation(a, b):
     return sum(x * y for x, y in zip(a, b)) / math.sqrt(sa * sb)
 
 
+def mpg123_pcm(path):
+    """libmpg123's decode, through its command-line front end.
+
+    Gapless is on by default and is the point: it trims by the delay and
+    padding a LAME extension states, and - measured against the pinned image
+    - without looking at the name the tag carries, unlike ffmpeg.
+    """
+    finished = subprocess.run(
+        oracle.command("mpg123", ["mpg123", "-q", "-s", path]),
+        capture_output=True)
+    if finished.returncode != 0 or not finished.stdout:
+        return None
+    raw = finished.stdout
+    return list(struct.unpack("<%dh" % (len(raw) // 2), raw))
+
+
 def decode_all(path):
     out = {}
+    out["mpg123"] = mpg123_pcm(path)
     out["ours"] = check_mpeg.ours_pcm(path)
     out["ffmpeg"] = check_mpeg.ffmpeg_pcm(path)
     out["libsndfile"] = check_mpeg.libsndfile_pcm(path)
@@ -374,18 +395,18 @@ def run_case(label, wav, mp3, rate, channels, mode_args, floor, signal_name):
     if pcm["ours"] is None:
         return bad + ["%s: our decoder could not read the file" % label]
     meta = check_mpeg.ours_meta(mp3)
-    # Both references return the recording: ffmpeg honours the delay and
+    # Every reference returns the recording: ffmpeg honours the delay and
     # padding of a tag whose encoder name begins LAME (ours does, on purpose;
-    # see mp3enc_tag.c) and libsndfile honours any tag that states them. Each
-    # is compared with our decode cut to match, and the cut has to leave
-    # exactly the frames that were given.
+    # see mp3enc_tag.c), and libsndfile and mpg123 honour any tag that states
+    # them. Each is compared with our decode cut to match, and the cut has to
+    # leave exactly the frames that were given.
     trimmed = check_mpeg.trim(pcm["ours"], int(meta["delay"]),
                               int(meta["padding"]), channels)
-    expected = {"ffmpeg": trimmed, "libsndfile": trimmed}
+    expected = {"ffmpeg": trimmed, "libsndfile": trimmed, "mpg123": trimmed}
     if len(trimmed) != n * channels:
         bad.append("%s: the tag's delay and padding leave %d frames of the "
                    "%d that were given" % (label, len(trimmed) // channels, n))
-    for name in ("ffmpeg", "libsndfile"):
+    for name in ("ffmpeg", "libsndfile", "mpg123"):
         if pcm[name] is None:
             bad.append("%s: %s could not read a file we wrote" % (label, name))
             continue
@@ -449,7 +470,7 @@ def controls(good_mp3):
 
 
 def main():
-    print(oracle.provenance(["ffmpeg", "libsndfile"]))
+    print(oracle.provenance(["ffmpeg", "libsndfile", "mpg123"]))
     if not os.path.isfile(WRITE_PROBE):
         raise SystemExit("write_probe is not built: run `make oracle-probe`.")
     os.makedirs(SCRATCH, exist_ok=True)
@@ -473,14 +494,14 @@ def main():
                 if good is None and name == "tone" and rate == 44100:
                     good = mp3
     failures += controls(good)
-    print("%d encodes, each read by two decoders that are not ours; every "
+    print("%d encodes, each read by three decoders that are not ours (two implementations: libsndfile reaches MP3 through libmpg123); every "
           "frame's back-pointer, granule lengths and tag checked in the bytes; "
           "3 controls rejected" % cases)
     if failures:
         print("\n".join("FAIL " + f for f in failures))
         return 1
     print("check-mp3-encode: every file the encoder wrote is read the same way by"
-          " ffmpeg, libsndfile and this library")
+          " ffmpeg, libsndfile, mpg123 and this library")
     return 0
 
 

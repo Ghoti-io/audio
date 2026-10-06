@@ -55,6 +55,19 @@
 #             verifies the STREAMINFO MD5 of a file we wrote, which is a
 #             whole-decoder check no comparison of ours could construct.
 #             `metaflac` reads the metadata blocks.
+# mpg123      The most widely used MP3 decoder after ffmpeg's, added when the
+#             encoder came: `libmpg123` is what players built on it (and
+#             its gapless rule, which is its own code and not ffmpeg's)
+#             do with a file, and it shares no code with ffmpeg's decoder
+#             or with libsndfile's (which reaches MP3 through libmpg123 -
+#             see the paragraph on MPEG below). The binary is pinned along
+#             with the library, because the library is what decides.
+#
+# **For MPEG audio the count needs the same care as FLAC's.** libsndfile
+# 1.2.2 decodes MP3 through libmpg123, so libsndfile and mpg123 are one
+# implementation answering twice, and ffmpeg's native decoder is the other.
+# Check `ldd` on the *library* rather than the front end: the python
+# wrapper is ctypes over libsndfile, which is what links libmpg123.
 #
 # **For Opus the reference count is two, and the second one is inside
 # ffmpeg.** libavcodec has a native Opus decoder as well as a libopus
@@ -130,6 +143,8 @@ RUN apt-get update -qq \
       libflac14=1.5.0+ds-2 \
       opus-tools=0.2-1+b3 \
       libopus0=1.5.2-2 \
+      mpg123=1.32.10-1+deb13u1 \
+      libmpg123-0t64=1.32.10-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 # opus_compare, built from the libopus source of the same snapshot.
@@ -168,11 +183,12 @@ RUN printf 'Types: deb-src\nURIs: http://snapshot.debian.org/archive/debian/%s\n
 # literally, which puts a quoting layer between a check and the fact it checks.
 COPY ffmpeg-version sox-version libsndfile-version pywave-version \
       mutagen-version flac-version opusdec-version opus-compare-version \
-      /usr/local/bin/
+      mpg123-version /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/ffmpeg-version /usr/local/bin/sox-version \
       /usr/local/bin/libsndfile-version /usr/local/bin/pywave-version \
       /usr/local/bin/mutagen-version /usr/local/bin/flac-version \
-      /usr/local/bin/opusdec-version /usr/local/bin/opus-compare-version
+      /usr/local/bin/opusdec-version /usr/local/bin/opus-compare-version \
+      /usr/local/bin/mpg123-version
 
 # A locale, pinned, because regex lost 1,855 differential rows to an image
 # that had none. Nothing here reads a name out of a file yet, but sox and
@@ -188,4 +204,4 @@ ENV TZ=UTC SOURCE_DATE_EPOCH=0
 ENTRYPOINT []
 CMD ["sh", "-c", "ffmpeg-version; sox-version; libsndfile-version; \
 pywave-version; mutagen-version; flac-version; opusdec-version; \
-opus-compare-version"]
+opus-compare-version; mpg123-version"]

@@ -75,6 +75,7 @@ PROBE = {
     "flac": (["flac-version"], "flac 1.5.0"),
     "opusdec": (["opusdec-version"], "opusdec 1.5.2"),
     "opus_compare": (["opus-compare-version"], "opus_compare 1.5.2"),
+    "mpg123": (["mpg123-version"], "mpg123 1.32.10"),
 }
 
 # Which implementation each reference actually answers a FLAC question with.

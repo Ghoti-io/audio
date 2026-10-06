@@ -291,14 +291,25 @@ The tag states the file's frames and bytes, a hundred-entry table of
 contents for a variable-rate one, and - in the extension LAME added - the
 encoder's delay and padding, which are 528 and whatever the last frame
 leaves. The tag is rewritten at the end of the file, so the stream has to
-accept a seek. **The encoder's name field says `LAME(G1)`**: ffmpeg takes the delay and
-padding only from a tag whose name begins `LAME`, `Lavf` or `Lavc` (checked
-case-sensitively on the first four bytes, with nothing after them read), so
-without those letters a file from this encoder plays 1,057 samples late and
-ends with 609 of padding. They are the prefix a reader requires and not a
-claim to be LAME's code; the rest of the nine bytes says what wrote the file
-and its major generation. libsndfile and this library's own decoder honour
-any tag that states a delay. libmpg123's rule is not tested here.
+accept a seek. **The encoder's name field says `LAME(G<major>)`**, with this library's
+major version, and the reason is one reader. The delay and padding make a
+file play gaplessly, and three readers were measured against it:
+
+| Reader | Applies the tag's delay and padding |
+|---|---|
+| ffmpeg (libavformat) | only if the name's first four bytes are `LAME`, `Lavf` or `Lavc`; case-sensitive, nothing after them is read |
+| libmpg123, and libsndfile through it | whatever the name says |
+| this library | whatever the name says, if it is printable |
+
+ffmpeg's demuxer is behind most players and browsers, so a name it does not
+recognise gives a file that plays 1,057 samples late and ends with 609 of
+padding nearly everywhere. The four letters are therefore **a prefix a reader
+requires and not a claim to be LAME's code**: nothing parses what follows,
+the digits are this library's major version, and the encoder is this
+library's own. The honest alternative, `Ghoti.io`, is what shipped first, and
+it was reversed for exactly that cost. A major release changes every file's
+bytes (the tag carries it), and `make check-golden` compares architectures
+with each other and not with stored hashes, so nothing needs recomputing.
 
 **How a frame is made.** In the order a granule travels:
 
@@ -363,8 +374,9 @@ that could be 156, which on one machine was whatever followed it in memory.
 - `make check-mp3-encode` encodes 108 signals - full-scale noise and square
   waves, the highest frequency the format holds, silence between bursts, a
   channel silent or inverted, a recording one bit deep - at nine sampling
-  frequencies in all three modes, and requires ffmpeg's decoder, libsndfile's
-  and this library's to read each to the same samples, the tag to be true,
+  frequencies in all three modes, and requires ffmpeg's decoder, mpg123's, libsndfile's
+  (which is libmpg123 again) and this library's to read each to the same
+  samples and the recording's exact length, the tag to be true,
   every frame's back-pointer and granule lengths to fit the bytes, and the
   recording to be in the decode. Three deliberately broken files must be
   rejected.

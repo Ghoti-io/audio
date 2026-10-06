@@ -1244,7 +1244,10 @@ TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
        * trim by the delay and padding stated beside it, and is the nine
        * bytes the extension keeps. */
       EXPECT_EQ(std::memcmp(lame, "LAME", 4), 0);
-      EXPECT_EQ(std::memcmp(lame, MP3E_TAG_ENCODER, 9), 0);
+      std::string name = "LAME(G" + std::to_string(GAUD_VERSION_MAJOR) + ")";
+      name.resize(9, ' ');
+      EXPECT_EQ(std::string((const char *)lame, 9), name)
+          << "the library's major version, in the nine bytes the format keeps";
     }
   }
 }

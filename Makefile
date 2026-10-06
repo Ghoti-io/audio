@@ -708,7 +708,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 # and could not find the disagreement the whole arrangement exists to find.
 
 ORACLE := tools/oracle
-ORACLE_IMAGE := localhost/ghoti-audio-oracle-refs:deb13-2
+ORACLE_IMAGE := localhost/ghoti-audio-oracle-refs:deb13-3
 
 # Both probes are built like an example - the static archive whole - so each
 # binary carries the code under test rather than whatever is installed.
@@ -757,7 +757,7 @@ oracle-probe: ## Build the probes the differentials drive
 oracle-probe: $(DUMP_PROBE) $(WRITE_PROBE) $(TAG_PROBE) $(VORBIS_PROBE) \
 		$(OPUS_DECODE_PROBE)
 
-oracle-build: ## Build the pinned reference image: ffmpeg, sox, libsndfile, python3, mutagen, flac and opus
+oracle-build: ## Build the pinned reference image: ffmpeg, sox, libsndfile, python3, mutagen, flac, opus and mpg123
 	docker build -t $(ORACLE_IMAGE) $(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if none would
@@ -766,7 +766,7 @@ oracle-version: ## Print which references would answer, and fail if none would
 # flac would answer yes while two of the gates could not run.
 	@python3 -c "import sys; sys.path.insert(0, '$(ORACLE)'); \
 import oracle_env as o; \
-print(o.provenance(['ffmpeg','sox','libsndfile','pywave','mutagen','flac']))"
+print(o.provenance(['ffmpeg','sox','libsndfile','pywave','mutagen','flac','mpg123']))"
 
 corpus: ## Regenerate tests/data/ with the pinned references (deliberate)
 	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/make_corpus.py

@@ -1,0 +1,6 @@
+#!/bin/sh
+# "mpg123 <version>", and the *libmpg123* version rather than the front
+# end's, because the library is what decides an answer. The binary prints
+# "mpg123 1.32.10; ..." and the two packages are pinned to one version, so
+# the number is the second word of the first line, without its semicolon.
+mpg123 --version 2>&1 | head -1 | awk '{sub(/;.*/, "", $2); print "mpg123", $2}'

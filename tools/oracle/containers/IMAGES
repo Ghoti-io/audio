@@ -49,21 +49,23 @@
 # Building it:
 #   make oracle-build
 
-ffmpeg	localhost/ghoti-audio-oracle-refs:deb13-2	ffmpeg 7.1.5	libavformat's RIFF and IFF demuxers; the most widely deployed reader of both formats
-sox	localhost/ghoti-audio-oracle-refs:deb13-2	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
-libsndfile	localhost/ghoti-audio-oracle-refs:deb13-2	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
-pywave	localhost/ghoti-audio-oracle-refs:deb13-2	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
-mutagen	localhost/ghoti-audio-oracle-refs:deb13-2	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
-flac	localhost/ghoti-audio-oracle-refs:deb13-2	flac 1.5.0	The format's own reference implementation. `flac -t` verifies a file's STREAMINFO MD5, which scores the whole decoder at once; libFLAC underneath is also what sox and libsndfile answer FLAC questions with
-opusdec	localhost/ghoti-audio-oracle-refs:deb13-2	opusdec 1.5.2	libopus through opus-tools' front end - the implementation RFC 6716 defines conformance against. The *libopus* version is pinned and not opus-tools', because libopus is what decides an answer
-opus_compare	localhost/ghoti-audio-oracle-refs:deb13-2	opus_compare 1.5.2	**The only normative reference in this image.** RFC 6716 defines a conforming decoder as one whose output this tool accepts, so it answers pass or fail rather than a number to argue about. Built from the libopus source of the same snapshot, because Debian packages the library and not this one file
+ffmpeg	localhost/ghoti-audio-oracle-refs:deb13-3	ffmpeg 7.1.5	libavformat's RIFF and IFF demuxers; the most widely deployed reader of both formats
+sox	localhost/ghoti-audio-oracle-refs:deb13-3	SoX 14.4.2	A separate lineage from ffmpeg, and the reference happiest being asked for a raw sample dump
+libsndfile	localhost/ghoti-audio-oracle-refs:deb13-3	libsndfile 1.2.2	The third parser, and the one most non-ffmpeg audio applications actually use
+pywave	localhost/ghoti-audio-oracle-refs:deb13-3	Python 3.13.5 wave	A pure-Python fourth reading that shares no code with the three C parsers. WAV only; 3.13 removed aifc
+mutagen	localhost/ghoti-audio-oracle-refs:deb13-3	mutagen 1.47.0	The only reference here that exists for metadata, and the implementation most taggers are built on. Tags only; it reads no samples
+flac	localhost/ghoti-audio-oracle-refs:deb13-3	flac 1.5.0	The format's own reference implementation. `flac -t` verifies a file's STREAMINFO MD5, which scores the whole decoder at once; libFLAC underneath is also what sox and libsndfile answer FLAC questions with
+opusdec	localhost/ghoti-audio-oracle-refs:deb13-3	opusdec 1.5.2	libopus through opus-tools' front end - the implementation RFC 6716 defines conformance against. The *libopus* version is pinned and not opus-tools', because libopus is what decides an answer
+opus_compare	localhost/ghoti-audio-oracle-refs:deb13-3	opus_compare 1.5.2	**The only normative reference in this image.** RFC 6716 defines a conforming decoder as one whose output this tool accepts, so it answers pass or fail rather than a number to argue about. Built from the libopus source of the same snapshot, because Debian packages the library and not this one file
+mpg123	localhost/ghoti-audio-oracle-refs:deb13-3	mpg123 1.32.10	libmpg123 through its front end: the decoder most MP3 players that are not ffmpeg are built on, and the one whose gapless rule (the LAME extension, read only when its name says so) is its own code. **One implementation with libsndfile**, which reaches MP3 through libmpg123
 
 # Not here yet:
 #   afconvert  Apple's own, and the reference that decides what AIFF-C really
 #              means. It is macOS-only, so it cannot live in this image; when
 #              something turns on a disagreement about AIFF-C it will have to
 #              be run by hand and its answer committed.
-# Raised to deb13-2 by phase 6, which added the two Opus lines above.
+# Raised to deb13-2 by phase 6, which added the two Opus lines above, and to
+# deb13-3 when the MP3 encoder came and mpg123 was added to score it.
 # §11.13's rule applies to them as it does to FLAC's four: **for Opus the
 # count is two, and the second is inside ffmpeg** - libavcodec has a
 # native Opus decoder as well as a libopus wrapper, and `-c:a opus`
