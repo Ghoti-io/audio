@@ -171,6 +171,14 @@ typedef struct {
 void gaud_mp3e_huffman_plan(MP3E_Granule * granule,
     const MP3E_Layout * layout, unsigned row);
 
+/**
+ * A quick upper bound on part 3: the quadruples, and the pairs under the
+ * one table that suits the largest value, with no region split. It is
+ * within a few per cent of ::gaud_mp3e_huffman_plan's answer and a hundred
+ * times cheaper, which is what a bisection on the step wants.
+ */
+uint32_t gaud_mp3e_huffman_estimate(const int32_t * is);
+
 /** The bits of main data part 3 for the plan in @p granule. */
 uint32_t gaud_mp3e_huffman_bits(const MP3E_Granule * granule, unsigned row);
 

@@ -100,6 +100,68 @@ static void regions_of(const MP3_Granule * side, unsigned row, unsigned big,
   }
 }
 
+/**
+ * The tables worth trying for a run whose largest magnitude is @p m.
+ *
+ * The standard's tables come in families of the same range - two for 2,
+ * two for 3, three for 5 and for 7, two for 15 - and the families differ
+ * in which pairs get the short codes, so more than one has to be tried; a
+ * table of a wider range than the data needs is never better than one of
+ * exactly its range, so the wider ones are not. Beyond 15 the tables carry
+ * extra bits, in two groups of eight whose widths interleave, and the first
+ * two of each that can hold the value are the candidates.
+ *
+ * @return how many were written into @p out.
+ */
+static unsigned candidates(int m, uint8_t out[6]) {
+  if (m == 0) {
+    out[0] = 0;
+    return 1;
+  }
+  if (m == 1) {
+    out[0] = 1;
+    return 1;
+  }
+  if (m == 2) {
+    out[0] = 2;
+    out[1] = 3;
+    return 2;
+  }
+  if (m == 3) {
+    out[0] = 5;
+    out[1] = 6;
+    return 2;
+  }
+  if (m <= 5) {
+    out[0] = 7;
+    out[1] = 8;
+    out[2] = 9;
+    return 3;
+  }
+  if (m <= 7) {
+    out[0] = 10;
+    out[1] = 11;
+    out[2] = 12;
+    return 3;
+  }
+  if (m <= 15) {
+    out[0] = 13;
+    out[1] = 15;
+    return 2;
+  }
+  unsigned n = 0;
+  for (unsigned group = 0; group < 2u; ++group) {
+    unsigned found = 0;
+    for (unsigned t = 16u + 8u * group; t < 24u + 8u * group && found < 2u; ++t) {
+      if (table_capacity(t) >= m) {
+        out[n++] = (uint8_t)t;
+        ++found;
+      }
+    }
+  }
+  return n;
+}
+
 /** Bits of pairs [lo, hi) coded with table @p t, or COST_INF. */
 static uint32_t pairs_cost(
     const int32_t * is, unsigned lo, unsigned hi, unsigned t) {
@@ -176,12 +238,44 @@ static void choose_tables(MP3E_Granule * granule, const MP3E_Layout * layout,
   /* cost[t][k]: bits of runs 0..k-1 under table t, counting only the runs
    * the table can carry; bad[t][k]: how many runs it cannot. A region is
    * usable with a table when no run in it is bad, and costs a difference
-   * of two prefix sums. Runs are clipped to the pair region. */
+   * of two prefix sums. Runs are clipped to the pair region.
+   *
+   * Only the tables that could be best for some region are costed. A
+   * region's largest value is some run's largest value, so the tables worth
+   * trying are the union of the candidates of the runs' maxima; the rest are
+   * marked bad throughout. */
   uint32_t cost[32][MP3E_MAX_BANDS + 1u];
   uint8_t bad[32][MP3E_MAX_BANDS + 1u];
+  int run_max[MP3E_MAX_BANDS];
+  bool wanted[32];
+  memset(wanted, 0, sizeof(wanted));
+  for (unsigned k = 0; k < runs; ++k) {
+    unsigned lo = layout->band[k].start;
+    unsigned hi = lo + layout->band[k].width;
+    if (hi > big_end) {
+      hi = big_end;
+    }
+    int m = 0;
+    for (unsigned i = lo; i < hi; ++i) {
+      int v = is[i] < 0 ? -is[i] : is[i];
+      m = v > m ? v : m;
+    }
+    run_max[k] = m;
+    uint8_t list[6];
+    unsigned n = candidates(m, list);
+    for (unsigned c = 0; c < n; ++c) {
+      wanted[list[c]] = true;
+    }
+  }
+  wanted[0] = true;
+  uint8_t tried[32];
+  unsigned tried_count = 0;
   for (unsigned t = 0; t < 32u; ++t) {
     cost[t][0] = 0;
     bad[t][0] = 0;
+    if (wanted[t]) {
+      tried[tried_count++] = (uint8_t)t;
+    }
   }
   for (unsigned k = 0; k < runs; ++k) {
     unsigned lo = layout->band[k].start;
@@ -189,9 +283,19 @@ static void choose_tables(MP3E_Granule * granule, const MP3E_Layout * layout,
     if (hi > big_end) {
       hi = big_end;
     }
+    int cap_needed = run_max[k];
     for (unsigned t = 0; t < 32u; ++t) {
-      uint32_t c = lo < hi ? pairs_cost(is, lo, hi, t) : 0u;
-      bool usable = c < COST_INF;
+      uint32_t c = 0;
+      bool usable = wanted[t] && table_capacity(t) >= cap_needed;
+      if (!wanted[t]) {
+        cost[t][k + 1u] = 0;
+        bad[t][k + 1u] = (uint8_t)(bad[t][k] + 1u);
+        continue;
+      }
+      if (usable && lo < hi) {
+        c = pairs_cost(is, lo, hi, t);
+        usable = c < COST_INF;
+      }
       cost[t][k + 1u] = cost[t][k] + (usable ? c : 0u);
       bad[t][k + 1u] = (uint8_t)(bad[t][k] + (usable ? 0u : 1u));
     }
@@ -202,7 +306,8 @@ static void choose_tables(MP3E_Granule * granule, const MP3E_Layout * layout,
     do { \
       uint32_t best_ = COST_INF; \
       unsigned best_t_ = 0; \
-      for (unsigned t_ = 0; t_ < 32u; ++t_) { \
+      for (unsigned i_ = 0; i_ < tried_count; ++i_) { \
+        unsigned t_ = tried[i_]; \
         if (bad[t_][to] != bad[t_][from]) { \
           continue; \
         } \
@@ -298,12 +403,12 @@ static void choose_tables(MP3E_Granule * granule, const MP3E_Layout * layout,
   #undef REGION_BEST
 }
 
-void gaud_mp3e_huffman_plan(MP3E_Granule * granule,
-    const MP3E_Layout * layout, unsigned row) {
-  const int32_t * is = granule->is;
-  MP3_Granule * side = &granule->side;
-
-  /* The end of the non-zero part, and of the part that needs pairs. */
+/**
+ * Where the pairs end and the quadruples end: the shortest prefix whose
+ * every value of magnitude over one is a pair's, and the shortest after it
+ * that holds every non-zero value in whole quadruples inside 576.
+ */
+static void extents(const int32_t * is, unsigned * out_big, unsigned * out_end) {
   unsigned nonzero_end = 0;
   unsigned big_end = 0;
   for (unsigned i = 0; i < MP3E_LINES; ++i) {
@@ -325,11 +430,44 @@ void gaud_mp3e_huffman_plan(MP3E_Granule * granule,
       end += 4u;
     }
     if (end >= nonzero_end) {
-      granule->count1_end = (uint16_t)end;
-      break;
+      *out_big = big_end;
+      *out_end = end;
+      return;
     }
     big_end += 2u;
   }
+}
+
+uint32_t gaud_mp3e_huffman_estimate(const int32_t * is) {
+  unsigned big_end;
+  unsigned count1_end;
+  extents(is, &big_end, &count1_end);
+  uint32_t a = quads_cost(is, big_end, count1_end, 0);
+  uint32_t b = quads_cost(is, big_end, count1_end, 1);
+  uint32_t bits = a < b ? a : b;
+  int m = 0;
+  for (unsigned i = 0; i < big_end; ++i) {
+    int v = is[i] < 0 ? -is[i] : is[i];
+    m = v > m ? v : m;
+  }
+  uint8_t list[6];
+  unsigned n = candidates(m, list);
+  uint32_t best = COST_INF;
+  for (unsigned c = 0; c < n; ++c) {
+    uint32_t cost = pairs_cost(is, 0, big_end, list[c]);
+    best = cost < best ? cost : best;
+  }
+  return bits + (best < COST_INF ? best : 0u);
+}
+
+void gaud_mp3e_huffman_plan(MP3E_Granule * granule,
+    const MP3E_Layout * layout, unsigned row) {
+  const int32_t * is = granule->is;
+  MP3_Granule * side = &granule->side;
+  unsigned big_end;
+  unsigned count1_end;
+  extents(is, &big_end, &count1_end);
+  granule->count1_end = (uint16_t)count1_end;
   granule->big_end = (uint16_t)big_end;
   side->big_values = big_end / 2u;
 

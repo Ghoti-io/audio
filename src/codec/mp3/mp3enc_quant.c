@@ -67,20 +67,27 @@ int32_t gaud_mp3e_quantize_one(int32_t value, int e4) {
   else {
     v <<= -whole;
   }
-  /* The number of thresholds at or below v. */
-  unsigned lo = 0;
-  unsigned hi = QUANT_MAX + 1u;
-  while (lo < hi) {
-    unsigned mid = (lo + hi) >> 1;
-    if (gaud_mp3enc_quant_threshold[mid] <= v) {
-      lo = mid + 1u;
-    }
-    else {
-      hi = mid;
-    }
+  const uint64_t * threshold = gaud_mp3enc_quant_threshold;
+  if (v < threshold[0]) {
+    return 0;
   }
-  int32_t q = (int32_t)lo;
-  return value < 0 ? -q : q;
+  /* A guess from logarithms - v^(3/4), rounded with the standard's offset -
+   * and then the table decides: the guess is within a few of the answer,
+   * so a walk of a few thresholds finds the exact one, where a search of
+   * the whole table would take thirteen. */
+  int32_t log2_v = gaud_mp3e_log2_q8(v) - MP3_Q * 256;
+  uint32_t y = gaud_mp3e_exp2_q8(log2_v * 3 / 4);
+  uint64_t guess = ((uint64_t)y + 26568u) >> 16;
+  unsigned q = guess > QUANT_MAX ? QUANT_MAX : (unsigned)guess;
+  /* q is the count of thresholds at or below v. */
+  while (q > 0 && threshold[q - 1u] > v) {
+    --q;
+  }
+  while (q < QUANT_MAX + 1u && threshold[q] <= v) {
+    ++q;
+  }
+  int32_t result = (int32_t)(q > QUANT_MAX ? QUANT_MAX : q);
+  return value < 0 ? -result : result;
 }
 
 int64_t gaud_mp3e_dequantize_one(int32_t quantized, int e4) {
@@ -122,6 +129,7 @@ typedef struct {
   uint64_t energy[MP3E_MAX_BANDS];
   bool preflag;
   bool scale;
+  MP3E_Granule scratch; ///< A second granule to try a step in.
 } Work;
 
 static int pretab_for(const Work * w, unsigned run) {
@@ -183,27 +191,61 @@ static uint32_t finish(const Work * w, unsigned global_gain, MP3E_Granule * g) {
   return side->part2_3_length;
 }
 
-/* The finest gain whose bits fit. */
-static unsigned fit_gain(const Work * w, uint32_t budget, MP3E_Granule * g,
+/** Part 2 and an estimate of part 3 at @p gain, with @p g quantised. */
+static uint32_t estimate_bits(const Work * w, unsigned gain, MP3E_Granule * g) {
+  quantize_all(w, gain, g);
+  memset(g->sf_long, 0, sizeof(g->sf_long));
+  memset(g->sf_short, 0, sizeof(g->sf_short));
+  memset(g->scfsi_reused, 0, sizeof(g->scfsi_reused));
+  g->side.block_type = w->in->block_type;
+  for (unsigned r = 0; r < w->runs; ++r) {
+    const MP3E_Band * band = &w->layout->band[r];
+    if (w->layout->is_short) {
+      if (band->sfb < 12u) {
+        g->sf_short[band->sfb][band->window] = (uint8_t)w->sf[r];
+      }
+    }
+    else if (band->sfb < 21u) {
+      g->sf_long[band->sfb] = (uint8_t)w->sf[r];
+    }
+  }
+  if (!gaud_mp3e_scalefactor_plan(g, w->version)) {
+    return BITS_INF;
+  }
+  return g->part2_bits + gaud_mp3e_huffman_estimate(g->is);
+}
+
+/* The finest gain whose bits fit: bisect on the estimate, then let the
+ * exact count - which is never more - claim a step or two back. */
+static unsigned fit_gain(Work * w, uint32_t budget, MP3E_Granule * g,
     bool * out_fits) {
   unsigned lo = 0;
   unsigned hi = 255;
-  /* Bisect for the smallest gain whose bits are within the budget. Bits
-   * fall as the gain rises, so "fits" is monotone. */
   while (lo < hi) {
     unsigned mid = (lo + hi) >> 1;
-    quantize_all(w, mid, g);
-    uint32_t bits = finish(w, mid, g);
-    if (bits <= budget) {
+    if (estimate_bits(w, mid, g) <= budget) {
       hi = mid;
     }
     else {
       lo = mid + 1u;
     }
   }
+  /* The exact plan at the estimate's answer, then finer while it fits. */
   quantize_all(w, lo, g);
   uint32_t bits = finish(w, lo, g);
-  *out_fits = bits <= budget;
+  bool fits = bits <= budget;
+  for (unsigned step = 0; fits && lo > 0 && step < 4u; ++step) {
+    MP3E_Granule * probe = &w->scratch;
+    quantize_all(w, lo - 1u, probe);
+    uint32_t finer = finish(w, lo - 1u, probe);
+    if (finer > budget) {
+      break;
+    }
+    --lo;
+    *g = *probe;
+    bits = finer;
+  }
+  *out_fits = fits;
   return lo;
 }
 
