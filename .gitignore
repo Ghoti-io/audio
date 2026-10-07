@@ -29,3 +29,6 @@ tests/data/out
 # would drop the corpus from every clone but this one while `git status` stayed
 # clean. `make check-fixtures` is the gate that refuses to let that happen; do
 # not add an extension rule to this file without running it.
+
+# Third-party data fetched by tools/corpus/fetch.sh
+/third_party

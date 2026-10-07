@@ -253,6 +253,138 @@ def write_wav(path, data, rate):
         w.writeframes(np.clip(np.round(data * 32767.0), -32768, 32767).astype("<i2").tobytes())
 
 
+# ------------------------------------------------------------------ music
+
+CORPUS = os.path.join(ROOT, "third_party", "mp3corpus")
+CLIP_SECONDS = 30
+#: The VBR scale: quality points the encoder is asked for, and LAME's -V
+#: settings it is compared against.
+VBR_QUALITIES = tuple(range(20, 65, 5))
+LAME_VBR = (0, 2, 4, 6, 8)
+#: Raising the quality five points may raise the rate by this factor at most,
+#: and never lower it. LAME climbs about 1.25 at the widest; ours is at 1.71 on worn shellac today.
+VBR_STEP_RATIO = 1.8
+#: Raising the quality may not lower the rate or the score by more than
+#: this. Measured: the drum clip dips to 0.86 of the rate between quality 35
+#: and 40 (its score rises, 0.950 to 0.983), and worn shellac loses 0.011 of
+#: score between 20 and 25, at the 32 kbit/s floor. Both are named in
+#: notes/audio/mp3-encoder.md as things to remove, not to keep.
+VBR_RATE_DIP = 0.8
+VBR_SCORE_DIP = 0.02
+#: At the same bit rate (read off LAME's -V ladder, interpolated in the log
+#: of the rate) ours may be this far below LAME's score on any clip, and on
+#: average over the clips.
+VBR_GAP_EACH = 0.06
+VBR_GAP_MEAN = 0.03
+
+
+def corpus_clips():
+    """The fetched music, decoded to 44.1 kHz stereo WAV in the scratch
+    directory: a list of (tag, path). Empty if tools/corpus/fetch.sh has not
+    been run."""
+    clips = []
+    if not os.path.isdir(CORPUS):
+        return clips
+    for name in sorted(os.listdir(CORPUS)):
+        if not name.endswith(".flac"):
+            continue
+        tag = name[:-5]
+        wav = os.path.join(SCRATCH, "music_%s.wav" % tag)
+        if not os.path.exists(wav):
+            ffmpeg(["-i", os.path.join(CORPUS, name), "-t", str(CLIP_SECONDS),
+                    "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", wav])
+        if os.path.exists(wav):
+            clips.append((tag, wav))
+    return clips
+
+
+def vbr_encode(kind, wav, setting):
+    """Encode at a VBR setting (ours: quality 0-100, LAME: -V 0-9)."""
+    base = os.path.join(SCRATCH, os.path.splitext(os.path.basename(wav))[0])
+    mp3 = "%s.%s-v%d.mp3" % (base, kind, setting)
+    if os.path.exists(mp3):
+        os.remove(mp3)
+    if kind == "ours":
+        finished = run([WRITE_PROBE, wav, mp3, "mp3", "mp3", "0", "vbr", str(setting)])
+        ok = finished.returncode == 0
+    else:
+        ffmpeg(["-i", wav, "-c:a", "libmp3lame", "-q:a", str(setting), "-f", "mp3", mp3])
+        ok = os.path.exists(mp3) and os.path.getsize(mp3) > 0
+    return mp3 if ok else None
+
+
+def vbr_point(kind, wav, ref, rate, setting, seconds):
+    mp3 = vbr_encode(kind, wav, setting)
+    if mp3 is None:
+        return None
+    pcm = decode(mp3)
+    if pcm is None:
+        return None
+    kbps = os.path.getsize(mp3) * 8.0 / seconds / 1000.0
+    return kbps, score(ref, samples(pcm, ref.shape[1]), rate)
+
+
+def music_checks(failures):
+    """The VBR quality scale on real music: it must rise smoothly with the
+    rate, and at LAME's rates it must sound about as good as LAME."""
+    clips = corpus_clips()
+    if not clips:
+        message = ("the music corpus is not fetched: run tools/corpus/fetch.sh "
+                   "(set GHOTI_CORPUS_REQUIRED=1 to make this a failure)")
+        print("\n  " + message)
+        if os.environ.get("GHOTI_CORPUS_REQUIRED") == "1":
+            failures.append(message)
+        return
+    print("\n  VBR on music: kbit/s and score, ours by quality, LAME by -V")
+    gaps = []
+    for tag, wav in clips:
+        ref, rate = load(wav)
+        seconds = len(ref) / float(rate)
+        ours = []
+        for q in VBR_QUALITIES:
+            point = vbr_point("ours", wav, ref, rate, q, seconds)
+            if point is None:
+                failures.append("%s: ours did not encode at quality %d" % (tag, q))
+                break
+            ours.append((q,) + point)
+        lame = []
+        for v in LAME_VBR:
+            point = vbr_point("lame", wav, ref, rate, v, seconds)
+            if point is not None:
+                lame.append(point)
+        if len(ours) != len(VBR_QUALITIES) or len(lame) < 2:
+            continue
+        print("  %-11s ours %s" % (tag, " ".join("%d:%.0f/%.3f" % p for p in ours)))
+        print("  %-11s lame %s" % ("", " ".join("%.0f/%.3f" % p for p in lame)))
+        for a, b in zip(ours, ours[1:]):
+            if b[1] < a[1] * VBR_RATE_DIP or b[2] < a[2] - VBR_SCORE_DIP:
+                failures.append("%s: quality %d -> %d lowered the rate or the score "
+                                "(%.0f -> %.0f kbit/s, %.4f -> %.4f)"
+                                % (tag, a[0], b[0], a[1], b[1], a[2], b[2]))
+            if a[1] > 0 and b[1] / a[1] > VBR_STEP_RATIO:
+                failures.append("%s: quality %d -> %d raised the rate %.2fx (%.0f -> %.0f "
+                                "kbit/s); the most allowed is %.2fx"
+                                % (tag, a[0], b[0], b[1] / a[1], a[1], b[1], VBR_STEP_RATIO))
+        lame.sort()
+        xs = [math.log(p[0]) for p in lame]
+        ys = [p[1] for p in lame]
+        clip_gaps = [float(np.interp(math.log(k), xs, ys)) - s
+                     for _, k, s in ours if xs[0] <= math.log(k) <= xs[-1]]
+        if clip_gaps:
+            gap = float(np.mean(clip_gaps))
+            gaps.append(gap)
+            print("  %-11s ours is %+.4f behind LAME at LAME's rates" % ("", gap))
+            if gap > VBR_GAP_EACH:
+                failures.append("%s: %.4f behind LAME at equal rate; the most allowed is %.2f"
+                                % (tag, gap, VBR_GAP_EACH))
+    if gaps and sum(gaps) / len(gaps) > VBR_GAP_MEAN:
+        failures.append("music: on average %.4f behind LAME at equal rate; the most allowed "
+                        "is %.2f" % (sum(gaps) / len(gaps), VBR_GAP_MEAN))
+    if gaps:
+        print("  music: %d clips, ours on average %.4f behind LAME at equal rate"
+              % (len(gaps), sum(gaps) / len(gaps)))
+
+
 def main():
     print(oracle.provenance(["ffmpeg"]))
     for probe in (WRITE_PROBE, DUMP_PROBE):
@@ -335,6 +467,8 @@ def main():
     print("  LAME at 64, 128, 256 kbit/s: %.4f %.4f %.4f" % tuple(ladder))
     if not (ladder[0] < ladder[1] < ladder[2]):
         failures.append("control: LAME's score does not rise with its bit rate (%s)" % ladder)
+
+    music_checks(failures)
 
     mean_gap = sum(gaps) / len(gaps) if gaps else float("nan")
     print("\n%d signals; ours is on average %.4f behind LAME" % (len(cases), mean_gap))

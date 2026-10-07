@@ -388,6 +388,9 @@ that could be 156, which on one machine was whatever followed it in memory.
   on a similar spectrogram, written from the published description. It
   cannot hear, and it knows nothing of masking; what it can do is compare
   three encoders on one input at one rate, where its calibration drops out.
+  If `tools/corpus/fetch.sh` has been run it also scores the VBR quality
+  scale on twelve freely licensed music clips from Wikimedia Commons (not
+  committed; each pinned by SHA-256, licences in `tools/corpus/MANIFEST`).
   On six signals ours is on average level with LAME and ahead of it on
   three; on the sound effects of an office suite, which are real recordings,
   it is ahead of LAME on six of eight at 32 kbit/s, and on two recorded
