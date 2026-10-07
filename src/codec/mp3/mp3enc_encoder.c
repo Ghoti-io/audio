@@ -889,15 +889,19 @@ GAUD_Result gaud_mp3_encoder_open(const GAUD_Codec * codec,
   enc->granules = version == MP3_MPEG1 ? 2u : 1u;
   enc->sample_rate = params->sample_rate;
   enc->quality = quality;
-  /* Four tenths of a decibel of signal-to-noise ratio per point of quality,
-   * and the middle of the scale four decibels under the model's own level:
+  /* A fifth of a decibel of signal-to-noise ratio per point of quality, and
+   * the middle of the scale four decibels under the model's own level:
    * measured against LAME on the same input, that puts the default where
-   * LAME's -V4 is, and the whole range is 40 decibels of how much
-   * quantisation noise the encoder leaves under what the ear masks. */
+   * LAME's -V4 is. The slope was two fifths until the music corpus showed
+   * what that did: the rate saturated at about 300 kbit/s by quality 80, so
+   * the top fifth of the scale was one file, and the climb below it was
+   * steep (up to 1.8 times the rate for five points on worn shellac, where
+   * LAME's steps are 1.25). A fifth keeps the default where it was and uses
+   * the whole scale, with no step over 1.4 on the clips measured. */
   enc->snr_offset_q8 = mode == GAUD_RATE_VBR
-      ? ((int)quality - 50) * 4 * 256 / 10 - 4 * 256
+      ? ((int)quality - 50) * 256 / 5 - 4 * 256
       : 0;
-  /* The threshold of hearing follows quality twice as fast: a recorded
+  /* The threshold of hearing follows quality four times as fast: a recorded
    * voice's quiet passages are what a variable-rate file gives up first and
    * what an encoder that cares about them keeps, and their level is nowhere
    * near any masking threshold, only the threshold of hearing. */

@@ -1234,6 +1234,24 @@ TEST(Mp3EncodeStereo, ASignalInBothChannelsCostsAboutWhatOneChannelDoes) {
   }
 }
 
+TEST(Mp3EncodeRate, EveryFifthOfTheQualityScaleIsAFinerFile) {
+  /* The scale was once so steep that the rate reached the format's ceiling
+   * by quality 80, and qualities 80 to 100 wrote the same file. Each point
+   * of the top of the scale has to buy something. Measured on this signal,
+   * the file at quality 80 and then at 100: 241057 and 241371 bytes before
+   * (0.1 % apart), 232019 and 241162 after (3.9 %). */
+  Pcm pcm = Bursts(2, 44100 * 6);
+  size_t last = 0;
+  for (uint32_t quality : {20u, 40u, 60u, 80u, 100u}) {
+    GAUD_Encode_Params params = BaseParams(2, 44100);
+    params.rate_control = GAUD_RATE_VBR;
+    params.quality = quality;
+    size_t size = EncodeWith(pcm, params).size();
+    EXPECT_GT((double)size, 1.02 * (double)last) << "quality " << quality;
+    last = size;
+  }
+}
+
 TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
   /* The tag's checksum once read 190 bytes of a frame that could be
    * shorter, and so depended on what happened to be in memory after it -

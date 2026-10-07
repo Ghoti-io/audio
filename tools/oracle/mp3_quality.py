@@ -262,20 +262,19 @@ CLIP_SECONDS = 30
 VBR_QUALITIES = tuple(range(20, 65, 5))
 LAME_VBR = (0, 2, 4, 6, 8)
 #: Raising the quality five points may raise the rate by this factor at most,
-#: and never lower it. LAME climbs about 1.25 at the widest; ours is at 1.76 on worn shellac today.
-VBR_STEP_RATIO = 1.8
+#: and never lower it. LAME climbs about 1.25 at the widest; ours is at 1.39 on piano today.
+VBR_STEP_RATIO = 1.5
 #: Raising the quality may not lower the rate, and may not lower the score by
 #: more than this. Measured: the rate is monotone on all twelve clips (it was
 #: not on the drum before middle/side was given the allowance it is owed), and
-#: the score dips at most 0.015 (worn shellac, 20 to 25, at the 32 kbit/s
-#: floor, where the rate cannot move).
+#: the score rises with it on every clip.
 VBR_RATE_DIP = 0.97
-VBR_SCORE_DIP = 0.02
+VBR_SCORE_DIP = 0.005
 #: At the same bit rate (read off LAME's -V ladder, interpolated in the log
 #: of the rate) ours may be this far below LAME's score on any clip, and on
 #: average over the clips.
-VBR_GAP_EACH = 0.04
-VBR_GAP_MEAN = 0.015
+VBR_GAP_EACH = 0.03
+VBR_GAP_MEAN = 0.01
 
 
 def corpus_clips():

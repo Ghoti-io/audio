@@ -1,0 +1,15 @@
+# 33 quality-slope
+# defect: the quality scale is twice as steep, so it reaches the format's ceiling by quality 80
+# caught by: Mp3EncodeRate.EveryFifthOfTheQualityScaleIsAFinerFile
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -899,7 +899,7 @@
+    * LAME's steps are 1.25). A fifth keeps the default where it was and uses
+    * the whole scale, with no step over 1.4 on the clips measured. */
+   enc->snr_offset_q8 = mode == GAUD_RATE_VBR
+-      ? ((int)quality - 50) * 256 / 5 - 4 * 256
++      ? ((int)quality - 50) * 4 * 256 / 10 - 4 * 256
+       : 0;
+   /* The threshold of hearing follows quality four times as fast: a recorded
+    * voice's quiet passages are what a variable-rate file gives up first and
