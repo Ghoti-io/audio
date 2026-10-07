@@ -5,8 +5,8 @@
 --- a/src/codec/mp3/mp3enc_encoder.c
 +++ b/src/codec/mp3/mp3enc_encoder.c
 @@ -333,7 +333,7 @@
-       ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][0], ms_allowed[0]);
-       ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][1], ms_allowed[1]);
+       ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][0], ms_allowed[gr][0]);
+       ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][1], ms_allowed[gr][1]);
      }
 -    middle_side = ms < lr;
 +    middle_side = ms > lr;

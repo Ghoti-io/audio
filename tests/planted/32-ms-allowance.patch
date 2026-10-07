@@ -1,0 +1,17 @@
+# 32 ms-allowance
+# defect: middle and side are each held to one share of the noise left and right may carry, instead of sharing twice that between them
+# caught by: Mp3EncodeStereo.ASignalInBothChannelsCostsAboutWhatOneChannelDoes
+#
+--- a/src/codec/mp3/mp3enc_encoder.c
++++ b/src/codec/mp3/mp3enc_encoder.c
+@@ -308,8 +308,8 @@
+     uint64_t m = allowed_left[r] < allowed_right[r] ? allowed_left[r] : allowed_right[r];
+     uint64_t es = run_energy(layout, side, r);
+     uint64_t em = run_energy(layout, middle, r);
+-    out_middle[r] = 2u * m - (es < m ? es : m);
+-    out_side[r] = 2u * m - (em < m ? em : m);
++    out_middle[r] = m + 0u * (es + em);
++    out_side[r] = m;
+   }
+ }
+ 

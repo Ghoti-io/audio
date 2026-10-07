@@ -276,6 +276,43 @@ static void to_middle_side(const int32_t * left, const int32_t * right,
   }
 }
 
+
+/** A run's energy in the quantiser's units. */
+static uint64_t run_energy(const MP3E_Layout * layout, const int32_t * spectrum, unsigned r) {
+  uint64_t energy = 0;
+  const MP3E_Band * band = &layout->band[r];
+  for (unsigned i = band->start; i < (unsigned)band->start + band->width; ++i) {
+    int64_t scaled = (int64_t)spectrum[layout->order[i]] / (1 << MP3E_ENERGY_SHIFT);
+    energy += (uint64_t)(scaled * scaled);
+  }
+  return energy;
+}
+
+/**
+ * The noise middle and side may carry, band by band.
+ *
+ * Left is (M + S) / sqrt 2 and right (M - S) / sqrt 2, so the noise in each
+ * of them is half of M's plus half of S's, and each may carry what the
+ * quieter of the two is allowed, @p allowed_lr. That is M's noise plus S's
+ * at most twice @p allowed_lr, not each at most once: where side is quieter
+ * than that - and a near-mono recording's side is quiet everywhere - what it
+ * does not use is middle's. Holding both to @p allowed_lr, as this once did,
+ * made middle/side look dearer than left/right wherever the bands were
+ * barely above their thresholds, and so chose left/right for a mono signal
+ * at a lax setting and coded the same sound twice.
+ */
+static void middle_side_allowed(const MP3E_Layout * layout, const int32_t * middle,
+    const int32_t * side, const uint64_t * allowed_left, const uint64_t * allowed_right,
+    uint64_t * out_middle, uint64_t * out_side) {
+  for (unsigned r = 0; r < layout->count; ++r) {
+    uint64_t m = allowed_left[r] < allowed_right[r] ? allowed_left[r] : allowed_right[r];
+    uint64_t es = run_energy(layout, side, r);
+    uint64_t em = run_energy(layout, middle, r);
+    out_middle[r] = 2u * m - (es < m ? es : m);
+    out_side[r] = 2u * m - (em < m ? em : m);
+  }
+}
+
 static GAUD_Result encode_frame(MP3_Encoder * enc) {
   MP3E_Frame_Header header = {
       .version = enc->version,
@@ -319,28 +356,24 @@ static GAUD_Result encode_frame(MP3_Encoder * enc) {
   if (channels == 2u) {
     uint64_t lr = 0;
     uint64_t ms = 0;
-    uint64_t ms_allowed[2][MP3E_MAX_BANDS];
+    uint64_t ms_allowed[2][2][MP3E_MAX_BANDS];
     for (unsigned gr = 0; gr < granules; ++gr) {
       const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
       to_middle_side(spectrum[gr][0], spectrum[gr][1], mid_side[gr][0], mid_side[gr][1]);
-      for (unsigned r = 0; r < layout->count; ++r) {
-        uint64_t m = allowed[gr][0][r] < allowed[gr][1][r] ? allowed[gr][0][r] : allowed[gr][1][r];
-        ms_allowed[0][r] = m;
-        ms_allowed[1][r] = m;
-      }
+      middle_side_allowed(layout, mid_side[gr][0], mid_side[gr][1], allowed[gr][0],
+          allowed[gr][1], ms_allowed[gr][0], ms_allowed[gr][1]);
       lr += gaud_mp3e_estimate_bits(layout, spectrum[gr][0], allowed[gr][0]);
       lr += gaud_mp3e_estimate_bits(layout, spectrum[gr][1], allowed[gr][1]);
-      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][0], ms_allowed[0]);
-      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][1], ms_allowed[1]);
+      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][0], ms_allowed[gr][0]);
+      ms += gaud_mp3e_estimate_bits(layout, mid_side[gr][1], ms_allowed[gr][1]);
     }
     middle_side = ms < lr;
     if (middle_side) {
       for (unsigned gr = 0; gr < granules; ++gr) {
         const MP3E_Layout * layout = &enc->layout[layout_index[gr]];
         for (unsigned r = 0; r < layout->count; ++r) {
-          uint64_t m = allowed[gr][0][r] < allowed[gr][1][r] ? allowed[gr][0][r] : allowed[gr][1][r];
-          allowed[gr][0][r] = m;
-          allowed[gr][1][r] = m;
+          allowed[gr][0][r] = ms_allowed[gr][0][r];
+          allowed[gr][1][r] = ms_allowed[gr][1][r];
         }
         spectrum[gr][0] = mid_side[gr][0];
         spectrum[gr][1] = mid_side[gr][1];

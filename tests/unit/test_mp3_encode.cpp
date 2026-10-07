@@ -1201,6 +1201,39 @@ TEST(Mp3EncodeRate, ImpossibleRequestsAreRefused) {
   EXPECT_EQ(result, GAUD_ERR_INVALID);
 }
 
+/** The same samples in both channels of a stereo stream. */
+Pcm DualMono(const Pcm & mono) {
+  Pcm pcm(mono.size() * 2u);
+  for (size_t i = 0; i < mono.size(); ++i) {
+    pcm[2u * i] = mono[i];
+    pcm[2u * i + 1u] = mono[i];
+  }
+  return pcm;
+}
+
+TEST(Mp3EncodeStereo, ASignalInBothChannelsCostsAboutWhatOneChannelDoes) {
+  /* Side is silent, and middle may carry the noise left and right are each
+   * allowed, twice over. Choosing left/right at a lax setting - because the
+   * bands that sit just above their thresholds in left looked dearer in
+   * middle, whose energy is twice as high and whose allowance was held to
+   * one share - coded the same sound twice. Measured on this signal, the
+   * stereo file over the mono one at qualities 30, 40 and 50: 1.11, 1.21 and
+   * 1.14 before, 1.05, 1.04 and 1.04 after; the bound sits between. */
+  Pcm mono = Bursts(1, 44100 * 3);
+  Pcm both = DualMono(mono);
+  for (uint32_t quality : {30u, 40u, 50u}) {
+    GAUD_Encode_Params params = BaseParams(1, 44100);
+    params.rate_control = GAUD_RATE_VBR;
+    params.quality = quality;
+    size_t one = EncodeWith(mono, params).size();
+    params = BaseParams(2, 44100);
+    params.rate_control = GAUD_RATE_VBR;
+    params.quality = quality;
+    size_t two = EncodeWith(both, params).size();
+    EXPECT_LT((double)two, 1.08 * (double)one) << "quality " << quality;
+  }
+}
+
 TEST(Mp3EncodeTag, TheFrameIsAFunctionOfItsFieldsAlone) {
   /* The tag's checksum once read 190 bytes of a frame that could be
    * shorter, and so depended on what happened to be in memory after it -
